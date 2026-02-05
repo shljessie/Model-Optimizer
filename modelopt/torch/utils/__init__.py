@@ -27,4 +27,5 @@ from .perf import *
 from .regex import *
 from .robust_json import *
 from .tensor import *
+from .video_dataset_utils import *
 from .vlm_dataset_utils import *
