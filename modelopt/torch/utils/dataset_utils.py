@@ -587,12 +587,13 @@ def get_max_batch_size(
         return 512
 
 
-def _process_batch(batch_data, infer_method, max_working_batch_size=None):
+def _process_batch(batch_data, infer_method, generation_kwargs={}, max_working_batch_size=None):
     """Process a batch of data through the model's inference method.
 
     Args:
         batch_data: Dictionary containing the batch data
         infer_method: Model's inference method (either forward or generate)
+        generation_kwargs: Keyword arguments to pass to the model.generate() method.
         max_working_batch_size: Maximum batch size known to work without OOM
 
     Returns:
@@ -630,7 +631,7 @@ def _process_batch(batch_data, infer_method, max_working_batch_size=None):
 
     # Try processing with current batch size
     try:
-        infer_method(**batch_data)
+        infer_method(**batch_data, **generation_kwargs)
         return (
             batch_size
             if max_working_batch_size is None
@@ -661,24 +662,27 @@ def _process_batch(batch_data, infer_method, max_working_batch_size=None):
     return max_working_batch_size
 
 
-def _forward_loop(model: torch.nn.Module, dataloader: DataLoader) -> None:
+def _forward_loop(
+    model: torch.nn.Module, dataloader: DataLoader, generation_kwargs: dict = {}
+) -> None:
     """Runs forward passes through the model using data from the dataloader.
 
     Args:
         model: The PyTorch model to run inference on
         dataloader: DataLoader containing the batched input data
+        generation_kwargs: Keyword arguments to pass to the model.generate() method.
     """
     with torch.no_grad():
-        use_generate = _should_use_generate(model)
+        # use_generate = _should_use_generate(model)
+        use_generate = model_type_is_enc_dec(model)
         infer_method = model.generate if use_generate else model.forward
         max_working_batch_size = None  # Initialize max working batch size as None
 
         for _, data in enumerate(tqdm(dataloader)):
-            # For generate(), add max_new_tokens to prevent indefinite generation during calibration
-            if use_generate:
-                data["max_new_tokens"] = 1
             # Process batch and update max working batch size
-            max_working_batch_size = _process_batch(data, infer_method, max_working_batch_size)
+            max_working_batch_size = _process_batch(
+                data, infer_method, generation_kwargs, max_working_batch_size
+            )
 
 
 def create_forward_loop(
@@ -691,6 +695,7 @@ def create_forward_loop(
     device: str | None = None,
     include_labels: bool = False,
     dataloader: DataLoader | None = None,
+    generation_kwargs: dict = {},
 ) -> Callable:
     """Creates and returns a forward loop function configured for a specific model, dataset, and tokenizer.
 
@@ -709,7 +714,7 @@ def create_forward_loop(
         device: Target device for the returned dataloader.
         include_labels: Whether to include labels in the dataloader.
         dataloader: If provided, use the provided dataloader instead.
-
+        generation_kwargs: Keyword arguments to pass to the model.generate() method.
     Example usage for quantization:
 
     .. code-block:: python
@@ -748,7 +753,7 @@ def create_forward_loop(
             include_labels=include_labels,
         )
 
-    return lambda model: _forward_loop(model, dataloader)
+    return lambda model: _forward_loop(model, dataloader, generation_kwargs)
 
 
 def model_type_is_enc_dec(model):
