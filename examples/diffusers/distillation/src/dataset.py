@@ -1,0 +1,90 @@
+"""Dataset and dataloader utilities for precomputed latents + text embeddings."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import torch
+from safetensors.torch import load_file
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+logger = logging.getLogger(__name__)
+
+
+class LatentDataset(Dataset):
+    """Loads precomputed latents and text embeddings from a directory.
+
+    Expected directory layout:
+        data_root/
+            sample_000000.safetensors   # contains: latents, text_embeds, text_mask
+            sample_000001.safetensors
+            ...
+    """
+
+    def __init__(self, data_root: str | Path) -> None:
+        self.data_root = Path(data_root)
+        self.files = sorted(self.data_root.glob("*.safetensors"))
+        if not self.files:
+            raise FileNotFoundError(f"No .safetensors files found in {self.data_root}")
+        logger.info(f"LatentDataset: {len(self.files)} samples from {self.data_root}")
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return load_file(str(self.files[idx]))
+
+
+class MockDataset(Dataset):
+    """Generates random tensors for pipeline testing without real data.
+
+    Args:
+        num_samples: Number of mock samples.
+        latent_shape: (C, F, H, W) shape of video latents.
+        text_embed_dim: Dimension of text embeddings.
+        text_seq_len: Sequence length for text embeddings.
+    """
+
+    def __init__(
+        self,
+        num_samples: int = 100,
+        latent_shape: tuple[int, ...] = (48, 4, 32, 32),
+        text_embed_dim: int = 4096,
+        text_seq_len: int = 512,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.num_samples = num_samples
+        self.latent_shape = latent_shape
+        self.text_embed_dim = text_embed_dim
+        self.text_seq_len = text_seq_len
+        self.dtype = dtype
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {
+            "latents": torch.randn(self.latent_shape, dtype=self.dtype),
+            "text_embeds": torch.randn(self.text_seq_len, self.text_embed_dim, dtype=self.dtype),
+            "text_mask": torch.ones(self.text_seq_len, dtype=torch.int8),
+        }
+
+
+def create_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    num_workers: int = 2,
+    shuffle: bool = True,
+    distributed: bool = False,
+) -> DataLoader:
+    sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(shuffle and sampler is None),
+        num_workers=num_workers,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=True,
+    )

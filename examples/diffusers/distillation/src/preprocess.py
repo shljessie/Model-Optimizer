@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Preprocess raw videos + captions into precomputed latents + text embeddings.
+
+Two-phase pipeline (only one heavy model on GPU at a time):
+1. Load text encoder -> encode all captions -> save -> unload text encoder
+2. Load VAE encoder -> encode all videos -> save -> unload VAE
+
+Usage:
+    python -m general.preprocess \
+        --model_name wan \
+        --model_path /path/to/Wan2.2/checkpoint \
+        --dataset /path/to/dataset.json \
+        --output_dir /path/to/precomputed \
+        --video_column video \
+        --caption_column caption
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+import torch
+from safetensors.torch import save_file
+
+from .interfaces import free_gpu_memory
+from .models import get_model_backend
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+
+def load_dataset_file(path: str) -> list[dict]:
+    p = Path(path)
+    if p.suffix == ".json":
+        with open(p) as f:
+            return json.load(f)
+    elif p.suffix == ".jsonl":
+        with open(p) as f:
+            return [json.loads(line) for line in f if line.strip()]
+    elif p.suffix == ".csv":
+        import csv
+
+        with open(p) as f:
+            reader = csv.DictReader(f)
+            return list(reader)
+    else:
+        raise ValueError(f"Unsupported dataset format: {p.suffix}. Use .json, .jsonl, or .csv")
+
+
+def load_video(path: str) -> torch.Tensor:
+    """Load a video file and return as [C, F, H, W] float tensor in [0, 1]."""
+    import torchvision.io as tvio
+
+    frames, _, _info = tvio.read_video(path, output_format="TCHW")
+    # frames: [F, C, H, W] uint8 -> [C, F, H, W] float [0, 1]
+    video = frames.permute(1, 0, 2, 3).float() / 255.0
+    return video
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Preprocess dataset for distillation training")
+    parser.add_argument("--model_name", type=str, required=True, help="Model backend name (e.g. 'wan')")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument(
+        "--text_encoder_path", type=str, default=None,
+        help="Path to text encoder model (e.g. Gemma dir for LTX-2)",
+    )
+    parser.add_argument("--dataset", type=str, required=True, help="Path to dataset file (.json/.jsonl/.csv)")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory for precomputed data")
+    parser.add_argument("--video_column", type=str, default="video", help="Column name for video paths")
+    parser.add_argument("--caption_column", type=str, default="caption", help="Column name for captions")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--batch_size", type=int, default=1)
+    args = parser.parse_args()
+
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+    dtype = dtype_map[args.dtype]
+
+    # Load dataset metadata
+    samples = load_dataset_file(args.dataset)
+    logger.info(f"Loaded {len(samples)} samples from {args.dataset}")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get model backend (we only need the inference pipeline)
+    _, _, pipeline_cls = get_model_backend(args.model_name)
+    if pipeline_cls is None:
+        raise ValueError(f"Model '{args.model_name}' has no inference pipeline for preprocessing")
+    pipeline = pipeline_cls()
+
+    # Build a lightweight model config for the pipeline
+    from .config import ModelConfig
+
+    model_config = ModelConfig(
+        model_name=args.model_name,
+        model_path=args.model_path,
+        text_encoder_path=args.text_encoder_path,
+        dtype=args.dtype,
+    )
+
+    # --- Phase 1: Encode text ---
+    logger.info("Phase 1: Encoding captions with text encoder ...")
+    pipeline.load_components(model_config, "cuda", dtype)
+
+    captions = [s[args.caption_column] for s in samples]
+    text_embeddings = []
+
+    # The key used in CachedEmbeddings.positive varies by model backend
+    # (e.g., "context" for Wan, "video_context" for LTX-2). We pick the first.
+    text_embed_key = None
+
+    for i in range(0, len(captions), args.batch_size):
+        batch_captions = captions[i : i + args.batch_size]
+        cached = pipeline.encode_prompts(batch_captions, "", "cuda")
+        for emb in cached:
+            if text_embed_key is None:
+                text_embed_key = next(iter(emb.positive))
+            text_embeddings.append(emb.positive[text_embed_key])
+        if (i + args.batch_size) % 100 == 0:
+            logger.info(f"  Text encoding: {min(i + args.batch_size, len(captions))}/{len(captions)}")
+
+    # Unload text encoder to free memory for VAE
+    pipeline.unload_text_encoder()
+    logger.info(f"Phase 1 complete: {len(text_embeddings)} captions encoded")
+
+    # --- Phase 2: Encode videos ---
+    logger.info("Phase 2: Encoding videos with VAE ...")
+    video_paths = [s[args.video_column] for s in samples]
+
+    for i, (video_path, text_emb) in enumerate(zip(video_paths, text_embeddings)):
+        output_path = out_dir / f"sample_{i:06d}.safetensors"
+        if output_path.exists():
+            continue
+
+        video = load_video(video_path)
+        latents = pipeline.encode_videos([video], "cuda")
+        latent = latents[0]
+
+        # Create attention mask (all ones, length matches text embedding)
+        text_mask = torch.ones(text_emb.shape[0], dtype=torch.int8)
+
+        save_file(
+            {
+                "latents": latent,
+                "text_embeds": text_emb,
+                "text_mask": text_mask,
+            },
+            str(output_path),
+        )
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Video encoding: {i + 1}/{len(video_paths)}")
+
+    pipeline.offload_to_cpu()
+    free_gpu_memory()
+    logger.info(f"Phase 2 complete: {len(video_paths)} videos encoded")
+    logger.info(f"Precomputed data saved to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
