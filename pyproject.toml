@@ -118,7 +118,7 @@ dev-test = [
     "tox-current-env>=0.0.12",
 ]
 # Compound extras via self-references
-all = ["nvidia-modelopt[onnx,hf]"]
+all = ["nvidia-modelopt[onnx,hf,puzzletron]"]
 dev = ["nvidia-modelopt[all,dev-docs,dev-lint,dev-test]"]
 
 [project.urls]
