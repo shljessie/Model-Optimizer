@@ -20,9 +20,9 @@ ______________________________________________________________________
 **[Input]** Model Optimizer currently supports inputs of a [Hugging Face](https://huggingface.co/), [PyTorch](https://github.com/pytorch/pytorch) or [ONNX](https://github.com/onnx/onnx) model.
 
 **[Optimize]** Model Optimizer provides Python APIs for users to easily compose the above model optimization techniques and export an optimized quantized checkpoint.
-Model Optimizer is also integrated with [NVIDIA NeMo](https://github.com/NVIDIA-NeMo/NeMo), [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) and [Hugging Face Accelerate](https://github.com/huggingface/accelerate) for training required inference optimization techniques.
+Model Optimizer is also integrated with [NVIDIA Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge), [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) and [Hugging Face Accelerate](https://github.com/huggingface/accelerate) for training required inference optimization techniques.
 
-**[Export for deployment]** Seamlessly integrated within the NVIDIA AI software ecosystem, the quantized checkpoint generated from Model Optimizer is ready for deployment in downstream inference frameworks like [SGLang](https://github.com/sgl-project/sglang), [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization), [TensorRT](https://github.com/NVIDIA/TensorRT), or [vLLM](https://github.com/vllm-project/vllm).
+**[Export for deployment]** Seamlessly integrated within the NVIDIA AI software ecosystem, the quantized checkpoint generated from Model Optimizer is ready for deployment in downstream inference frameworks like [SGLang](https://github.com/sgl-project/sglang), [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization), [TensorRT](https://github.com/NVIDIA/TensorRT), or [vLLM](https://github.com/vllm-project/vllm). The unified Hugging Face export API now supports both transformers and diffusers models.
 
 ## Latest News
 
@@ -79,7 +79,7 @@ pip install -e .[dev]
 
 You can also directly use the [TensorRT-LLM docker images](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)
 (e.g., `nvcr.io/nvidia/tensorrt-llm/release:<version>`), which have Model Optimizer pre-installed.
-Make sure to upgrade Model Optimizer to the latest version using ``pip`` as described above.
+Make sure to upgrade Model Optimizer to the latest version as described above.
 Visit our [installation guide](https://nvidia.github.io/Model-Optimizer/getting_started/2_installation.html) for
 more fine-grained control on installed dependencies or for alternative docker images and environment variables to setup.
 

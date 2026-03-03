@@ -62,25 +62,9 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       TRAIN_BS="${1#*=}"
       ;;
-    --medusa_num_heads*)
-      if [[ "$1" != *=* ]]; then shift; fi
-      MEDUSA_NUM_HEADS="${1#*=}"
-      ;;
-    --medusa_num_layers*)
-      if [[ "$1" != *=* ]]; then shift; fi
-      MEDUSA_NUM_LAYERS="${1#*=}"
-      ;;
     --eagle_config*)
       if [[ "$1" != *=* ]]; then shift; fi
       EAGLE_CONFIG="${1#*=}"
-      ;;
-    --fsdp_transformer_layer_cls_to_wrap*)
-      if [[ "$1" != *=* ]]; then shift; fi
-      FSDP_TRANSFORMER_LAYER_CLS_TO_WRAP="${1#*=}"
-      ;;
-    --num_gpu*)
-      if [[ "$1" != *=* ]]; then shift; fi
-      NUM_GPU="${1#*=}"
       ;;
     --disable_tqdm*)
       if [[ "$1" != *=* ]]; then shift; fi
@@ -102,6 +86,30 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       AR_VALIDATE_STEPS="${1#*=}"
       ;;
+    --cp_size*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      CP_SIZE="${1#*=}"
+      ;;
+    --dp_size*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      DP_SHARD_SIZE="${1#*=}"
+      ;;
+    --log_steps*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      LOG_STEPS="${1#*=}"
+      ;;
+    --draft_vocab_cache*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      DRAFT_VOCAB_CACHE="${1#*=}"
+      ;;
+    --num_nodes*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      NUM_NODES="${1#*=}"
+      ;;
+    --head_node_ip*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      HEAD_NODE_IP="${1#*=}"
+      ;;
     *)
       >&2 printf "Error: Invalid argument ${1#*=}\n"
       exit 1
@@ -112,10 +120,13 @@ done
 
 set -x
 
-# Get the default value for save_steps based on the available number of GPUs
-GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())")
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+NUM_NODES=${NUM_NODES:-1}
+GPU_PER_NODE=${GPU_PER_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
+TOTAL_GPU=$((NUM_NODES * GPU_PER_NODE))
+echo "Total GPUs: $TOTAL_GPU (NUM_NODES: $NUM_NODES, GPU_PER_NODE: $GPU_PER_NODE)"
 # Calculate save_steps
-DEFAULT_SAVE_STEPS=$((8192 / GPU_COUNT))
+DEFAULT_SAVE_STEPS=$((8192 / TOTAL_GPU))
 
 MODEL=${MODEL:-"TinyLlama/TinyLlama-1.1B-Chat-v1.0"}
 MODE=${MODE:-"eagle3"}
@@ -126,11 +137,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-"ckpts/${MODEL_BASENAME}-$(date +%Y%m%d_%H%M)"}
 NUM_EPOCHS=${NUM_EPOCHS:-1}
 SAVE_STEPS=${SAVE_STEPS:-$DEFAULT_SAVE_STEPS}
 LR=${LR:-"1e-4"}
-TRAIN_BS=${TRAIN_BS:-4}
-MEDUSA_NUM_HEADS=${MEDUSA_NUM_HEADS:-1}
-MEDUSA_NUM_LAYERS=${MEDUSA_NUM_LAYERS:-1}
-FSDP_TRANSFORMER_LAYER_CLS_TO_WRAP=${FSDP_TRANSFORMER_LAYER_CLS_TO_WRAP:-"LlamaDecoderLayer"}
-NUM_GPU=${NUM_GPU:-1}
+TRAIN_BS=${TRAIN_BS:-1}
 TRAINING_SEQ_LEN=${TRAINING_SEQ_LEN:-2048}
 OFFLINE_DATA_PATH=${OFFLINE_DATA_PATH:-""}
 DISABLE_TQDM=${DISABLE_TQDM:-False}
@@ -138,17 +145,20 @@ VLM_PROCESSOR=${VLM_PROCESSOR:-}
 VLM_IMG_DIR=${VLM_IMG_DIR:-}
 AR_VALIDATE_STEPS=${AR_VALIDATE_STEPS:-1000}
 ESTIMATE_AR=${ESTIMATE_AR:-False}
+CP_SIZE=${CP_SIZE:-1}
+DP_SHARD_SIZE=${DP_SHARD_SIZE:-$((TOTAL_GPU/CP_SIZE))}
+LOG_STEPS=${LOG_STEPS:-100}
+DRAFT_VOCAB_CACHE=${DRAFT_VOCAB_CACHE:-""}
 
-if [[ "$MODE" == "medusa" ]]; then
-  SPECULATIVE_ARGS="--medusa_num_heads $MEDUSA_NUM_HEADS --medusa_num_layers $MEDUSA_NUM_LAYERS"
-elif [[ "$MODE" == "eagle1" || "$MODE" == "eagle3" ]]; then
+
+if [[ "$MODE" == "eagle3" ]]; then
   if [[ -n "$EAGLE_CONFIG" ]]; then
     SPECULATIVE_ARGS="--eagle_config $EAGLE_CONFIG"
   else
     SPECULATIVE_ARGS=""
   fi
 else
-  echo "Only medusa, eagle1, eagle3 supported for now!"
+  echo "Only eagle3 supported for now!"
   exit 1
 fi
 
@@ -163,11 +173,6 @@ else
   OFFLINE_TRAINING_ARGS=""
 fi
 
-if [[ "$NUM_GPU" == 1 ]]; then
-  MULTI_GPU=""
-else
-  MULTI_GPU="--multi_gpu"
-fi
 
 if [[ "$VLM_PROCESSOR" != "" ]]; then
   VLM_ARGS="--vlm_processor $VLM_PROCESSOR --vlm_img_dir $VLM_IMG_DIR"
@@ -175,9 +180,35 @@ else
   VLM_ARGS=""
 fi
 
+if [[ "$TOTAL_GPU" -gt 1 ]]; then
+  #Use FSDP2 when multi GPU available
+  FSDP_ARGS="--fsdp 'full_shard' --fsdp_config ${SCRIPT_DIR}/fsdp_config.json"
+else
+  #Otherwise, single GPU training
+  FSDP_ARGS=""
+fi
+
+
+if [[ "$DRAFT_VOCAB_CACHE" != "" ]]; then
+  DRAFT_VOCAB_CACHE_ARGS="--draft_vocab_cache $DRAFT_VOCAB_CACHE"
+else
+  DRAFT_VOCAB_CACHE_ARGS=""
+fi
+
+if [[ "$NUM_NODES" != 1 ]]; then
+  MULTI_NODE_ARGS="--num_processes $TOTAL_GPU \
+                   --num_machines $NUM_NODES \
+                   --machine_rank $SLURM_PROCID \
+                   --rdzv_backend c10d \
+                   --main_process_ip $HEAD_NODE_IP \
+                   --main_process_port 29500"
+else
+  MULTI_NODE_ARGS=""
+fi
+
 # Disable tokenizers parallelism to avoid warning
 export TOKENIZERS_PARALLELISM=False
-CMD="accelerate launch $MULTI_GPU --mixed_precision bf16 main.py \
+CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 ${SCRIPT_DIR}/main.py \
     --mode $MODE \
     --eagle_decoder_type $EAGLE_DECODER_TYPE \
     --model_name_or_path $MODEL \
@@ -197,15 +228,19 @@ CMD="accelerate launch $MULTI_GPU --mixed_precision bf16 main.py \
     --weight_decay 0.0 \
     --warmup_steps 100 \
     --lr_scheduler_type linear \
-    --logging_steps 100 \
+    --logging_steps $LOG_STEPS \
     --tf32 True \
     --data_path $DATA \
     --disable_tqdm $DISABLE_TQDM \
     --estimate_ar $ESTIMATE_AR \
     --ar_validate_steps $AR_VALIDATE_STEPS \
+    $DRAFT_VOCAB_CACHE_ARGS \
     $VLM_ARGS \
     $OFFLINE_TRAINING_ARGS \
     $SPECULATIVE_ARGS \
+    $FSDP_ARGS \
+    --cp_size $CP_SIZE \
+    --dp_shard_size $DP_SHARD_SIZE \
 "
 
 start_time=$(date +%s)

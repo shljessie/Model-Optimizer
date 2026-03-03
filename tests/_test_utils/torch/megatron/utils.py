@@ -18,10 +18,6 @@ from collections import defaultdict
 from warnings import warn
 
 import torch
-from _test_utils.import_helper import skip_if_no_megatron
-
-skip_if_no_megatron()
-
 from megatron.core import dist_checkpointing
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -127,6 +123,47 @@ def run_mcore_inference_with_dummy_input(
         0, model.vocab_size, (batch_size, model.max_sequence_length)
     ).cuda()
     return run_mcore_inference(model, prompt_tokens, hidden_size)
+
+
+def get_batch(model, batch_size=2):
+    seq_length = model.max_sequence_length
+    vocab_size = model.vocab_size
+
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_length)).cuda()
+    labels = torch.randint(0, vocab_size, (batch_size, seq_length)).cuda()
+    position_ids = (
+        torch.arange(seq_length, dtype=torch.int64).unsqueeze(0).repeat(batch_size, 1).cuda()
+    )
+    attention_mask = torch.tril(
+        torch.ones((batch_size, 1, seq_length, seq_length), dtype=torch.bool)
+    ).cuda()
+    loss_mask = torch.ones((batch_size, seq_length), dtype=torch.float32).cuda()
+
+    return input_ids, labels, position_ids, attention_mask, loss_mask
+
+
+def get_forward(model, batch_size=2):
+    """Return a forward function with cached batch inputs."""
+    input_ids, labels, position_ids, attention_mask, loss_mask = get_batch(model, batch_size)
+
+    def forward(model):
+        # MambaModel doesn't accept loss_mask argument
+        if isinstance(model, MambaModel):
+            return model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+        return model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+
+    return forward
 
 
 def initialize_for_megatron(

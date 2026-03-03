@@ -9,7 +9,6 @@ LICENSE @NVIDIA/modelopt-setup-codeowners
 LICENSE_HEADER @NVIDIA/modelopt-setup-codeowners
 pyproject.toml @NVIDIA/modelopt-setup-codeowners
 SECURITY.md @NVIDIA/modelopt-setup-codeowners
-setup.py @NVIDIA/modelopt-setup-codeowners
 tox.ini @NVIDIA/modelopt-setup-codeowners
 
 # Library
@@ -45,6 +44,7 @@ modelopt/torch/utils @NVIDIA/modelopt-torch-utils-codeowners
 /examples/llm_ptq @NVIDIA/modelopt-examples-llm_ptq-codeowners
 /examples/llm_qat @NVIDIA/modelopt-examples-llm_qat-codeowners
 /examples/llm_sparsity @NVIDIA/modelopt-torch-sparsity-codeowners
+/examples/megatron_bridge @NVIDIA/modelopt-examples-megatron-codeowners
 /examples/model_hub @NVIDIA/modelopt-examples-model_hub-codeowners
 /examples/nemo_run @NVIDIA/modelopt-examples-megatron-codeowners
 /examples/onnx_ptq @NVIDIA/modelopt-onnx-codeowners
