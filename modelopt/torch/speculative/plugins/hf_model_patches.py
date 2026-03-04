@@ -61,6 +61,9 @@ def patch_for_kimi_k2(module):
             Please install transformers >=4.57, <5.0"
         )
 
+    if module.eagle_config._attn_implementation == "flex_attention":
+        raise ValueError("Kimi K2 does not support flex attention.")
+
     # Avoid quantizing drafter by updating quantization_config
     quant_config = getattr(module.config, "quantization_config", None)
     if isinstance(quant_config, CompressedTensorsConfig):
