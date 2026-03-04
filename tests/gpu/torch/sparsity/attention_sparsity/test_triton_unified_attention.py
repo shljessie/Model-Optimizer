@@ -860,3 +860,224 @@ class TestBackward:
         )
 
         torch.testing.assert_close(o_fwd, o_bwd, rtol=1e-5, atol=1e-5)
+
+    def test_backward_sparse24_random_grad_output(self):
+        """Sparse24 backward with random dO matches reference (not just dO=1)."""
+        from modelopt.torch.sparsity.attention_sparsity.kernels import context_attention
+
+        block = _get_prefill_block_size()
+        seq_len = block * 2 + block // 2
+        num_heads, num_kv_heads, head_dim = 4, 2, 32
+        scale = 1.0 / (head_dim**0.5)
+        bq, ts = block, block
+
+        torch.manual_seed(71)
+        q_data = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.float32)
+        k_data = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float32)
+        v_data = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float32)
+        grad_output = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.float32)
+
+        # Triton backward with random dO
+        q = q_data.clone().requires_grad_(True)
+        k = k_data.clone().requires_grad_(True)
+        v = v_data.clone().requires_grad_(True)
+        o = context_attention(
+            q,
+            k,
+            v,
+            b_start_loc=torch.tensor([0], device="cuda", dtype=torch.int32),
+            b_seq_len=torch.tensor([seq_len], device="cuda", dtype=torch.int32),
+            max_input_len=seq_len,
+            is_causal=True,
+            softmax_scale=scale,
+            apply_sparse24=True,
+            skip_diagonal_blocks=True,
+        )
+        o.backward(grad_output)
+
+        # Python reference backward with same random dO
+        nqkv = num_heads // num_kv_heads
+        dq_ref = torch.zeros_like(q_data)
+        dk_ref = torch.zeros_like(k_data)
+        dv_ref = torch.zeros_like(v_data)
+        for h in range(num_heads):
+            kv_h = h // nqkv
+            q_h = q_data[:, h].clone().requires_grad_(True)
+            k_h = k_data[:, kv_h].clone().requires_grad_(True)
+            v_h = v_data[:, kv_h].clone().requires_grad_(True)
+            o_h = _attention_sparse24_ref(q_h, k_h, v_h, scale, bq, ts)
+            o_h.backward(grad_output[:, h])
+            dq_ref[:, h] = q_h.grad
+            dk_ref[:, kv_h] += k_h.grad
+            dv_ref[:, kv_h] += v_h.grad
+
+        # Random dO amplifies numerical differences vs uniform dO=1; use slightly
+        # wider tolerance (0.1% of elements exceeded atol=1e-2, max abs diff ~0.03).
+        torch.testing.assert_close(q.grad, dq_ref, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(k.grad, dk_ref, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(v.grad, dv_ref, rtol=5e-2, atol=5e-2)
+
+
+@pytest.fixture(scope="module")
+def long_llama_dir(tmp_path_factory):
+    """Tiny Llama with long position embeddings for sparse24 model-level tests.
+
+    Sparse24 with skip_diagonal_blocks=True only applies sparsity to non-diagonal tiles.
+    With BLOCK_FWD=128, we need seq_len > 128 so that non-diagonal tiles exist.
+    """
+    from _test_utils.torch.transformers_models import create_tiny_llama_dir
+
+    return create_tiny_llama_dir(
+        tmp_path_factory.mktemp("long_llama"),
+        with_tokenizer=True,
+        num_hidden_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=64,
+        max_position_embeddings=512,
+    )
+
+
+@pytest.mark.skipif(not TRITON_KERNEL_AVAILABLE, reason="Need CUDA + triton")
+class TestModelBackward:
+    """Model-level backward tests with cross-entropy loss (realistic dO patterns)."""
+
+    def test_triton_dense_matches_eager(self, tiny_llama_dir):
+        """Model-level: Triton dense backward matches eager with cross-entropy loss."""
+        pytest.importorskip("transformers")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from modelopt.torch.sparsity.attention_sparsity.kernels import register_triton_attention
+
+        register_triton_attention()
+
+        tok = AutoTokenizer.from_pretrained(tiny_llama_dir)
+        if tok.pad_token_id is None:
+            tok.pad_token_id = tok.eos_token_id
+        inputs = tok("The quick brown fox jumps over", return_tensors="pt").to("cuda")
+        input_ids = inputs.input_ids
+        labels = input_ids.clone()
+
+        grads = {}
+        for impl in ("modelopt_triton", "eager"):
+            model = AutoModelForCausalLM.from_pretrained(
+                tiny_llama_dir,
+                attn_implementation=impl,
+                torch_dtype=torch.float32,
+                device_map="cuda",
+            )
+            model.train()
+            output = model(input_ids=input_ids, labels=labels)
+            output.loss.backward()
+            grads[impl] = {
+                n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None
+            }
+            del model
+            torch.cuda.empty_cache()
+
+        for name in grads["eager"]:
+            torch.testing.assert_close(
+                grads["modelopt_triton"][name],
+                grads["eager"][name],
+                rtol=1e-2,
+                atol=1e-2,
+                msg=f"Gradient mismatch at {name}",
+            )
+
+    def test_sparse24_training_step_decreases_loss(self, long_llama_dir):
+        """Model-level: sparse24 training steps with cross-entropy decrease loss.
+
+        Uses 256-token input (> BLOCK_FWD=128) so non-diagonal tiles exist and
+        2:4 sparsity is actually applied with skip_diagonal_blocks=True.
+        """
+        pytest.importorskip("transformers")
+        from transformers import AutoModelForCausalLM
+
+        from modelopt.torch.sparsity.attention_sparsity.kernels import (
+            register_triton_attention,
+            set_sparse24,
+        )
+
+        register_triton_attention()
+
+        model = AutoModelForCausalLM.from_pretrained(
+            long_llama_dir,
+            attn_implementation="modelopt_triton",
+            torch_dtype=torch.float32,
+            device_map="cuda",
+        )
+        set_sparse24(model, apply_sparse24=True, skip_diagonal_blocks=True)
+        model.train()
+
+        vocab_size = model.config.vocab_size
+        seq_len = 256  # > BLOCK_FWD=128 so sparsity is applied on non-diagonal tiles
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, vocab_size, (1, seq_len), device="cuda")
+        labels = input_ids.clone()
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        losses = []
+        for _ in range(10):
+            optimizer.zero_grad()
+            output = model(input_ids=input_ids, labels=labels)
+            output.loss.backward()
+            optimizer.step()
+            losses.append(output.loss.item())
+
+        assert losses[-1] < losses[0], (
+            f"Loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}\n"
+            f"All losses: {[f'{v:.4f}' for v in losses]}"
+        )
+
+    def test_sparse24_grads_match_dense_direction(self, long_llama_dir):
+        """Model-level: sparse24 param gradients point in similar direction as dense.
+
+        Uses 256-token input (> BLOCK_FWD=128) so non-diagonal tiles exist and
+        2:4 sparsity is actually applied with skip_diagonal_blocks=True.
+        """
+        pytest.importorskip("transformers")
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        from modelopt.torch.sparsity.attention_sparsity.kernels import (
+            register_triton_attention,
+            set_sparse24,
+        )
+
+        register_triton_attention()
+
+        # Create input_ids once so both modes see the same data
+        torch.manual_seed(42)
+        vocab_size = AutoConfig.from_pretrained(long_llama_dir).vocab_size
+        seq_len = 256  # > BLOCK_FWD=128 so sparsity is applied
+        input_ids = torch.randint(0, vocab_size, (1, seq_len), device="cuda")
+        labels = input_ids.clone()
+
+        grads = {}
+        for mode in ("dense", "sparse24"):
+            model = AutoModelForCausalLM.from_pretrained(
+                long_llama_dir,
+                attn_implementation="modelopt_triton",
+                torch_dtype=torch.float32,
+                device_map="cuda",
+            )
+            if mode == "sparse24":
+                set_sparse24(model, apply_sparse24=True, skip_diagonal_blocks=True)
+            model.train()
+
+            output = model(input_ids=input_ids, labels=labels)
+            output.loss.backward()
+            grads[mode] = {
+                n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None
+            }
+            del model
+            torch.cuda.empty_cache()
+
+        for name in grads["dense"]:
+            g_d = grads["dense"][name].flatten().float()
+            g_s = grads["sparse24"][name].flatten().float()
+            cos = F.cosine_similarity(g_d, g_s, dim=0).item()
+            assert cos > 0.5, (
+                f"{name}: cosine similarity {cos:.4f} between sparse24 and dense gradients "
+                f"is too low (expected > 0.5)"
+            )

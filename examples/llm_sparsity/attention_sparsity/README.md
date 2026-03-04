@@ -196,13 +196,12 @@ python hf_sa.py \
 
 | | Skip-Softmax | Sparse24 Triton |
 |---|---|---|
-| Method | Threshold-based softmax skipping | 2:4 structured sparsity on attention scores |
+| Method | Threshold-based softmax skipping | Fine-grained 2:4 sparsity on attention scores |
 | Attention backend | `eager` (patches `F.softmax`) | `modelopt_triton` (fused Triton kernel) |
 | Calibration | Optional (RULER-based) | Not needed (fixed top-2-of-4 selection) |
 | Sparsity ratio | Variable (depends on threshold) | Fixed 50% |
-| Diagonal preservation | N/A | Yes (tiles near the causal diagonal are kept dense) |
-| Training support | No | Yes (autograd-compatible forward/backward) |
-| Decode support | Yes | Yes (same kernel, `is_causal=False`) |
+| Training support | No | Yes |
+| Decode support | Yes | Yes |
 
 ### Training with Sparse24 Attention
 
