@@ -44,7 +44,6 @@ from modelopt.torch.puzzletron.tools.checkpoint_utils import (
     copy_tokenizer,
 )
 from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import (
-    copy_deci_lm_hf_code,
     save_checkpoint,
     save_safetensors_index,
 )
@@ -198,7 +197,6 @@ def validate_puzzle_solutions(args: DictConfig) -> None:
             save_checkpoint(model, checkpoint_dir, descriptor)
 
             copy_tokenizer(args.tokenizer_name, checkpoint_dir)
-            copy_deci_lm_hf_code(checkpoint_dir)
 
         dist.barrier()
 
