@@ -32,6 +32,7 @@ import threading
 import torch
 
 from modelopt.torch.sparsity.attention_sparsity.kernels.triton_unified_attention import (
+    context_attention,
     context_attention_fwd,
 )
 
@@ -72,9 +73,13 @@ def _diffusers_sparse24_attention(
     """Run Triton sparse24 attention on diffusers-layout tensors ``[B, S, H, D]``.
 
     Reshapes to the packed ``[total, H, D]`` format expected by
-    ``context_attention_fwd``, runs the kernel with ``apply_sparse24=True``,
+    ``context_attention``, runs the kernel with ``apply_sparse24=True``,
     and reshapes back.  Supports both self-attention (seq_q == seq_k) and
     cross-attention (seq_q != seq_k).
+
+    Uses ``context_attention`` (autograd-compatible) instead of
+    ``context_attention_fwd`` so that gradients flow through Q, K, V
+    during training.
     """
     batch, seq_q, num_heads, head_dim = query.shape
     seq_k = key.shape[1]
@@ -84,7 +89,6 @@ def _diffusers_sparse24_attention(
     q = query.reshape(batch * seq_q, num_heads, head_dim).contiguous()
     k = key.reshape(batch * seq_k, num_kv_heads, head_dim).contiguous()
     v = value.reshape(batch * seq_k, num_kv_heads, head_dim).contiguous()
-    o = torch.empty_like(q)
 
     b_start_loc = torch.arange(batch, device=device, dtype=torch.int32) * seq_q
     b_seq_len = torch.full((batch,), seq_q, device=device, dtype=torch.int32)
@@ -98,22 +102,29 @@ def _diffusers_sparse24_attention(
         b_seq_len_k = None
         max_input_len_k = None
 
-    context_attention_fwd(
-        q,
-        k,
-        v,
-        o,
-        b_start_loc=b_start_loc,
-        b_seq_len=b_seq_len,
-        max_input_len=seq_q,
-        is_causal=is_causal,
-        softmax_scale=scale,
-        apply_sparse24=True,
-        skip_diagonal_blocks=skip_diagonal_blocks,
-        b_start_loc_k=b_start_loc_k,
-        b_seq_len_k=b_seq_len_k,
-        max_input_len_k=max_input_len_k,
+    fwd_kwargs = {
+        "b_start_loc": b_start_loc,
+        "b_seq_len": b_seq_len,
+        "max_input_len": seq_q,
+        "is_causal": is_causal,
+        "softmax_scale": scale,
+        "apply_sparse24": True,
+        "skip_diagonal_blocks": skip_diagonal_blocks,
+        "b_start_loc_k": b_start_loc_k,
+        "b_seq_len_k": b_seq_len_k,
+        "max_input_len_k": max_input_len_k,
+    }
+
+    # Use autograd-compatible path when gradients are needed (training),
+    # otherwise use faster inference-only path (mirrors hf_triton_attention.py).
+    needs_grad = torch.is_grad_enabled() and (
+        query.requires_grad or key.requires_grad or value.requires_grad
     )
+    if needs_grad:
+        o = context_attention(q, k, v, **fwd_kwargs)
+    else:
+        o = torch.empty_like(q)
+        context_attention_fwd(q, k, v, o, **fwd_kwargs)
 
     return o.view(batch, seq_q, num_heads, head_dim)
 
