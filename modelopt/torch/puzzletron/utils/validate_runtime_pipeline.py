@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model evaluation utilities for models split across multiple GPUs in pipeline-parallel mode.
+"""
+Model evaluation utilities for models split across multiple GPUs in pipeline-parallel mode.
 
 Coordinates forward passes and loss computation through model shards distributed across GPUs
 using sewing_kit's StitchedModule framework. Relies on validation.py for core loss computation.
@@ -22,16 +23,18 @@ Used by validate_model.py during activation scoring for sharded models.
 """
 # mypy: ignore-errors
 
+import traceback
+from contextlib import nullcontext
+from typing import Type
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import modelopt.torch.utils.distributed as dist
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.modeling_decilm import (
-    DeciLMForCausalLM,
-    LMHead,
-)
+from modelopt.torch.puzzletron.anymodel.model_descriptor import ModelDescriptor
+from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.modeling_decilm import LMHead
 from modelopt.torch.puzzletron.sewing_kit import (
     ExternalTarget,
     InputArgs,
@@ -51,6 +54,23 @@ from modelopt.torch.puzzletron.tools.sharded_checkpoint_utils import DummyBlock
 from modelopt.torch.puzzletron.utils.validation import _organize_outputs, calculate_batch_outputs
 
 
+def _log_forward_error(e: Exception, rank: int, batch_idx: int, num_batches: int) -> None:
+    """Log detailed error info for distributed forward pass failures.
+
+    When one rank crashes during distributed forward, others may hang waiting for communication.
+    This logging helps diagnose which rank failed and why.
+    """
+    error_msg = (
+        f"\n{'=' * 60}\n"
+        f"[Rank {rank}] ERROR in stitched_model forward (batch {batch_idx}/{num_batches})\n"
+        f"Error: {type(e).__name__}: {e}\n"
+        f"{'=' * 60}\n"
+        f"{traceback.format_exc()}"
+        f"{'=' * 60}\n"
+    )
+    print(error_msg, flush=True)
+
+
 class HiddenStatesAndLMHead(list):
     def __init__(self, hidden_states: list[torch.Tensor], lm_head_weights: torch.Tensor):
         super().__init__(hidden_states)
@@ -59,7 +79,7 @@ class HiddenStatesAndLMHead(list):
 
 @torch.no_grad()
 def calculate_losses_pipeline(
-    stitched_model: StitchedModule | DeciLMForCausalLM,
+    stitched_model: StitchedModule,
     dataloader: DataLoader | None,
     target_hidden_states_per_batch: HiddenStatesAndLMHead | None = None,
     return_hidden_states: bool = False,
@@ -68,8 +88,11 @@ def calculate_losses_pipeline(
     just_model_forward: bool = False,
     checkpoint_manager=None,
     autocast_dtype: torch.dtype = torch.bfloat16,
+    descriptor: Type[ModelDescriptor] = None,
+    use_autocast: bool = True,
 ) -> tuple[dict[str, dict], HiddenStatesAndLMHead | None] | tuple[None, None]:
-    """Do model forward on each batch and calculate LM loss.
+    """
+    Do model forward on each batch and calculate LM loss.
     Optionally also calculate kl_div loss and other metrics from given target_hidden_states_per_batch.
     Optionally return hidden states per batch.
     Does not support data-parallel.
@@ -87,8 +110,8 @@ def calculate_losses_pipeline(
         target_hidden_states_per_batch: list[torch.Tensor], returned if return_hidden_states=True
 
     """
-    if isinstance(stitched_model, DeciLMForCausalLM):
-        stitched_model = perform_pipeline_stitches(stitched_model)
+    if not isinstance(stitched_model, StitchedModule):
+        stitched_model = perform_pipeline_stitches(stitched_model, descriptor)
 
     params = list(stitched_model.parameters())
     model_device = params[0].device if params else "cpu"
@@ -145,14 +168,24 @@ def calculate_losses_pipeline(
 
     stitched_model.eval()
 
-    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+    # Use autocast for mixed precision, or nullcontext if disabled
+    # (some models like Qwen3-VL MoE have dtype bugs under autocast)
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast else nullcontext()
+    )
+    with autocast_ctx:
+        fake_input_ids = fake_tensor(1, seq_len, dtype=torch.long, device=model_device)
         for i_batch in progress_bar:
             if dist.is_master():
                 input_ids = all_input_ids[i_batch].to(model_device)
             else:
-                input_ids = fake_tensor(1, seq_len, dtype=torch.long)
+                input_ids = fake_input_ids
 
-            output = stitched_model({}, {}, input_ids)
+            try:
+                output = stitched_model({}, {}, input_ids)
+            except Exception as e:
+                _log_forward_error(e, dist.rank(), i_batch, num_batches)
+                raise
 
             if dist.is_last_process():
                 logits = output.captured_outputs.get("model_output")
@@ -183,6 +216,16 @@ def calculate_losses_pipeline(
 
                 outputs.append(batch_outputs)
 
+                # Free GPU memory after processing each batch
+                del logits, hidden_states, targets
+                if target_hidden_states is not None:
+                    del target_hidden_states
+                if target_logits is not None:
+                    del target_logits
+
+            # Free output tensor memory on all ranks
+            del output
+
             # Update checkpoint progress periodically
             if checkpoint_manager:
                 checkpoint_manager.update_progress(i_batch + 1, num_batches)
@@ -200,13 +243,28 @@ def calculate_losses_pipeline(
     return losses, hidden_states_per_batch
 
 
-def perform_pipeline_stitches(model: DeciLMForCausalLM) -> StitchedModule:
+def perform_pipeline_stitches(
+    model,
+    descriptor: Type[ModelDescriptor],
+) -> StitchedModule:
+    """Create pipeline stitches for distributed model evaluation.
+
+    Args:
+        model: The model to stitch (any HuggingFace model with AnyModel descriptor).
+        descriptor: ModelDescriptor for layer naming.
+    """
     target = ModuleTarget("module", model)
     stitcher = Needle()
 
+    num_layers = model.config.num_hidden_layers
+
     is_real_block = np.flatnonzero(
-        [not isinstance(block, DummyBlock) for block in model.model.layers]
+        [
+            not isinstance(model.get_submodule(descriptor.layer_block_name(i)), DummyBlock)
+            for i in range(num_layers)
+        ]
     )
+
     first_block, last_block = is_real_block.min(), is_real_block.max()
 
     if dist.rank() != 0:
@@ -216,7 +274,7 @@ def perform_pipeline_stitches(model: DeciLMForCausalLM) -> StitchedModule:
                 name="activations", adapter=lambda x: InputArgs(x)
             ),
             target.input(
-                name=f"model.layers.{first_block}",
+                name=descriptor.layer_block_name(first_block),
                 reducer=InputReducer(
                     lambda acc, override, orig, *args: override + orig.drop_args(0)
                 ),
@@ -226,17 +284,17 @@ def perform_pipeline_stitches(model: DeciLMForCausalLM) -> StitchedModule:
     if not dist.is_last_process():
         # send activations to next rank
         stitcher.stitch(
-            target.output(f"model.layers.{last_block}"),
+            target.output(descriptor.layer_block_name(last_block)),
             RemoteTarget(peer_rank=dist.rank() + 1).value(name="activations"),
         )
     else:
         # register model output
         stitcher.stitch(
-            target.output(name="lm_head"),
+            target.output(name=descriptor.output_embedding_name()),
             ExternalTarget().output("model_output"),
         )
         stitcher.stitch(
-            target.output(name="model.norm"),
+            target.output(name=descriptor.final_norm_name()),
             ExternalTarget().output("hidden_states"),
         )
 

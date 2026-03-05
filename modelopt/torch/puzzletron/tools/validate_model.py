@@ -12,42 +12,49 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Provides a function to validate a model. Runs a model forward pass on a dataset and calculates
+# mypy: ignore-errors
+"""
+Provides a function to validate a model. Runs a model forward pass on a dataset and calculates
 the loss, and optionally registers hooks to capture the inputs and the outputs
 of pytorch modules that are used for activation scoring for pruning.
 
 TODO: Consider moving this a separate module dedicated for scoring
+
+Uses native HuggingFace models with deci_x_patcher for heterogeneous layer configurations.
 """
 
 import textwrap
 from pathlib import Path
+from typing import Type
 
 import torch
 from omegaconf import DictConfig
 from torch import nn
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    PreTrainedModel,
-    PreTrainedTokenizerBase,
-)
+from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 import modelopt.torch.utils.distributed as dist
 from modelopt.torch.puzzletron.activation_scoring.activation_hooks.utils import (
     register_activation_hooks,
 )
-from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import load_checkpoint
+from modelopt.torch.puzzletron.anymodel.model_descriptor import (
+    ModelDescriptor,
+    ModelDescriptorFactory,
+)
+from modelopt.torch.puzzletron.anymodel.puzzformer.no_op import Same
 from modelopt.torch.puzzletron.tools.logger import aprint, mprint
-from modelopt.torch.puzzletron.tools.sharded_checkpoint_utils import load_and_shard_model
+from modelopt.torch.puzzletron.tools.sharded_checkpoint_utils import (
+    load_and_shard_model,
+    set_submodule,
+)
 from modelopt.torch.puzzletron.utils.data.dataloaders import create_validation_dataloader
-from modelopt.torch.puzzletron.utils.parsing import simple_parse_args_string
+from modelopt.torch.puzzletron.utils.parsing import (
+    simple_parse_args_string,  # noqa: F401 (kept for backwards compat)
+)
 from modelopt.torch.puzzletron.utils.validate_runtime_pipeline import (
     HiddenStatesAndLMHead,
     calculate_losses_pipeline,
 )
-from modelopt.torch.puzzletron.utils.validation import calculate_losses
 
 """
 Two goals:
@@ -70,7 +77,6 @@ def validate_model(
     tokenizer: PreTrainedTokenizerBase | None = None,
     target_hidden_states_per_batch: list[torch.Tensor] | None = None,
     return_hidden_states: bool = False,
-    pipeline_parallel: bool = False,
     calculate_full_score_ablations: bool = False,
     val_dataloader: DataLoader | None = None,
 ) -> tuple[dict[str, dict], HiddenStatesAndLMHead | None] | tuple[None, None]:
@@ -79,86 +85,80 @@ def validate_model(
     Args:
         args: Configuration object containing the following attributes:
 
-            Model Configuration attributes:
+            Model Configuration:
+            - model_name_or_path (str): Path to model checkpoint or HuggingFace model name.
+                                        Required unless model is passed directly.
+            - model_dtype (str or torch.dtype): Model data type (e.g., "torch.bfloat16", torch.float16).
+            - autocast_dtype (str or torch.dtype): Autocast data type for mixed precision.
 
-            - ``model_name_or_path`` (str): Path to model checkpoint or HuggingFace model name.
-              Required unless model is passed directly.
-            - ``model_dtype`` (str or torch.dtype): Model data type (e.g., "torch.bfloat16", torch.float16).
-            - ``autocast_dtype`` (str or torch.dtype): Autocast data type for mixed precision.
+            Dataset Configuration:
+            - dataset_path (str): Path to the validation dataset.
+            - tokenizer_name (str, optional): Tokenizer name/path. Uses model_name_or_path if not specified.
+            - data_column (str): Column name in dataset containing text data.
+            - block_size (int): Maximum sequence length for tokenization.
+            - eval_samples (int, optional): Number of samples to evaluate. Uses all if None.
+            - val_dataset_name (str): Name of validation dataset split.
+            - source_datasets_to_discard (list[str], optional): List of source datasets to exclude.
+            - load_dataset_fn (callable, optional): Custom function to load the dataset.
 
-            Dataset Configuration attributes:
+            Data Processing:
+            - micro_batch_size (int): Batch size for evaluation.
+            - seed (int): Random seed for reproducibility.
+            - shuffle_seed (int, optional): Seed for shuffling data. Uses seed if None.
+            - varlen (bool): Enable variable-length sequences.
+            - bos_rate (float): Rate of adding BOS token.
+            - fim_rate (float): Fill-in-the-middle rate for code completion tasks.
+            - fim_spm_rate (float): SPM-based fill-in-the-middle rate.
 
-            - ``dataset_path`` (str): Path to the validation dataset.
-            - ``tokenizer_name`` (str, optional): Tokenizer name/path. Uses model_name_or_path if not specified.
-            - ``data_column`` (str): Column name in dataset containing text data.
-            - ``block_size`` (int): Maximum sequence length for tokenization.
-            - ``eval_samples`` (int, optional): Number of samples to evaluate. Uses all if None.
-            - ``val_dataset_name`` (str): Name of validation dataset split.
-            - ``source_datasets_to_discard`` (list[str], optional): List of source datasets to exclude.
-            - ``load_dataset_fn`` (callable, optional): Custom function to load the dataset.
+            Activation Hooks:
+            - activations_log_dir (str, optional): Directory to log activation scores. If provided,
+                                                   hooks will be registered to capture activations.
+            - activation_hooks_kwargs (str or dict, optional): Arguments for activation hooks.
+                                                               If string, comma-separated format: "arg1=val1,arg2=val2".
 
-            Data Processing attributes:
-
-            - ``micro_batch_size`` (int): Batch size for evaluation.
-            - ``seed`` (int): Random seed for reproducibility.
-            - ``shuffle_seed`` (int, optional): Seed for shuffling data. Uses seed if None.
-            - ``varlen`` (bool): Enable variable-length sequences.
-            - ``bos_rate`` (float): Rate of adding BOS token.
-            - ``fim_rate`` (float): Fill-in-the-middle rate for code completion tasks.
-            - ``fim_spm_rate`` (float): SPM-based fill-in-the-middle rate.
-
-            Activation Hooks attributes:
-
-            - ``activations_log_dir`` (str, optional): Directory to log activation scores.
-              If provided, hooks will be registered to capture activations.
-            - ``activation_hooks_kwargs`` (str or dict, optional): Arguments for activation hooks.
-              If string, comma-separated format: "arg1=val1,arg2=val2".
-
-            Execution Options attributes:
-
-            - ``calc_losses_on_cpu`` (bool): Calculate losses on CPU to avoid OOM. Very slow, not recommended.
-            - ``write_results`` (bool): Write validation results to file.
+            Execution Options:
+            - calc_losses_on_cpu (bool): Calculate losses on CPU to avoid OOM. Very slow, not recommended.
+            - write_results (bool): Write validation results to file.
 
         model: Pre-loaded model. If None, will be loaded from args.model_name_or_path.
         tokenizer: Pre-loaded tokenizer. If None, will be loaded based on args.
         target_hidden_states_per_batch: Target hidden states for pipeline parallel evaluation.
         return_hidden_states: Whether to return hidden states from the model.
-        pipeline_parallel: Enable pipeline parallelism for large models.
         calculate_full_score_ablations: Calculate comprehensive teacher similarity scores.
-            False calculates only a small suite for efficiency.
+                                         False calculates only a small suite for efficiency.
         val_dataloader: Pre-created validation dataloader. If None, will be created from args.
 
     Returns:
         A tuple containing:
-
         - losses: Dictionary mapping loss names to loss statistics (avg, per_sample).
         - hidden_states_per_batch: Hidden states and LM head outputs if return_hidden_states is True, else None.
-
         Returns (None, None) if not on master rank.
     """
+    descriptor = ModelDescriptorFactory.get(args.descriptor)
+
     if val_dataloader is None:
         val_dataloader = prepare_dataloader(args, tokenizer) if dist.is_master() else None
     validation_full_iters = (
         args.eval_samples // args.micro_batch_size
     )  # model pipeline, single data rank
 
-    model = prepare_model(args, model, pipeline_parallel)
+    model = prepare_model(args, descriptor=descriptor, model=model)
 
     just_model_forward = False
     checkpoint_manager = None
     activation_hooks = None
 
     if args.activations_log_dir is not None:
-        activation_hooks_kwargs = (
-            simple_parse_args_string(args.activation_hooks_kwargs)
-            if isinstance(args.activation_hooks_kwargs, str)
-            else args.activation_hooks_kwargs
-        )
+        activation_hooks_kwargs = args.activation_hooks_kwargs or {}
         activation_hooks_kwargs["validation_full_iters"] = validation_full_iters
+        hook_class = args.hook_class
 
-        # Create activation hooks first
-        activation_hooks, hook_class = register_activation_hooks(
-            model=model, activation_hooks_kwargs=activation_hooks_kwargs
+        # Create activation hooks using pruning mixin
+        activation_hooks = register_activation_hooks(
+            model=model,
+            activation_hooks_kwargs=activation_hooks_kwargs,
+            hook_class=hook_class,
+            pruning_mixin=args.pruning_mixin,
         )
 
         # Create checkpoint manager with hooks
@@ -181,26 +181,23 @@ def validate_model(
         else:
             mprint("No checkpoint found, starting fresh")
         just_model_forward = True
-        model.lm_head = nn.Identity()
+        set_submodule(model, descriptor.output_embedding_name(), Same())
 
-    if not pipeline_parallel:
-        losses, hidden_states_per_batch = calculate_losses(
-            model=model,
-            dataloader=val_dataloader,
-            checkpoint_manager=checkpoint_manager,
-        )
-    else:
-        losses, hidden_states_per_batch = calculate_losses_pipeline(
-            stitched_model=model,
-            dataloader=val_dataloader,
-            target_hidden_states_per_batch=target_hidden_states_per_batch,
-            return_hidden_states=return_hidden_states,
-            calculate_full_score_ablations=calculate_full_score_ablations,
-            calc_on_cpu=args.calc_losses_on_cpu,
-            just_model_forward=just_model_forward,
-            checkpoint_manager=checkpoint_manager,
-            autocast_dtype=getattr(torch, args.autocast_dtype.strip("torch.")),
-        )
+    losses, hidden_states_per_batch = calculate_losses_pipeline(
+        stitched_model=model,
+        dataloader=val_dataloader,
+        target_hidden_states_per_batch=target_hidden_states_per_batch,
+        return_hidden_states=return_hidden_states,
+        calculate_full_score_ablations=calculate_full_score_ablations,
+        calc_on_cpu=args.calc_losses_on_cpu,
+        just_model_forward=just_model_forward,
+        checkpoint_manager=checkpoint_manager,
+        autocast_dtype=getattr(
+            torch, getattr(args, "autocast_dtype", "torch.bfloat16").strip("torch.")
+        ),
+        descriptor=descriptor,
+        use_autocast=descriptor.uses_autocast(),
+    )
 
     if losses is not None:
         avg_losses = {loss_name: loss_log["avg"] for loss_name, loss_log in losses.items()}
@@ -224,31 +221,13 @@ def validate_model(
 
 
 def prepare_model(
-    args: DictConfig, model: PreTrainedModel | None = None, pipeline_parallel: bool = False
+    args: DictConfig,
+    descriptor: Type[ModelDescriptor],
+    model: PreTrainedModel | None = None,
 ) -> nn.Module:
     if model is None:
         assert args.model_name_or_path is not None
-        if pipeline_parallel:
-            model = load_and_shard_model(
-                args.model_name_or_path,
-                model_config_overrides={"block_size": args.block_size},
-                model_dtype=getattr(torch, args.model_dtype.strip("torch.")),
-            )
-        else:
-            try:
-                model = load_checkpoint(
-                    args.model_name_or_path,
-                    model_config_overrides={"block_size": args.block_size},
-                    ignore_unexpected_config_keys=True,
-                )
-                model.to("cuda")
-            except FileNotFoundError:
-                model = AutoModelForCausalLM.from_pretrained(
-                    args.model_name_or_path,
-                    torch_dtype="auto",
-                    device_map="auto",
-                    trust_remote_code=True,
-                )
+        model = load_and_shard_model(descriptor=descriptor, checkpoint_path=args.model_name_or_path)
 
     model.eval()
     return model

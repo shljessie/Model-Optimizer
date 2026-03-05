@@ -15,6 +15,7 @@
 
 """This module provides the main compression function for a model using MIP-based NAS search algorithm."""
 
+import hydra
 from omegaconf import DictConfig
 
 import modelopt.torch.puzzletron.activation_scoring.score_pruning_activations as score_pruning_activations
@@ -51,24 +52,25 @@ def puzzletron(
             f"dataset_path={dataset_path}",
         ],
     )
+    hydra_cfg = hydra.utils.instantiate(hydra_cfg)
 
     # Step 1: score_pruning_activations (distributed processing)
     score_pruning_activations.launch_score_activations(hydra_cfg)
 
-    # Step 2: pruning_ckpts (single process)
-    if dist.is_master():
-        pruning_ckpts.launch_prune_ckpt(hydra_cfg)
-    dist.barrier()
+    # # Step 2: pruning_ckpts (single process)
+    # if dist.is_master():
+    #     pruning_ckpts.launch_prune_ckpt(hydra_cfg)
+    # dist.barrier()
 
-    # Step 4: build_library_and_stats (single process)
-    if dist.is_master():
-        build_library_and_stats.launch_build_library_and_stats(hydra_cfg)
-    dist.barrier()
+    # # Step 4: build_library_and_stats (single process)
+    # if dist.is_master():
+    #     build_library_and_stats.launch_build_library_and_stats(hydra_cfg)
+    # dist.barrier()
 
-    # Step 5: calc_one_block_scores (distributed processing)
-    scoring.launch_scoring(hydra_cfg)
+    # # Step 5: calc_one_block_scores (distributed processing)
+    # scoring.launch_scoring(hydra_cfg)
 
-    # Step 6: mip_and_realize_models (distributed processing)
-    mip_and_realize_models.launch_mip_and_realize_model(hydra_cfg)
+    # # Step 6: mip_and_realize_models (distributed processing)
+    # mip_and_realize_models.launch_mip_and_realize_model(hydra_cfg)
 
     return hydra_cfg

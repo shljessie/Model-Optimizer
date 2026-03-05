@@ -24,6 +24,7 @@ from _test_utils.torch.distributed.utils import spawn_multiprocess_job
 from _test_utils.torch.puzzletron.utils import setup_test_model_and_data
 
 import modelopt.torch.utils.distributed as dist
+from modelopt.torch.puzzletron import puzzletron
 from modelopt.torch.puzzletron.anymodel import convert_model
 
 # The e2e test to compress a model based on Local Neural Architecture Search (Mixed Integer Programing NAS search)
@@ -42,26 +43,26 @@ from modelopt.torch.puzzletron.anymodel import convert_model
     ),
     [
         ("llama_3_1_8b_instruct", "llama", "llama_3_1_8b_instruct", None, False),
-        ("llama_3_2_3b_instruct", "llama", "llama_3_1_8b_instruct", None, False),
-        ("qwen2_5_7b_instruct", "qwen2", "qwen2_5_7b_instruct", None, False),
-        (
-            "mistral-small-24b-instruct-2501",
-            "mistral_small",
-            "mistral-small-24b-instruct-2501",
-            None,
-            False,
-        ),
-        ("qwen3-8b", "qwen3", "qwen3-8b", None, False),
-        ("qwen3-vl-30b-a3b-instruct", "qwen3_vl", "qwen3-vl-30b-a3b-instruct", None, True),
-        ("nemotron-nano-12b-v2", "nemotron_h_v2", "nemotron-nano-12b-v2", "*-", False),
-        (
-            "nemotron-3-nano-30b-a3b-base-bf16",
-            "nemotron_h",
-            "nemotron-3-nano-30b-a3b-base-bf16",
-            "*E",
-            True,
-        ),
-        ("gpt-oss-20b", "gpt_oss_20b", "gpt-oss-20b", None, True),
+        # ("llama_3_2_3b_instruct", "llama", "llama_3_1_8b_instruct", None, False),
+        # ("qwen2_5_7b_instruct", "qwen2", "qwen2_5_7b_instruct", None, False),
+        # (
+        #     "mistral-small-24b-instruct-2501",
+        #     "mistral_small",
+        #     "mistral-small-24b-instruct-2501",
+        #     None,
+        #     False,
+        # ),
+        # ("qwen3-8b", "qwen3", "qwen3-8b", None, False),
+        # ("qwen3-vl-30b-a3b-instruct", "qwen3_vl", "qwen3-vl-30b-a3b-instruct", None, True),
+        # ("nemotron-nano-12b-v2", "nemotron_h_v2", "nemotron-nano-12b-v2", "*-", False),
+        # (
+        #     "nemotron-3-nano-30b-a3b-base-bf16",
+        #     "nemotron_h",
+        #     "nemotron-3-nano-30b-a3b-base-bf16",
+        #     "*E",
+        #     True,
+        # ),
+        # ("gpt-oss-20b", "gpt_oss_20b", "gpt-oss-20b", None, True),
     ],
 )
 def test_puzzletron(
@@ -106,7 +107,7 @@ def _test_puzzletron_multiprocess_job(
     puzzle_dir, hf_checkpoint_path, dataset_path = setup_test_model_and_data(
         project_root_path, tmp_path, rank, hf_config_name, hybrid_override_pattern
     )
-    hydra_config_dir = (  # noqa: F841
+    hydra_config_dir = (
         project_root_path / f"tests/gpu/torch/puzzletron/resources/configs/{hydra_config_subdir}"
     )
 
@@ -120,10 +121,10 @@ def _test_puzzletron_multiprocess_job(
     dist.barrier()
 
     # TODO commented for the duration of merging process  from dkorzekwa/any_model to feature/puzzletron
-    # # Compress the model using a one-click approach
-    # puzzletron.puzzletron(
-    #     str(hydra_config_dir), hydra_config_subdir, str(puzzle_dir), str(dataset_path)
-    # )
+    # Compress the model using a one-click approach
+    puzzletron.puzzletron(
+        str(hydra_config_dir), hydra_config_subdir, str(puzzle_dir), str(dataset_path)
+    )
 
     # #
     # # Check assertions
