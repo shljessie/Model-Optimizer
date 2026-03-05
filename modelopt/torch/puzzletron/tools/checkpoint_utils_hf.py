@@ -120,7 +120,21 @@ def load_model_config(
     checkpoint_dir: Path | str,
     model_config_overrides: Mapping | None = None,
     ignore_unexpected_config_keys: bool = False,
+    trust_remote_code: bool = False,
 ):
+    """Load model configuration from a checkpoint directory.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory (e.g. containing config.json).
+        model_config_overrides: Optional mapping of config overrides.
+        ignore_unexpected_config_keys: If True, ignore unexpected config keys.
+        trust_remote_code: If True, allows execution of custom code from the model repository.
+            This is a security risk if the model source is untrusted. Only set to True if you
+            trust the source of the model. Defaults to False for security.
+
+    Returns:
+        Loaded model configuration (PretrainedConfig).
+    """
     if not isinstance(checkpoint_dir, Path):
         checkpoint_dir = Path(checkpoint_dir)
 
@@ -128,7 +142,10 @@ def load_model_config(
         model_config_overrides = {}
 
     config, unused_kwargs = AutoConfig.from_pretrained(
-        checkpoint_dir, trust_remote_code=True, return_unused_kwargs=True, **model_config_overrides
+        checkpoint_dir,
+        trust_remote_code=trust_remote_code,
+        return_unused_kwargs=True,
+        **model_config_overrides,
     )
     if hasattr(config, "block_configs"):
         config.block_configs = maybe_cast_block_configs(config.block_configs)
