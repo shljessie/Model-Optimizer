@@ -124,6 +124,23 @@ DEFAULT_LORA_CFG_RANDOM_INIT_SMALL_RANK_TEST = {
     },
 }
 
+MOE_SEQUENTIAL_MLP_LORA_CFG = {
+    "adapter_type": "lora",
+    "adapter_name": "moe_default",
+    "adapter_cfg": {
+        # Disable for all layers by default; only enable on SequentialMLP modules
+        # whose full module name ends with "experts" (not its inner linear layers).
+        "*": {"enable": False},
+        "*experts": {
+            "rank": 8,
+            "scale": 1.0,
+            "lora_a_init": init.kaiming_uniform_,
+            "lora_b_init": init.kaiming_uniform_,
+            "enable": True,
+        },
+    },
+}
+
 SELECTIVE_LAYER_LORA_CFG = {
     "adapter_type": "lora",
     "adapter_name": "selective",
@@ -831,4 +848,115 @@ def _test_mcore_lora_then_quantize_save_restore(lora_config, tmp_path, rank, siz
 def test_mcore_lora_then_quantize_save_restore(dist_workers, lora_config, tmp_path):
     dist_workers.run(
         partial(_test_mcore_lora_then_quantize_save_restore, lora_config, str(tmp_path))
+    )
+
+
+def _test_moe_sequential_mlp_lora_structure(lora_config, rank, size):
+    """Verify LoRA on SequentialMLP creates one shared lora_down and per-expert lora_up."""
+    from megatron.core.transformer.moe.experts import SequentialMLP
+
+    num_experts = 4
+    hidden_size = 256
+    lora_rank = lora_config["adapter_cfg"]["*experts"]["rank"]
+    initialize_for_megatron(tensor_model_parallel_size=size, pipeline_model_parallel_size=1)
+    model = get_mcore_gpt_model(
+        tp_size=size,
+        hidden_size=hidden_size,
+        num_attention_heads=4,
+        ffn_hidden_size=None,
+        num_moe_experts=num_experts,
+        moe_grouped_gemm=False,  # ensures SequentialMLP, not GroupedMLP
+        transformer_impl="local",
+    ).cuda()
+
+    prompt_tokens = torch.randint(0, model.vocab_size, (2, model.max_sequence_length)).cuda()
+    original_output = megatron_prefill(model, prompt_tokens)
+
+    mtpeft.update_model(model, lora_config)
+
+    adapter_name = lora_config["adapter_name"]
+    moe_lora_modules = []
+    for name, module in model.named_modules():
+        if isinstance(module, LoRAModule) and isinstance(module, SequentialMLP):
+            moe_lora_modules.append((name, module))
+            # lora_down: single shared nn.Linear
+            lora_a = getattr(module, f"lora_a_{adapter_name}")
+            assert isinstance(lora_a, torch.nn.Linear), (
+                f"lora_a should be nn.Linear, got {type(lora_a)}"
+            )
+            assert lora_a.weight.shape == (lora_rank, hidden_size), (
+                f"lora_a shape mismatch: {lora_a.weight.shape}"
+            )
+            # lora_up: ModuleList with one entry per local expert
+            lora_b = getattr(module, f"lora_b_{adapter_name}")
+            assert isinstance(lora_b, torch.nn.ModuleList), (
+                f"lora_b should be nn.ModuleList, got {type(lora_b)}"
+            )
+            assert len(lora_b) == module.num_local_experts, (
+                f"Expected {module.num_local_experts} lora_up modules, got {len(lora_b)}"
+            )
+            for up in lora_b:
+                assert isinstance(up, torch.nn.Linear)
+                assert up.weight.shape == (hidden_size, lora_rank)
+
+    assert len(moe_lora_modules) > 0, "No LoRA-wrapped SequentialMLP modules found in model"
+
+    # Random-init lora → output differs from original
+    lora_output = megatron_prefill(model, prompt_tokens)
+    assert lora_output.shape == original_output.shape
+    assert not torch.allclose(lora_output, original_output)
+
+    # Disable all adapters → output matches original
+    mtpeft.disable_adapters(model)
+    disabled_output = megatron_prefill(model, prompt_tokens)
+    assert torch.allclose(disabled_output, original_output, rtol=1e-3, atol=1e-3)
+
+    # Re-enable → output matches lora_output
+    mtpeft.enable_adapters(model)
+    reenabled_output = megatron_prefill(model, prompt_tokens)
+    assert torch.allclose(reenabled_output, lora_output, rtol=1e-3, atol=1e-3)
+
+
+def test_moe_sequential_mlp_lora_structure(dist_workers):
+    dist_workers.run(partial(_test_moe_sequential_mlp_lora_structure, MOE_SEQUENTIAL_MLP_LORA_CFG))
+
+
+def _test_moe_sequential_mlp_lora_gradient_flow(lora_config, rank, size):
+    """Verify gradients flow to the shared lora_down and all per-expert lora_up weights."""
+    num_experts = 4
+    hidden_size = 256
+    initialize_for_megatron(tensor_model_parallel_size=size, pipeline_model_parallel_size=1)
+    model = get_mcore_gpt_model(
+        tp_size=size,
+        hidden_size=hidden_size,
+        num_attention_heads=4,
+        ffn_hidden_size=None,
+        num_moe_experts=num_experts,
+        moe_grouped_gemm=False,
+        transformer_impl="local",
+    ).cuda()
+
+    mtpeft.update_model(model, lora_config)
+    model.train()
+
+    batch_size, seq_len = 2, model.max_sequence_length
+    prompt_tokens = torch.randint(0, model.vocab_size, (batch_size, seq_len)).cuda()
+    attention_mask = (
+        torch.triu(torch.ones((batch_size, seq_len, seq_len), device="cuda"), diagonal=1)
+        .bool()
+        .view(batch_size, 1, seq_len, seq_len)
+    )
+    output = model(prompt_tokens, position_ids=None, attention_mask=attention_mask)
+    output.sum().backward()
+
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            assert param.grad is not None, f"Expected grad for LoRA param {name}"
+        else:
+            assert param.grad is None, f"Expected no grad for frozen base param {name}"
+
+
+def test_moe_sequential_mlp_lora_gradient_flow(dist_workers):
+    dist_workers.run(
+        partial(_test_moe_sequential_mlp_lora_gradient_flow, MOE_SEQUENTIAL_MLP_LORA_CFG)
     )
