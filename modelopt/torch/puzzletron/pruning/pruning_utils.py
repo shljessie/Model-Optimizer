@@ -366,10 +366,10 @@ def _init_attention_biases(
         f"({new_config.num_attention_heads=}) != ({original_config.num_attention_heads=})"
     )
     num_q_heads = new_config.num_attention_heads
-    n_heads_in_group = new_config.block_configs[layer_idx].attention.n_heads_in_group
-    orig_n_heads_in_group = original_config.block_configs[layer_idx].attention.n_heads_in_group
-    num_kv_heads = num_q_heads // n_heads_in_group
-    orig_num_kv_heads = num_q_heads // orig_n_heads_in_group
+    num_kv_heads = new_config.block_configs[layer_idx].attention.num_key_value_heads
+    orig_num_kv_heads = original_config.block_configs[layer_idx].attention.num_key_value_heads
+    n_heads_in_group = num_q_heads // num_kv_heads
+    orig_n_heads_in_group = num_q_heads // orig_num_kv_heads
 
     o_proj_bias = new_config.o_proj_bias
     attention_bias = new_config.attention_bias
