@@ -127,11 +127,12 @@ class _QuantConv3d(QuantLinearConvBase):
         if not self._should_use_implicit_gemm():
             return super().forward(input, *args, **kwargs)
 
-        from experimental.conv.implicit_gemm_cuda import conv3d_implicit_gemm_cuda
+        # During calibration we only need to collect amax — use the faster
+        # default cuDNN path since the conv output itself doesn't matter.
+        if self.input_quantizer._if_calib and not self.input_quantizer._if_quant:
+            return super().forward(input, *args, **kwargs)
 
-        # --- Calibration: let input_quantizer collect amax without fake-quantizing ---
-        if self.input_quantizer._if_calib:
-            self.input_quantizer.collect(input)
+        from experimental.conv.implicit_gemm_cuda import conv3d_implicit_gemm_cuda
 
         # --- Get activation amax for the kernel ---
         act_amax = self.input_quantizer._get_amax(input)
@@ -151,7 +152,7 @@ class _QuantConv3d(QuantLinearConvBase):
             padding=self.padding,
             dilation=self.dilation,
             act_amax=act_amax,
-            quant_act=self.input_quantizer._if_quant and not self.input_quantizer._disabled,
+            quant_act=not self.input_quantizer._disabled,
             fp4_block_size=fp4_block_size,
         )
 
