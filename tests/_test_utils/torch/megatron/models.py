@@ -213,8 +213,7 @@ def get_mcore_gpt_model(
             num_experts=num_moe_experts,
             normalization=normalization,
             moe_grouped_gemm=moe_grouped_gemm,
-            # TODO: uncomment this when TEGroupedMLP is enabled in Megatron-LM
-            # use_te=use_te,
+            use_te=use_te,
         )
     else:
         assert HAS_TE, "Transformer Engine not installed"

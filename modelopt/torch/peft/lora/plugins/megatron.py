@@ -30,6 +30,21 @@ from modelopt.torch.quantization.plugins.megatron import (
     _MegatronRowParallelLinear as QuantRowParallelLinear,
 )
 
+try:
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+    )
+
+    from modelopt.torch.quantization.plugins.megatron import (
+        _QuantTEMCoreColumnParallelLinear,
+        _QuantTEMCoreRowParallelLinear,
+    )
+
+    HAS_TE = True
+except ImportError:
+    HAS_TE = False
+
 from ...config import PEFTAttributeConfig
 from ...custom import CUSTOM_MODEL_PLUGINS
 from ..layer import LoRAModule, LoRAModuleRegistry
@@ -333,7 +348,7 @@ class _LoRAMegatronSequentialMLP(_MegatronParallelLoRABase):
         - ``lora_b_{adapter_name}.{i}`` (lora_up[i]): EP-sharded in the same way as
           ``local_experts.{i}``, i.e., mapped to global expert index.
         """
-        from megatron.core.transformer import ensure_metadata_has_dp_cp_group
+        from modelopt.torch.opt.plugins.megatron import ensure_metadata_has_dp_cp_group
 
         # Base SequentialMLP state dict (handles local_experts weights).
         sharded_state_dict = SequentialMLP.sharded_state_dict(
@@ -430,3 +445,174 @@ QuantModuleRegistry.register(
 QuantModuleRegistry.register({_LoRAMegatronRowParallelLinear: "lora_megatron_RowParallelLinear"})(
     _QuantLoRAMegatronRowParallelLinear
 )
+
+if HAS_TE:
+
+    @LoRAModuleRegistry.register({TEColumnParallelLinear: "te_megatron_ColumnParallelLinear"})
+    class _LoRATEColumnParallelLinear(_MegatronParallelLoRABase):
+        """LoRA implementation for TEColumnParallelLinear layers.
+
+        The base TE layer stores ``in_features`` as the full input size and
+        ``out_features`` as the per-partition output size (TE divides internally
+        by ``tp_size``), so the full output is ``out_features * tp_size``.
+
+        Adapter layout:
+        - ``lora_a``: replicated ``nn.Linear(in_features, rank)``
+        - ``lora_b``: ``TEColumnParallelLinear(rank, out_features * tp_size)``
+          sharded at dim 0 via its own ``sharded_state_dict``
+        """
+
+        def update_layer_lora(
+            self,
+            adapter_name: str,
+            attr_config: "PEFTAttributeConfig",
+        ) -> None:
+            lora_a = nn.Linear(
+                in_features=self.in_features,
+                out_features=attr_config.rank,
+                bias=False,
+            )
+            with torch.no_grad():
+                attr_config.lora_a_init(lora_a.weight)
+
+            lora_b = TEColumnParallelLinear(
+                input_size=attr_config.rank,
+                output_size=self.out_features * self.tp_size,
+                config=self.config,
+                init_method=attr_config.lora_b_init,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_group=self._tp_group,
+            )
+
+            self._register_adapter_with_device(
+                adapter_name,
+                lora_a,
+                lora_b,
+                attr_config.rank,
+                attr_config.scale,
+                attr_config.enable,
+            )
+
+        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+            """lora_a is replicated; lora_b is sharded at dim 0 via TEColumnParallelLinear."""
+            from modelopt.torch.opt.plugins.megatron import ensure_metadata_has_dp_cp_group
+
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+            if hasattr(self, "_lora_adapters"):
+                for adapter_name in self._lora_adapters:
+                    lora_b_name = f"lora_b_{adapter_name}"
+                    lora_b = self._lora_adapters[adapter_name]["lora_b"]
+
+                    assert isinstance(lora_b, TEColumnParallelLinear)
+                    lora_b_sharded = lora_b.sharded_state_dict(
+                        prefix=f"{prefix}{lora_b_name}.",
+                        sharded_offsets=sharded_offsets,
+                        metadata=metadata,
+                    )
+                    sharded_state_dict.update(lora_b_sharded)
+
+            return sharded_state_dict
+
+    @LoRAModuleRegistry.register({TERowParallelLinear: "te_megatron_RowParallelLinear"})
+    class _LoRATERowParallelLinear(_MegatronParallelLoRABase):
+        """LoRA implementation for TERowParallelLinear layers.
+
+        The base TE layer stores ``in_features`` as the per-partition input size
+        and ``out_features`` as the full output size, so the full input is
+        ``in_features * tp_size``.
+
+        Adapter layout:
+        - ``lora_a``: ``TERowParallelLinear(in_features * tp_size, rank)``
+          sharded at dim 1 via its own ``sharded_state_dict``
+        - ``lora_b``: replicated ``nn.Linear(rank, out_features)``
+        """
+
+        def update_layer_lora(
+            self,
+            adapter_name: str,
+            attr_config: "PEFTAttributeConfig",
+        ) -> None:
+            lora_a = TERowParallelLinear(
+                input_size=self.in_features * self.tp_size,
+                output_size=attr_config.rank,
+                config=self.config,
+                init_method=attr_config.lora_a_init,
+                bias=False,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=False,
+                tp_group=self._tp_group,
+            )
+
+            lora_b = nn.Linear(
+                in_features=attr_config.rank,
+                out_features=self.out_features,
+                bias=False,
+            )
+            with torch.no_grad():
+                attr_config.lora_b_init(lora_b.weight)
+
+            self._register_adapter_with_device(
+                adapter_name,
+                lora_a,
+                lora_b,
+                attr_config.rank,
+                attr_config.scale,
+                attr_config.enable,
+            )
+
+        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+            """lora_a is sharded at dim 1 via TERowParallelLinear; lora_b is replicated."""
+            from modelopt.torch.opt.plugins.megatron import ensure_metadata_has_dp_cp_group
+
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+            if hasattr(self, "_lora_adapters"):
+                for adapter_name in self._lora_adapters:
+                    lora_a_name = f"lora_a_{adapter_name}"
+                    lora_a = self._lora_adapters[adapter_name]["lora_a"]
+
+                    assert isinstance(lora_a, TERowParallelLinear)
+                    lora_a_sharded = lora_a.sharded_state_dict(
+                        prefix=f"{prefix}{lora_a_name}.",
+                        sharded_offsets=sharded_offsets,
+                        metadata=metadata,
+                    )
+                    sharded_state_dict.update(lora_a_sharded)
+
+            return sharded_state_dict
+
+    # Register LoRA for quantized TE types (LoRA applied after TE quantization).
+    LoRAModuleRegistry.register(
+        {_QuantTEMCoreColumnParallelLinear: "quant_te_megatron_ColumnParallelLinear"}
+    )(_LoRATEColumnParallelLinear)
+    LoRAModuleRegistry.register(
+        {_QuantTEMCoreRowParallelLinear: "quant_te_megatron_RowParallelLinear"}
+    )(_LoRATERowParallelLinear)
+
+    class _QuantLoRATEColumnParallelLinear(
+        _LoRATEColumnParallelLinear, _QuantTEMCoreColumnParallelLinear
+    ):
+        """Quantized LoRA TEColumnParallelLinear combining LoRA and TE quantization."""
+
+        def _setup(self):
+            _QuantTEMCoreColumnParallelLinear._setup(self)
+
+    class _QuantLoRATERowParallelLinear(_LoRATERowParallelLinear, _QuantTEMCoreRowParallelLinear):
+        """Quantized LoRA TERowParallelLinear combining LoRA and TE quantization."""
+
+        def _setup(self):
+            _QuantTEMCoreRowParallelLinear._setup(self)
+
+    QuantModuleRegistry.register(
+        {_LoRATEColumnParallelLinear: "lora_te_megatron_ColumnParallelLinear"}
+    )(_QuantLoRATEColumnParallelLinear)
+    QuantModuleRegistry.register({_LoRATERowParallelLinear: "lora_te_megatron_RowParallelLinear"})(
+        _QuantLoRATERowParallelLinear
+    )
