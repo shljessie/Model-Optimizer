@@ -24,6 +24,7 @@ from typing import Any
 import numpy as np
 import torch
 from accelerate.hooks import remove_hook_from_module
+from eval_perplexity import evaluate_perplexity
 from example_utils import (
     build_quant_cfg,
     copy_custom_model_files,
@@ -681,6 +682,9 @@ def export_quantized(
                     "They will be set at deployment time."
                 )
 
+            if getattr(args, "eval_perplexity", False) and tokenizer is not None:
+                evaluate_perplexity(full_model, tokenizer, seq_len=2048)
+
             # Load any missing weights from non-standard safetensors (handled in get_model for non-low-memory mode)
             # Store the MTP layer prefixes on the model for later exclusion from quantization
             mtp_layer_prefixes, mtp_state_dict = load_mtp_weights(full_model, args.pyt_ckpt_path)
@@ -1221,6 +1225,12 @@ def parse_args() -> argparse.Namespace:
             "Only used for MOE models; used to reduce the number of experts calibrated during the forward pass. "
             "Does not impact non-MOE models."
         ),
+    )
+    parser.add_argument(
+        "--eval_perplexity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Evaluate Wikitext-2 perplexity after quantization (before export).",
     )
 
     args = parser.parse_args()
