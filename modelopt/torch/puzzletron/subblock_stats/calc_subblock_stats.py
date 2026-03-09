@@ -285,7 +285,8 @@ def calculate_subblock_stats_for_puzzle_dir(
     teacher_dir = (
         Path(teacher_dir) if teacher_dir is not None else master_puzzle_dir / "ckpts" / "teacher"
     )
-    model_config = load_model_config(teacher_dir)
+    trust_remote_code = descriptor.requires_trust_remote_code()
+    model_config = load_model_config(teacher_dir, trust_remote_code=trust_remote_code)
     # Get language model config for LM-specific attributes (VL models have nested config)
     lm_config = descriptor.get_language_model_config(model_config)
     subblock_configs = _load_subblock_configs(master_puzzle_dir, ffn_hidden_sizes, model_config)

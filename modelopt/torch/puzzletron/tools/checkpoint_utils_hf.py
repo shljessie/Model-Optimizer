@@ -73,10 +73,19 @@ def load_checkpoint(
     checkpoint_dir: Path | str,
     model_config_overrides: dict | None = None,
     ignore_unexpected_config_keys: bool = False,
+    trust_remote_code: bool = False,
 ) -> DeciLMForCausalLM:
     """
     Unlike AutoModelForCausalLM.from_pretrained, the models loaded by this function use your
     local repo code, not the code inside the checkpoint.
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory
+        model_config_overrides: Optional mapping of config overrides.
+        ignore_unexpected_config_keys: If True, ignore unexpected config keys.
+        trust_remote_code: If True, allows execution of custom code from the model repository.
+            This is a security risk if the model source is untrusted. Only set to True if you
+            trust the source of the model. Defaults to False for security.
     """
     from modelopt.torch.puzzletron.tools.checkpoint_utils import (
         load_state_dict,  # prevent circular import
@@ -86,7 +95,10 @@ def load_checkpoint(
         checkpoint_dir = Path(checkpoint_dir)
 
     model_config = load_model_config(
-        checkpoint_dir, model_config_overrides, ignore_unexpected_config_keys
+        checkpoint_dir,
+        model_config_overrides=model_config_overrides,
+        ignore_unexpected_config_keys=ignore_unexpected_config_keys,
+        trust_remote_code=trust_remote_code,
     )
 
     # Without sparsity we could have done:
@@ -221,7 +233,17 @@ def _save_checkpoint(
     )
 
 
-def split_checkpoint_to_subblocks(checkpoint_dir: Path | str) -> None:
+def split_checkpoint_to_subblocks(
+    checkpoint_dir: Path | str, trust_remote_code: bool = False
+) -> None:
+    """Split a checkpoint into subblocks.
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory
+        trust_remote_code: If True, allows execution of custom code from the model repository.
+            This is a security risk if the model source is untrusted. Only set to True if you
+            trust the source of the model. Defaults to False for security.
+    """
     from modelopt.torch.puzzletron.tools.checkpoint_utils import (
         load_state_dict,  # prevent circular import
     )
@@ -229,7 +251,7 @@ def split_checkpoint_to_subblocks(checkpoint_dir: Path | str) -> None:
     if not isinstance(checkpoint_dir, Path):
         checkpoint_dir = Path(checkpoint_dir)
 
-    model_config = load_model_config(checkpoint_dir)
+    model_config = load_model_config(checkpoint_dir, trust_remote_code=trust_remote_code)
     state_dict = load_state_dict(checkpoint_dir)
     save_subblocks(state_dict, checkpoint_dir)
 

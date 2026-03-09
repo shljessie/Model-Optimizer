@@ -29,6 +29,10 @@ import numpy as np
 import yaml
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from modelopt.torch.puzzletron.anymodel.model_descriptor import (
+    ModelDescriptor,
+    ModelDescriptorFactory,
+)
 from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import (
     AttentionConfig,
     BlockConfig,
@@ -558,7 +562,12 @@ def _parse_teacher_block_metrics(
 ) -> list[dict]:
     raw_metrics = json.loads((single_block_replacement_validation_dir / "teacher.json").read_text())
     teacher_checkpoint_dir = Path(raw_metrics["args"]["teacher_dir"]).resolve()
-    teacher_model_config = load_model_config(teacher_checkpoint_dir)
+    descriptor_name = raw_metrics["args"]["descriptor"]
+    descriptor = ModelDescriptorFactory.get(descriptor_name)
+    trust_remote_code = descriptor.requires_trust_remote_code()
+    teacher_model_config = load_model_config(
+        teacher_checkpoint_dir, trust_remote_code=trust_remote_code
+    )
 
     teacher_replacements = None
     replacement_library_path = raw_metrics["args"].get("replacement_library_path")

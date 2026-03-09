@@ -135,17 +135,20 @@ def skip_init(module_cls, *args, **kwargs) -> nn.Module:
     return module
 
 
-def is_valid_decilm_checkpoint(checkpoint_dir: Path | str) -> bool:
+def is_valid_decilm_checkpoint(checkpoint_dir: Path | str, trust_remote_code: bool = False) -> bool:
     """Validate that a checkpoint is in DeciLM format (has block_configs).
 
     Args:
         checkpoint_dir: Path to checkpoint directory
+        trust_remote_code: If True, allows execution of custom code from the model repository.
+            This is a security risk if the model source is untrusted. Only set to True if you
+            trust the source of the model. Defaults to False for security.
 
     Returns:
         True if checkpoint is valid DeciLM format, False otherwise
     """
     try:
-        model_config = load_model_config(checkpoint_dir)
+        model_config = load_model_config(checkpoint_dir, trust_remote_code=trust_remote_code)
         if model_config.block_configs is None:
             warnings.warn(
                 f"Skipping checkpoint '{checkpoint_dir}' - not in DeciLM format (missing block_configs)"
