@@ -110,10 +110,15 @@ def conv3d_implicit_gemm_cuda(
 
     cuda_mod = _get_cuda_module()
 
-    assert x.ndim == 5 and w.ndim == 5
+    if x.ndim != 5 or w.ndim != 5:
+        raise ValueError(f"Expected 5D tensors, got x.ndim={x.ndim}, w.ndim={w.ndim}")
     n_batch, cin, d, h, w_in = x.shape
     cout, cin_w, kd, kh, kw = w.shape
-    assert cin_w == cin
+    if cin_w != cin:
+        raise ValueError(
+            f"Grouped convolution is not supported (x has {cin} input channels, "
+            f"w has {cin_w}). This kernel requires groups=1."
+        )
 
     sd, sh, sw = _triple(stride)
     dd, dh, dw = _triple(dilation)
