@@ -29,14 +29,26 @@ _KERNEL_DIR = os.path.dirname(os.path.abspath(__file__))
 _cuda_module = None
 
 
+_MIN_SM_MAJOR = 8  # BF16 WMMA tensor cores require SM80+ (Ampere and newer)
+
+
 def _get_cuda_module():
     """Get or compile the CUDA module."""
     global _cuda_module
     if _cuda_module is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available. This kernel requires a CUDA GPU.")
+        major, minor = torch.cuda.get_device_capability()
+        if major < _MIN_SM_MAJOR:
+            raise RuntimeError(
+                f"This kernel requires SM{_MIN_SM_MAJOR}0+ (Ampere or newer) for BF16 WMMA "
+                f"tensor cores, but the current GPU has SM{major}{minor}."
+            )
+
         from torch.utils.cpp_extension import load
 
         _cuda_module = load(
-            name="conv3d_implicit_gemm_cuda_v19_wmma",
+            name="conv3d_implicit_gemm_cuda_v20_wmma",
             sources=[
                 os.path.join(_KERNEL_DIR, "implicit_gemm_binding.cpp"),
                 os.path.join(_KERNEL_DIR, "implicit_gemm_kernel.cu"),
@@ -94,17 +106,31 @@ def conv3d_implicit_gemm_cuda(
         dilation: Convolution dilation (D, H, W)
         act_amax: Activation max value for FP4 quantization
         quant_act: Whether to apply FP4 quantization to activations
-        fp4_block_size: FP4 quantization block size (128 or 256)
+        fp4_block_size: FP4 quantization block size (16, 32, 64, 128, or 256)
 
     Returns:
         Output tensor [N, Cout, OD, OH, OW]
+
+    Raises:
+        ValueError: If fp4_block_size is not one of {16, 32, 64, 128, 256}.
     """
+    valid_block_sizes = {16, 32, 64, 128, 256}
+    if fp4_block_size not in valid_block_sizes:
+        raise ValueError(
+            f"fp4_block_size must be one of {sorted(valid_block_sizes)}, got {fp4_block_size}"
+        )
+
     cuda_mod = _get_cuda_module()
 
-    assert x.ndim == 5 and w.ndim == 5
+    if x.ndim != 5 or w.ndim != 5:
+        raise ValueError(f"Expected 5D tensors, got x.ndim={x.ndim}, w.ndim={w.ndim}")
     n_batch, cin, d, h, w_in = x.shape
     cout, cin_w, kd, kh, kw = w.shape
-    assert cin_w == cin
+    if cin_w != cin:
+        raise ValueError(
+            f"Grouped convolution is not supported (x has {cin} input channels, "
+            f"w has {cin_w}). This kernel requires groups=1."
+        )
 
     sd, sh, sw = _triple(stride)
     dd, dh, dw = _triple(dilation)
@@ -130,7 +156,10 @@ def conv3d_implicit_gemm_cuda(
     has_bias = bias is not None
     bias_t = bias.float().contiguous() if has_bias else torch.empty(0, device=x.device)  # type: ignore[union-attr]
 
-    do_quant = quant_act and act_amax is not None
+    if quant_act and act_amax is None:
+        raise ValueError("act_amax is required when quant_act=True")
+
+    do_quant = quant_act
     amax_t = act_amax.float().contiguous() if do_quant else torch.empty(0, device=x.device)  # type: ignore[union-attr]
 
     y_flat = cuda_mod.conv3d_implicit_gemm_cuda(
