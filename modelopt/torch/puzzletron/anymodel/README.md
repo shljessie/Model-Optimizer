@@ -46,7 +46,7 @@ from models.<model_name> import *
 ## Usage
 
 ```python
-from scripts.convert_any_model import convert_model
+from modelopt.torch.puzzletron.anymodel import convert_model
 
 convert_model(
     input_dir="path/to/hf_checkpoint",
