@@ -24,44 +24,54 @@ after export. Common use cases include:
 - Transposing DequantizeLinear weights for column-major storage optimization
 - Graph cleanup and optimization
 
-Example usage:
-    >>> from modelopt.onnx.graph_surgery import (
-    ...     replace_attention_with_gqa,
-    ...     convert_fp16_to_bf16,
-    ...     transpose_dequantize_linear_weights,
-    ...     add_cross_kv_to_encoder,
-    ... )
-    >>> # Replace attention with GQA for LLMs (FP16 model)
-    >>> replace_attention_with_gqa(
-    ...     model_path="model_fp16.onnx",
-    ...     output_path="model_gqa.onnx",
-    ...     hf_model_id="meta-llama/Llama-2-7b-hf",
-    ...     io_dtype="float16",
-    ... )
-    >>> # Replace attention with GQA and convert to BF16 in one step
-    >>> replace_attention_with_gqa(
-    ...     model_path="model_fp16.onnx",
-    ...     output_path="model_gqa_bf16.onnx",
-    ...     hf_model_id="meta-llama/Llama-2-7b-hf",
-    ...     io_dtype="bfloat16",  # Automatically converts FP16 to BF16
-    ... )
-    >>> # Add cross-attention KV cache outputs to encoder (GenAI compatible)
-    >>> add_cross_kv_to_encoder(
-    ...     encoder_path="encoder_model.onnx",
-    ...     output_path="encoder_with_kv.onnx",
-    ...     hf_model_id="openai/whisper-large-v3-turbo",
-    ... )
-    >>> # Standalone FP16 to BF16 conversion
-    >>> convert_fp16_to_bf16(
-    ...     input_path="model_fp16.onnx",
-    ...     output_path="model_bf16.onnx",
-    ... )
-    >>>
-    >>> # Transpose DequantizeLinear weights for column-major storage
-    >>> transpose_dequantize_linear_weights(
-    ...     model_path="model_quantized.onnx",
-    ...     output_path="model_quantized_transposed.onnx",
-    ... )
+CLI Usage::
+
+    python -m modelopt.onnx.graph_surgery <command> [options]
+
+Available commands:
+
+Replace attention with GQA (for FP16/BF16 LLMs)::
+
+    python -m modelopt.onnx.graph_surgery replace-gqa \
+        --input model.onnx \
+        --output model_gqa.onnx \
+        --model-id meta-llama/Llama-2-7b-hf
+
+Replace attention with GQA (for INT4/AWQ quantized LLMs)::
+
+    python -m modelopt.onnx.graph_surgery replace-gqa \
+        --input model.onnx \
+        --output model_gqa.onnx \
+        --model-id meta-llama/Llama-3.1-8B
+
+Add cross-attention KV cache to encoder::
+
+    python -m modelopt.onnx.graph_surgery add-cross-kv \
+        --input encoder_model.onnx \
+        --output encoder_with_kv.onnx \
+        --model-id openai/whisper-large-v3-turbo
+
+Convert FP16 to BF16::
+
+    python -m modelopt.onnx.graph_surgery convert-bf16 \
+        --input model_fp16.onnx \
+        --output model_bf16.onnx
+
+Transpose DequantizeLinear weights (column-major optimization)::
+
+    python -m modelopt.onnx.graph_surgery transpose-dq \
+        --input model_quantized.onnx \
+        --output model_quantized_transposed.onnx
+
+Analyze attention pattern::
+
+    python -m modelopt.onnx.graph_surgery analyze \
+        --input model.onnx \
+        --layer 0
+
+For full options on any command, run::
+
+    python -m modelopt.onnx.graph_surgery <command> --help
 """
 
 from .dq_transpose import transpose_dequantize_linear_weights
