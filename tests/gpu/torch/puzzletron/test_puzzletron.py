@@ -62,6 +62,7 @@ from modelopt.torch.puzzletron.anymodel import convert_model
             "*E",
             True,
         ),
+        # GPT-OSS test fails, @TODO: fixing in progress
         # ("gpt-oss-20b", "gpt_oss_20b", "gpt-oss-20b", None, True),
     ],
 )
