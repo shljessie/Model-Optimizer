@@ -351,9 +351,7 @@ class _LoRAMegatronSequentialMLP(_MegatronParallelLoRABase):
         from modelopt.torch.opt.plugins.megatron import ensure_metadata_has_dp_cp_group
 
         # Base SequentialMLP state dict (handles local_experts weights).
-        sharded_state_dict = SequentialMLP.sharded_state_dict(
-            self, prefix, sharded_offsets, metadata
-        )
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         if not hasattr(self, "_lora_adapters") or not self._lora_adapters:
             return sharded_state_dict

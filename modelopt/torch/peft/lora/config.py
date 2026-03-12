@@ -22,6 +22,8 @@ argument in the PTQ script.
 Config name strings map to entries in :data:`LORA_CFG_CHOICES`.
 """
 
+import torch.nn.init as init
+
 __all__ = ["DENSE_LORA_CFG", "LORA_CFG_CHOICES", "MOE_LORA_CFG"]
 
 # ---------------------------------------------------------------------------
@@ -68,14 +70,27 @@ MOE_LORA_CFG = {
     "adapter_type": "lora",
     "adapter_cfg": {
         "*": {"enable": False},
-        "*linear_qkv*": {"rank": 64, "enable": True},
-        "*linear_proj*": {"rank": 64, "enable": True},
-        "*mlp.linear_fc1*": {"rank": 64, "enable": True},
-        "*mlp.linear_fc2*": {"rank": 64, "enable": True},
-        "*experts*": {"rank": 64, "enable": True},
+        "*mlp.experts*": {"rank": 64, "enable": True},
+        "*linear_fc1*": {"enable": False},
+        "*linear_fc2*": {"enable": False},
     },
 }
 
+MOE_LORA_RANDOM_INIT_CFG = {
+    "adapter_type": "lora",
+    "adapter_cfg": {
+        "*": {"enable": False},
+        "*mlp.experts*": {
+            "rank": 64,
+            "enable": True,
+            "scale": 1,
+            "lora_a_init": init.kaiming_uniform_,
+            "lora_b_init": init.kaiming_uniform_,
+        },
+        "*linear_fc1*": {"enable": False},
+        "*linear_fc2*": {"enable": False},
+    },
+}
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
