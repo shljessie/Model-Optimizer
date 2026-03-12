@@ -148,7 +148,7 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = config.num_key_value_heads
     hidden_size = config.hidden_size
-    hidden_size_per_layer = hidden_size // num_attention_heads
+    hidden_size_per_layer = getattr(config, "head_dim", hidden_size // num_attention_heads)
 
     dummy_bs = 1
     dummy_len = 10
