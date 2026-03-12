@@ -1,7 +1,14 @@
 NVIDIA Model Optimizer Changelog
 ================================
 
-0.43 (2026-03-xx)
+0.44 (2026-05-xx)
+^^^^^^^^^^^^^^^^^
+
+**New Features**
+
+- Support full Transformer Engine spec for Minitron pruning (``mcore_minitron``). Now we no longer need to use custom ModelOpt spec. Note that this does not affect the usage of the pruning workflow but makes pruning slightly faster and may result in slightly different pruned model because of different kernel and numerics.
+
+0.43 (2026-04-09)
 ^^^^^^^^^^^^^^^^^
 
 **Bug Fixes**
@@ -24,13 +31,12 @@ NVIDIA Model Optimizer Changelog
 - Add ``get_auto_quantize_config`` API to extract a flat quantization config from ``auto_quantize`` search results, enabling re-quantization at different effective bit targets without re-running calibration.
 - Improve ``auto_quantize`` checkpoint/resume: calibration state is now saved and restored across runs, avoiding redundant calibration when resuming a search.
 - Add NemotronH MoE expert support in ``auto_quantize`` grouping and scoring rules.
-- Support full Transformer Engine spec for Minitron pruning (``mcore_minitron``). Now we no longer need to use custom ModelOpt spec. Note that this does not affect the usage of the pruning workflow but makes pruning slightly faster and may result in slightly different pruned model because of different kernel and numerics.
 
 **Misc**
 
 - Migrated project metadata from ``setup.py`` to a fully declarative ``pyproject.toml``.
 
-0.42 (2026-02-xx)
+0.42 (2026-03-10)
 ^^^^^^^^^^^^^^^^^
 
 **Bug Fixes**
