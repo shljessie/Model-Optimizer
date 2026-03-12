@@ -385,7 +385,7 @@ class TensorRTPyBenchmark(Benchmark):
                 if hasattr(os, "RTLD_LAZY") and hasattr(os, "RTLD_GLOBAL"):
                     plugin_handle = ctypes.CDLL(
                         str(plugin_path),
-                        mode=os.RTLD_LAZY | os.RTLD_GLOBAL,  # type: ignore[attr-defined]
+                        mode=os.RTLD_LAZY | os.RTLD_GLOBAL,
                     )
                 else:
                     # Fallback for platforms without RTLD flags (e.g., Windows)
