@@ -24,6 +24,7 @@ from _test_utils.torch.distributed.utils import spawn_multiprocess_job
 from _test_utils.torch.puzzletron.utils import setup_test_model_and_data
 
 import modelopt.torch.utils.distributed as dist
+from modelopt.torch.puzzletron import puzzletron
 from modelopt.torch.puzzletron.anymodel import convert_model
 
 # The e2e test to compress a model based on Local Neural Architecture Search (Mixed Integer Programing NAS search)
@@ -106,7 +107,7 @@ def _test_puzzletron_multiprocess_job(
     puzzle_dir, hf_checkpoint_path, dataset_path = setup_test_model_and_data(
         project_root_path, tmp_path, rank, hf_config_name, hybrid_override_pattern
     )
-    hydra_config_dir = (  # noqa: F841
+    hydra_config_dir = (
         project_root_path / f"tests/gpu/torch/puzzletron/resources/configs/{hydra_config_subdir}"
     )
 
@@ -120,10 +121,10 @@ def _test_puzzletron_multiprocess_job(
     dist.barrier()
 
     # TODO commented for the duration of merging process  from dkorzekwa/any_model to feature/puzzletron
-    # # Compress the model using a one-click approach
-    # puzzletron.puzzletron(
-    #     str(hydra_config_dir), hydra_config_subdir, str(puzzle_dir), str(dataset_path)
-    # )
+    # Compress the model using a one-click approach
+    puzzletron.puzzletron(
+        str(hydra_config_dir), hydra_config_subdir, str(puzzle_dir), str(dataset_path)
+    )
 
     # #
     # # Check assertions
