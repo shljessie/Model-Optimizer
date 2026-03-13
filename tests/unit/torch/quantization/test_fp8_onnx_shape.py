@@ -26,12 +26,10 @@ import pytest
 
 onnx = pytest.importorskip("onnx")
 
-import torch  # noqa: E402
+import torch
+from _test_utils.torch.quantization.models import SimpleConv
 
-import modelopt.torch.quantization as mtq  # noqa: E402
-
-from _test_utils.torch.quantization.models import SimpleConv  # noqa: E402
-
+import modelopt.torch.quantization as mtq
 
 # ---------------------------------------------------------------------------
 # Part 1 — root-cause: TRT custom ops have no ONNX shape inference function
@@ -123,8 +121,7 @@ def test_fp8_onnx_export_shape_preserved():
     shape_by_name: dict[str, list] = {}
     for vi in (*inferred.graph.value_info, *inferred.graph.output):
         shape_by_name[vi.name] = [
-            d.dim_value if d.HasField("dim_value") else -1
-            for d in vi.type.tensor_type.shape.dim
+            d.dim_value if d.HasField("dim_value") else -1 for d in vi.type.tensor_type.shape.dim
         ]
 
     missing = []

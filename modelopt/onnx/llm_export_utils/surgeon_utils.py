@@ -21,6 +21,7 @@ import time
 import onnx
 import onnx_graphsurgeon as gs
 import torch
+from onnx_graphsurgeon.ir.tensor import LazyValues
 
 from modelopt.onnx.utils import is_fp8_constant
 
