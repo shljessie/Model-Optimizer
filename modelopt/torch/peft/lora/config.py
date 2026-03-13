@@ -52,9 +52,39 @@ DENSE_LORA_CFG = {
 # ---------------------------------------------------------------------------
 # MoE model config
 # ---------------------------------------------------------------------------
-# Creates LoRA adapters for local_experts only
-
+# Apply LoRA adapter per-layer in each local_expert
 MOE_LORA_CFG = {
+    "adapter_type": "lora",
+    "adapter_cfg": {
+        "*": {"enable": False},
+        "*local_experts*linear_fc1*": {"rank": 64, "enable": True},
+        "*local_experts*linear_fc2*": {"rank": 64, "enable": True},
+    },
+}
+MOE_LORA_RANDOM_INIT_CFG = {
+    "adapter_type": "lora",
+    "adapter_cfg": {
+        "*": {"enable": False},
+        "*local_experts*linear_fc1*": {
+            "rank": 64,
+            "enable": True,
+            "scale": 1,
+            "lora_a_init": init.kaiming_uniform_,
+            "lora_b_init": init.kaiming_uniform_,
+        },
+        "*local_experts*linear_fc2*": {
+            "rank": 64,
+            "enable": True,
+            "scale": 1,
+            "lora_a_init": init.kaiming_uniform_,
+            "lora_b_init": init.kaiming_uniform_,
+        },
+    },
+}
+
+# Apply LoRA adapters per local_experts, NOT per-layer
+
+MOE_PER_EXPERT_LORA_CFG = {
     "adapter_type": "lora",
     "adapter_cfg": {
         "*": {"enable": False},
@@ -64,7 +94,7 @@ MOE_LORA_CFG = {
     },
 }
 
-MOE_LORA_RANDOM_INIT_CFG = {
+MOE_PER_EXPERT_LORA_RANDOM_INIT_CFG = {
     "adapter_type": "lora",
     "adapter_cfg": {
         "*": {"enable": False},
