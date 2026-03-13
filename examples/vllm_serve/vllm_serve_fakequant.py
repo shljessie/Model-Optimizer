@@ -78,6 +78,8 @@ additional_env_vars = {
     "KV_QUANT_CFG",
     "MODELOPT_STATE_PATH",
     "CALIB_BATCH_SIZE",
+    "KV_SKIP_FIRST_M",
+    "KV_SKIP_LAST_N",
 }
 
 RayDistributedExecutor.ADDITIONAL_ENV_VARS.update(additional_env_vars)

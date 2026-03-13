@@ -287,13 +287,35 @@ class _QuantVLLMAttention(QuantModule):
         self.k_bmm_quantizer = TensorQuantizer()
         self.v_bmm_quantizer = TensorQuantizer()
         self.parallel_state = create_parallel_state()
+        # K/V skip config: first_m and last_n positions are not fake-quantized.
+        # Read at attention time inside unified_attention_with_output (vllm source).
+        self.kv_quant_skip_first_m: int = 0
+        self.kv_quant_skip_last_n: int = 0
 
     def forward(self, query, key, value, *args, **kwargs):
+        # Q is not cached so quantize it here as before.
         query = self.q_bmm_quantizer(query)
-        key = self.k_bmm_quantizer(key)
-        value = self.v_bmm_quantizer(value)
-
+        # Run K/V quantizers on the new tokens to calibrate amax, but discard
+        # the result so that clean fp16 values are written to the KV cache.
+        # The actual fake-quant with first-M/last-N skipping is applied at
+        # attention time inside unified_attention_with_output (vllm/attention/layer.py),
+        # which has access to the full gathered KV cache at attention time.
+        self.k_bmm_quantizer(key)
+        self.v_bmm_quantizer(value)
         return super().forward(query, key, value, *args, **kwargs)
+
+
+def set_kv_quant_skip_tokens(model, skip_first_m: int = 0, skip_last_n: int = 0):
+    """Configure first-M / last-N KV cache quantization skipping for all attention layers.
+
+    After mtq.quantize(), call this to skip fake-quantization of the first
+    ``skip_first_m`` and last ``skip_last_n`` KV tokens at attention time.
+    Setting both to 0 disables skipping (all tokens are quantized as normal).
+    """
+    for module in model.modules():
+        if isinstance(module, _QuantVLLMAttention):
+            module.kv_quant_skip_first_m = skip_first_m
+            module.kv_quant_skip_last_n = skip_last_n
 
 
 if CrossAttention is not None:
@@ -325,3 +347,4 @@ if VllmMLAAttention is not None:
             kv_c = self.kv_c_bmm_quantizer(kv_c)
             k_pe = self.k_pe_bmm_quantizer(k_pe)
             return super().forward(query, kv_c, k_pe, *args, **kwargs)
+

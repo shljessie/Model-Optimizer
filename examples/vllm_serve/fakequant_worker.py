@@ -34,6 +34,7 @@ from vllm_reload_utils import (
 )
 
 import modelopt.torch.quantization as mtq
+import modelopt.torch.quantization.plugins.vllm as modelopt_vllm_plugin
 from modelopt.torch.opt.conversion import restore_from_modelopt_state
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 
@@ -67,6 +68,8 @@ quant_config: dict[str, Any] = {
     "quant_file_path": os.environ.get("QUANT_FILE_PATH", None),
     "modelopt_state_path": os.environ.get("MODELOPT_STATE_PATH", None),
     "calib_batch_size": int(os.environ.get("CALIB_BATCH_SIZE", 1)),
+    "kv_skip_first_m": int(os.environ.get("KV_SKIP_FIRST_M", 0)),
+    "kv_skip_last_n": int(os.environ.get("KV_SKIP_LAST_N", 0)),
 }
 
 
@@ -286,6 +289,14 @@ def _fakequant_run_prolog_worker(self) -> None:
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         mtq.print_quant_summary(model)
+
+    skip_first_m = quant_config["kv_skip_first_m"]
+    skip_last_n = quant_config["kv_skip_last_n"]
+    if skip_first_m or skip_last_n:
+        modelopt_vllm_plugin.set_kv_quant_skip_tokens(
+            model, skip_first_m=skip_first_m, skip_last_n=skip_last_n
+        )
+        print(f"KV quant skip: first_m={skip_first_m}, last_n={skip_last_n}")
 
     mtq.fold_weight(model)
     for name, module in model.named_modules():
