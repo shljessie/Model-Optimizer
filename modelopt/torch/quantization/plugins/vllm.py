@@ -295,13 +295,8 @@ class _QuantVLLMAttention(QuantModule):
     def forward(self, query, key, value, *args, **kwargs):
         # Q is not cached so quantize it here as before.
         query = self.q_bmm_quantizer(query)
-        # Run K/V quantizers on the new tokens to calibrate amax, but discard
-        # the result so that clean fp16 values are written to the KV cache.
-        # The actual fake-quant with first-M/last-N skipping is applied at
-        # attention time inside unified_attention_with_output (vllm/attention/layer.py),
-        # which has access to the full gathered KV cache at attention time.
-        self.k_bmm_quantizer(key)
-        self.v_bmm_quantizer(value)
+        # self.k_bmm_quantizer(key)
+        # self.v_bmm_quantizer(value)
         return super().forward(query, key, value, *args, **kwargs)
 
 
