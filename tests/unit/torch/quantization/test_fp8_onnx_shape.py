@@ -66,8 +66,8 @@ def test_trt_fp8_ops_unsupported_by_onnx_inference():
 
     try:
         inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False)
-    except Exception:
-        # Newer ONNX rejects unknown domains outright — shape inference is impossible.
+    except onnx.shape_inference.InferenceError:
+        # Newer ONNX rejects unknown domains outright — inference is impossible.
         return
 
     # Older ONNX silently skips unknown ops, leaving the output shape empty.
@@ -121,7 +121,7 @@ def test_fp8_onnx_export_shape_preserved():
     # Run shape inference and collect QDQ output shapes.
     inferred = onnx.shape_inference.infer_shapes(onnx_model, strict_mode=False)
     shape_by_name: dict[str, list] = {}
-    for vi in inferred.graph.value_info:
+    for vi in (*inferred.graph.value_info, *inferred.graph.output):
         shape_by_name[vi.name] = [
             d.dim_value if d.HasField("dim_value") else -1
             for d in vi.type.tensor_type.shape.dim

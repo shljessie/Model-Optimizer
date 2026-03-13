@@ -265,11 +265,13 @@ def _fp8_dequantize(
     zero_point = g.op("Constant", value_t=torch.tensor(0.0))
     zero_point = g.op("Cast", zero_point, to_i=onnx_dtype_map["Float8"])
     out = g.op("DequantizeLinear", inputs, scale, zero_point)
-    out.setType(inputs.type().with_dtype(torch_dtype_map[trt_high_precision_dtype]).with_sizes(output_shape))
+    out.setType(
+        inputs.type().with_dtype(torch_dtype_map[trt_high_precision_dtype]).with_sizes(output_shape)
+    )
 
     # DequantizeLinear outputs float32 in opset 19; cast back to original type if needed.
     if otype in torch_dtype_map and otype != "Float":
-        out = g.op("Cast", out, to_i=onnx_dtype_map[otype])  # type: ignore[index]
+        out = g.op("Cast", out, to_i=onnx_dtype_map[otype])
     return out
 
 

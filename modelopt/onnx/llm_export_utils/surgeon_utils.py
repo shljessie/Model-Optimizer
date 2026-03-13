@@ -21,14 +21,8 @@ import time
 import onnx
 import onnx_graphsurgeon as gs
 import torch
-from onnx_graphsurgeon.ir.tensor import LazyValues
 
-
-def _is_float8_constant(const: gs.Constant) -> bool:
-    """Return True if the gs.Constant holds a FLOAT8E4M3FN tensor."""
-    if isinstance(const.values, LazyValues):
-        return const.values._tensor.data_type == onnx.TensorProto.FLOAT8E4M3FN
-    return False
+from modelopt.onnx.utils import is_fp8_constant
 
 
 def clear_inputs(node: gs.Node | gs.Tensor):
@@ -93,7 +87,7 @@ def fold_fp8_qdq_to_dq(graph: gs.Graph):
             node.op == "QuantizeLinear"
             and len(node.inputs) >= 3
             and isinstance(node.inputs[2], gs.Constant)
-            and _is_float8_constant(node.inputs[2])
+            and is_fp8_constant(node.inputs[2])
         )
         if not (is_trt_fp8_q or is_std_fp8_q):
             continue
