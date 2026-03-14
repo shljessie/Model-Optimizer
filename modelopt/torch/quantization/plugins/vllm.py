@@ -293,10 +293,10 @@ class _QuantVLLMAttention(QuantModule):
         self.kv_quant_skip_last_n: int = 0
 
     def forward(self, query, key, value, *args, **kwargs):
-        # Q is not cached so quantize it here as before.
+        # Q is not cached so quantize it here.
+        # K/V are quantized inside unified_attention_with_output (vllm/attention/layer.py)
+        # using fixed-shape GPU ops, which makes the path CUDA-graph-capturable.
         query = self.q_bmm_quantizer(query)
-        # self.k_bmm_quantizer(key)
-        # self.v_bmm_quantizer(value)
         return super().forward(query, key, value, *args, **kwargs)
 
 
