@@ -28,9 +28,14 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from modelopt.torch.opt.searcher import ForwardLoop
+from modelopt.torch.quantization.utils import LayerActivationCollector
 from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.distributed import DistributedProcessGroup, ParallelState
-from modelopt.torch.utils.network import bind_forward_method, unpatch_forward_method
+from modelopt.torch.utils.network import (
+    bind_forward_method,
+    get_decoder_layers,
+    unpatch_forward_method,
+)
 from modelopt.torch.utils.perf import get_used_gpu_mem_fraction
 
 from .calib import MseCalibrator, NVFP4MSECalibrator
@@ -49,17 +54,25 @@ from .utils import (
     weight_attr_names,
 )
 
-__all__ = ["awq", "local_hessian_calibrate", "max_calibrate", "smoothquant", "svdquant"]
+__all__ = [
+    "awq",
+    "local_hessian_calibrate",
+    "max_calibrate",
+    "sequential_calibrate",
+    "smoothquant",
+    "svdquant",
+]
 
 
 def weight_only_quantize(model: nn.Module):
     """Just quantize the weights of the model."""
+    name_to_module = dict(model.named_modules())
     seen_modules = set()
-    for name, module in model.named_modules():
+    for module in name_to_module.values():
         if module in seen_modules:
             continue
         for weight_name in weight_attr_names(module):
-            with enable_weight_access_and_writeback(module, model):
+            with enable_weight_access_and_writeback(module, model, name_to_module):
                 weight_quantizer = getattr(
                     module, quantizer_attr_names(weight_name).weight_quantizer
                 )
@@ -336,12 +349,6 @@ def mse_calibrate(
                     )
                     continue
 
-                if fp8_scale_sweep and not is_nvfp4_static:
-                    warnings.warn(
-                        f"fp8_scale_sweep is enabled but quantizer '{name}' is not NVFP4 static "
-                        "block quantization. fp8_scale_sweep will be ignored for this quantizer."
-                    )
-
                 # Create MSE calibrator with quant_func
                 module._calibrator = MseCalibrator(
                     amax=initial_amax,
@@ -353,7 +360,8 @@ def mse_calibrate(
                 )
 
     # Identify weight quantizers by checking if they have corresponding weight parameters
-    for name, parent_module in model.named_modules():
+    name_to_module = dict(model.named_modules())
+    for parent_module in name_to_module.values():
         if parent_module in seen_modules:
             continue
         for weight_name in weight_attr_names(parent_module):
@@ -372,7 +380,7 @@ def mse_calibrate(
         # Enable calibration mode for the weight quantizer
         weight_quantizer.disable_quant()
         weight_quantizer.enable_calib()
-        with enable_weight_access_and_writeback(parent_module, model):
+        with enable_weight_access_and_writeback(parent_module, model, name_to_module):
             weight = getattr(parent_module, weight_name)
             weight_quantizer(weight)
 
@@ -694,7 +702,12 @@ def enable_stats_collection(model: nn.Module):
     """Enable stats collection for all quantizers in the model."""
     for name, module in model.named_modules():
         if isinstance(module, TensorQuantizer) and not module._disabled:
-            if module._calibrator is not None:
+            if module._use_constant_amax:
+                # use_constant_amax quantizers use a fixed amax and don't need calibration.
+                # Disable quantization during calibration so it doesn't affect other quantizers.
+                module.disable_quant()
+                continue
+            elif module._calibrator is not None:
                 module.disable_quant()
                 module.enable_calib()
             else:
@@ -705,6 +718,11 @@ def finish_stats_collection(model: nn.Module, method: str | None = None, **kwarg
     """Finish stats collection for all quantizers in the model."""
     for _, module in model.named_modules():
         if not isinstance(module, TensorQuantizer) or module._disabled:
+            continue
+
+        if module._use_constant_amax:
+            # Re-enable quantization for use_constant_amax quantizers disabled in enable_stats_collection.
+            module.enable_quant()
             continue
 
         cal = getattr(module, "_calibrator", None)
@@ -889,8 +907,9 @@ def smoothquant(model: nn.Module, forward_loop: ForwardLoop | None = None, alpha
         scale_a = scale_a.clamp(min=1e-4, max=1e4)
         apply_pre_quant_scale_and_smooth(module, scale_a)
 
+    name_to_module = dict(model.named_modules())
     smoothed_modules = 0
-    for name, module in model.named_modules():
+    for name, module in name_to_module.items():
         if is_quantized_linear(module):
             if not hasattr(module.input_quantizer, "_amax"):
                 warnings.warn(f"{name} is not calibrated, skip smoothing")
@@ -906,7 +925,7 @@ def smoothquant(model: nn.Module, forward_loop: ForwardLoop | None = None, alpha
                 f"Error: {name} has only one channel to smooth"
             )
 
-            with enable_weight_access_and_writeback(module, model):
+            with enable_weight_access_and_writeback(module, model, name_to_module):
                 postprocess(module)
 
             smoothed_modules += 1
@@ -1496,9 +1515,10 @@ def svdquant(
     create_and_replace_svdquant_linear_on_the_fly(model=model)
     awq(model, forward_loop, "awq_lite", **kwargs)
 
-    for name, module in model.named_modules():
+    name_to_module = dict(model.named_modules())
+    for name, module in name_to_module.items():
         if is_quantized_linear(module) and module.weight_quantizer.is_enabled:
-            with enable_weight_access_and_writeback(module, model):
+            with enable_weight_access_and_writeback(module, model, name_to_module):
                 postprocess(module, name)
     max_calibrate(model, forward_loop)
 
@@ -1819,3 +1839,40 @@ def gptq_lite(
         torch.cuda.empty_cache()
 
     print_rank_0("GPTQ-lite quantization completed successfully")
+
+
+@torch.no_grad()
+def sequential_calibrate(
+    model: nn.Module,
+    forward_loop: ForwardLoop,
+    calib_func: Callable,
+    **calib_kwargs,
+):
+    """Sequential calibration - a sequential layer-by-layer calibration algorithm."""
+    if forward_loop is None:
+        raise ValueError("forward_loop must not be None for sequential calibration.")
+
+    transformer_layers = get_decoder_layers(model)
+    if transformer_layers is None:
+        raise ValueError(
+            "Could not find transformer layers in model'. "
+            "Sequential calibration requires a model with identifiable transformer layers."
+        )
+
+    print_rank_0(f"Sequential calibration: Found {len(transformer_layers)} transformer layers")
+
+    gettr = LayerActivationCollector(model)
+
+    for layer in transformer_layers:
+        # Get updated input activations to the current layer
+        layer_inputs = gettr.get_input_activations(layer, forward_loop)
+
+        # Define a forward loop for the current layer
+        def _layer_forward_loop(m, _inputs=layer_inputs):
+            for args, kwargs_input in _inputs:
+                m(*args, **kwargs_input)
+
+        # Call calibration function
+        calib_func(layer, _layer_forward_loop, **calib_kwargs)
+        del layer_inputs
+        torch.cuda.empty_cache()

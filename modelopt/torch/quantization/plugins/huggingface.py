@@ -16,16 +16,33 @@
 """Support quantization for huggingface layers."""
 
 import inspect
+import logging
 import warnings
 from contextlib import contextmanager
 from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn as nn
 import transformers
 from packaging import version
 from torch import Tensor
 from torch.nn.functional import linear
+from transformers.models.t5.modeling_t5 import T5Attention
+
+from modelopt.torch.opt.dynamic import DynamicModule
+from modelopt.torch.utils.distributed import ParallelState
+
+from ..algorithms import AutoQuantizeGradientSearcher
+from ..conversion import register
+from ..nn import QuantInputBase, QuantModule, QuantModuleRegistry, TensorQuantizer
+from ..nn.modules.quant_linear import _QuantLinear
+from ..triton import IS_AVAILABLE as IS_TRITON_AVAILABLE
+from ..utils import replace_function, sync_moe_expert_amax
+from .attention import register_attention_for_kv_quant
+from .custom import CUSTOM_MODEL_PLUGINS, _ParallelLinear, _QuantFunctionalMixin
+
+logger = logging.getLogger(__name__)
 
 try:
     from torch.distributed.tensor import Shard
@@ -39,26 +56,10 @@ try:
 except ImportError:
     kitchen = None
 
-import torch.nn as nn
-from transformers.models.t5.modeling_t5 import T5Attention
-
-from modelopt.torch.opt.dynamic import DynamicModule
-from modelopt.torch.utils.distributed import ParallelState
-
-from ..algorithms import AutoQuantizeGradientSearcher
-from ..conversion import register
-from ..nn import QuantInputBase, QuantModule, QuantModuleRegistry, TensorQuantizer
-from ..nn.modules.quant_linear import _QuantLinear
-from ..triton import IS_AVAILABLE as IS_TRITON_AVAILABLE
-
 if IS_TRITON_AVAILABLE:
     from ..triton import weight_dequant
 else:
     weight_dequant = None
-
-from ..utils import replace_function
-from .attention import register_attention_for_kv_quant
-from .custom import CUSTOM_MODEL_PLUGINS, _ParallelLinear, _QuantFunctionalMixin
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -363,9 +364,9 @@ class HFRowParallelLinear(HFParallelLinear):
 class _QuantHFParallelLinear(_ParallelLinear):
     _functionals_to_replace = [(torch.nn.functional, "linear")]
 
-    def fold_weight(self):
+    def fold_weight(self, keep_attrs: bool = False):
         with self.enable_weight_access_and_writeback():
-            super().fold_weight()
+            super().fold_weight(keep_attrs)
 
     @contextmanager
     def enable_weight_access_and_writeback(self):
@@ -440,31 +441,34 @@ _transposed_quantize = _TransposedQuantization.apply
 
 
 class _QuantSparseMoe(QuantModule):
-    """Module to support special handling of token dispatching during calibration.
+    """Quantization wrapper for HuggingFace sparse MoE blocks.
 
-    During calibration, we forward all tokens to all experts so that all experts see sufficient tokens to calibrate.
-    However, even in calibration mode, the actual top_k routing is used to calculate the actual outputs this instance
-    returns.
+    Supports ``layer_sync_moe_local_experts_amax`` to sync input quantizer amax across experts.
 
-    If calibration is not enabled, this module behaves as a normal MoELayer.
+    Optionally supports two config-driven features (disabled by default):
+    - ``_moe_calib_experts_ratio``: force-forward tokens to more experts during calibration.
+    - ``_moe_count_expert_calib_tokens``: count tokens routed to each expert during calibration.
+
+    When both are disabled, forward is a direct pass-through with zero overhead.
     """
 
     def _setup(self):
-        num_experts = 0
-        if hasattr(self, "gate") and hasattr(self.gate, "num_experts"):
-            num_experts = self.gate.num_experts
-        elif hasattr(self, "num_experts"):
-            num_experts = self.num_experts
-        elif hasattr(self, "experts") and hasattr(self.experts, "num_experts"):
-            num_experts = self.experts.num_experts
-
-        self.register_buffer(
-            "expert_token_count",
-            torch.zeros(num_experts, dtype=torch.long, device=next(self.parameters()).device),
-            persistent=False,
-        )
-        self._count_expert_tokens = False
         self._moe_calib_experts_ratio = None
+        self._moe_count_expert_calib_tokens = False
+        self._token_counting_initialized = False
+
+    def _init_token_counting(self):
+        """Lazy-init token counting infra (buffer + gate hook). Called once from forward."""
+        self._token_counting_initialized = True
+        num_experts = 0
+        for obj in [getattr(self, "gate", None), self, getattr(self, "experts", None)]:
+            if obj is not None:
+                for attr in ("num_experts", "n_routed_experts"):
+                    if hasattr(obj, attr):
+                        num_experts = getattr(obj, attr)
+                        break
+            if num_experts:
+                break
 
         if num_experts == 0:
             warnings.warn(
@@ -473,6 +477,12 @@ class _QuantSparseMoe(QuantModule):
             )
             return
 
+        self.register_buffer(
+            "expert_token_count",
+            torch.zeros(num_experts, dtype=torch.long, device=next(self.parameters()).device),
+            persistent=False,
+        )
+        self._count_expert_tokens = False
         if hasattr(self, "gate"):
             self.gate.register_forward_hook(self._gate_forward_hook)
 
@@ -492,17 +502,24 @@ class _QuantSparseMoe(QuantModule):
             self.expert_token_count += counts.to(self.expert_token_count.device)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._moe_calib_experts_ratio and not self._moe_count_expert_calib_tokens:
+            return super().forward(hidden_states)
+
+        if self._moe_count_expert_calib_tokens and not self._token_counting_initialized:
+            self._init_token_counting()
+
         is_calib = any(getattr(m, "_if_calib", False) for m in self.experts.modules())
-        self._count_expert_tokens = is_calib
+        self._count_expert_tokens = is_calib and self._moe_count_expert_calib_tokens
+
+        # If any of the experts are in calibration mode, we will forward all tokens to
+        # self._moe_calib_experts_ratio % of the experts to improve the calibration coverage.
+        # This is used only for calibration, we need to re-calculate the actual outputs again using
+        # the original top_k
         if is_calib and self._moe_calib_experts_ratio:
             self._count_expert_tokens = True
             assert 0 < self._moe_calib_experts_ratio <= 1, (
                 "moe_calib_experts_ratio must be between 0 and 1"
             )
-            # If any of the experts are in calibration mode, we will forward all tokens to
-            # self._moe_calib_experts_ratio % of the experts to improve the calibration coverage.
-            # This is used only for calibration, we need to re-calculate the actual outputs again using
-            # the original top_k
             if TRANSFORMERS_VERSION_GE_5_0:
                 assert hasattr(self, "gate") and hasattr(self.gate, "top_k")
                 original_top_k = self.gate.top_k
@@ -513,26 +530,38 @@ class _QuantSparseMoe(QuantModule):
                 self.gate.top_k = original_top_k
             else:
                 # Path for transformers < 5.0
-                original_top_k = self.top_k
+                if hasattr(self, "gate") and hasattr(self.gate, "top_k"):
+                    top_k_owner = self.gate
+                else:
+                    top_k_owner = self
+                original_top_k = top_k_owner.top_k
                 if hasattr(self, "num_experts"):
-                    self.top_k = max(
+                    top_k_owner.top_k = max(
                         original_top_k, round(self.num_experts * self._moe_calib_experts_ratio)
                     )
                 elif hasattr(self, "experts"):
-                    self.top_k = max(
+                    num_experts = (
+                        self.experts.num_experts
+                        if hasattr(self.experts, "num_experts")
+                        else len(self.experts)
+                    )
+                    top_k_owner.top_k = max(
                         original_top_k,
-                        round(self.experts.num_experts * self._moe_calib_experts_ratio),
+                        round(num_experts * self._moe_calib_experts_ratio),
                     )
                 else:
                     raise ValueError(f"Could not find num_experts in module {self}")
                 super().forward(hidden_states)
-                self.top_k = original_top_k
+                top_k_owner.top_k = original_top_k
             self._count_expert_tokens = False
-        else:
-            self._count_expert_tokens = True
+
         output = super().forward(hidden_states)
         self._count_expert_tokens = False
         return output
+
+    def layer_sync_moe_local_experts_amax(self):
+        """Sync input_quantizer amax across experts so all share the same amax per quantizer."""
+        sync_moe_expert_amax(self.experts)
 
 
 class _QuantLlama4TextExperts(QuantModule):
@@ -734,6 +763,107 @@ class _QuantQwen3VLMoeTextExperts(QuantModule):
         return next_states
 
 
+class _Qwen35MoeExpertModule(nn.Module):
+    """Container for a single Qwen3.5 MoE expert's linear layers.
+
+    Produces the naming pattern: experts.{id}.gate_proj.weight
+    (consistent with standard Qwen3 MoE per-expert module structure).
+    """
+
+    def __init__(self, hidden_dim: int, expert_dim: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_dim, expert_dim, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, expert_dim, bias=False)
+        self.down_proj = nn.Linear(expert_dim, hidden_dim, bias=False)
+
+
+class _QuantQwen35MoeExperts(QuantModule):
+    def _setup(self):
+        """Modify the Qwen3_5MoeExperts by using per-expert nn.Module containers.
+
+        This produces the naming pattern: experts.{id}.gate_proj.weight
+        (consistent with standard Qwen3 MoE).
+        """
+        from accelerate import init_empty_weights
+
+        dtype, device = self.gate_up_proj.dtype, self.gate_up_proj.device
+
+        def _copy_weight(module, weight):
+            module.to_empty(device=device)
+            with torch.no_grad():
+                module.weight.data = weight.detach().data.to(dtype=dtype, device=device)
+
+        expert_dim = self.intermediate_dim
+
+        with init_empty_weights():
+            expert_modules = nn.ModuleList(
+                [
+                    _Qwen35MoeExpertModule(self.hidden_dim, expert_dim)
+                    for _ in range(self.num_experts)
+                ]
+            )
+
+        for idx in range(self.num_experts):
+            # gate_up_proj shape: (num_experts, 2*intermediate_dim, hidden_dim)
+            # Already in (out_features, in_features) format, no transpose needed
+            _copy_weight(expert_modules[idx].gate_proj, self.gate_up_proj[idx, :expert_dim, :])
+            _copy_weight(expert_modules[idx].up_proj, self.gate_up_proj[idx, expert_dim:, :])
+            # down_proj shape: (num_experts, hidden_dim, intermediate_dim)
+            # Already in (out_features, in_features) format
+            _copy_weight(expert_modules[idx].down_proj, self.down_proj[idx])
+
+        delattr(self, "gate_up_proj")
+        delattr(self, "down_proj")
+        # Register expert modules directly as numbered children (like nn.ModuleList)
+        # so the naming pattern is: experts.{id}.gate_proj.weight (no extra nesting)
+        for idx in range(self.num_experts):
+            self.add_module(str(idx), expert_modules[idx])
+
+    def __len__(self):
+        """Support len() so the module is iterable like standard MoE experts."""
+        return self.num_experts
+
+    def __iter__(self):
+        """Support iteration over expert modules."""
+        for idx in range(self.num_experts):
+            yield getattr(self, str(idx))
+
+    def __getitem__(self, idx):
+        """Support indexing to get individual expert modules."""
+        return getattr(self, str(int(idx)))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            with torch.no_grad():
+                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            expert = self[expert_idx]
+            gate = expert.gate_proj(current_state)
+            up = expert.up_proj(current_state)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = expert.down_proj(current_hidden_states)
+            current_hidden_states = (
+                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            )
+            final_hidden_states.index_add_(
+                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+            )
+        return final_hidden_states
+
+
 class _QuantDbrxFFN(_QuantSparseMoe):
     @property
     def num_experts(self):
@@ -748,16 +878,140 @@ class _QuantDbrxFFN(_QuantSparseMoe):
         self.router.moe_top_k = value
 
 
+@contextmanager
+def patch_compressed_linear_loading():
+    """Context manager that patches CompressedLinear to survive custom ``_init_weights`` calls.
+
+    When loading pack-quantized models with ``trust_remote_code=True``,
+    ``compressed_tensors`` replaces ``.weight`` with ``.weight_packed`` on
+    CompressedLinear modules.  Custom model code (e.g. ``modeling_deepseek.py``)
+    often does ``module.weight.data.normal_(...)`` inside ``_init_weights``,
+    which crashes because ``.weight`` no longer exists.
+
+    This context manager monkey-patches ``CompressedLinear.__getattr__`` to
+    return a harmless dummy for ``.weight`` accesses, and restores the original
+    behaviour on exit (even if an exception is raised).
+
+    Usage::
+
+        from modelopt.torch.quantization.plugins.huggingface import patch_compressed_linear_loading
+
+        with patch_compressed_linear_loading():
+            model = AutoModelForCausalLM.from_pretrained(
+                ckpt_path,
+                device_map="auto",
+                trust_remote_code=True,
+                torch_dtype="auto",
+            )
+    """
+    try:
+        from compressed_tensors.linear.compressed_linear import CompressedLinear
+    except ImportError:
+        yield
+        return
+
+    if getattr(CompressedLinear, "_modelopt_init_patched", False):
+        yield
+        return
+
+    original_getattr = getattr(CompressedLinear, "__getattr__", None)
+
+    class _DummyWeightData:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: self
+
+    class _DummyWeight:
+        def __init__(self):
+            self.data = _DummyWeightData()
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: self
+
+    def patched_getattr(self, name):
+        if name == "weight":
+            if "_parameters" in self.__dict__ and "weight" in self._parameters:
+                return self._parameters["weight"]
+            if "weight" in self.__dict__:
+                return self.__dict__["weight"]
+            return _DummyWeight()
+        if original_getattr is not None:
+            return original_getattr(self, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    CompressedLinear.__getattr__ = patched_getattr
+    CompressedLinear._modelopt_init_patched = True
+    logger.info("Patched CompressedLinear for transformers compatibility")
+
+    try:
+        yield
+    finally:
+        if original_getattr is not None:
+            CompressedLinear.__getattr__ = original_getattr
+        elif hasattr(CompressedLinear, "__getattr__"):
+            del CompressedLinear.__getattr__
+        CompressedLinear._modelopt_init_patched = False
+        logger.info("Restored CompressedLinear original state")
+
+
 class _QuantCompressedLinear(QuantModule):
+    """Quantization wrapper for ``compressed_tensors`` CompressedLinear modules.
+
+    Handles on-the-fly decompression of pack-quantized INT4 weights during
+    calibration.  This avoids fully decompressing all experts into GPU memory
+    at once (which would OOM for large MoE models), and also correctly handles
+    the ``weight_shape`` metadata that ``compressed_tensors`` stores as a
+    tensor rather than a plain list.
+    """
+
     def _setup(self):
         self.input_quantizer = TensorQuantizer()
         self.weight_quantizer = TensorQuantizer()
+
+    def _build_compressed_data(self):
+        """Build compressed_data dict and quantization_args from module attributes.
+
+        Returns a (compressed_data, quant_args) tuple suitable for
+        ``self.compressor.decompress_weight()``.  ``weight_shape`` is
+        normalised to a plain ``list[int]`` so that ``compressed_tensors``
+        does not choke on a ``torch.Tensor`` value.
+        """
+        compressed_data = {"weight_packed": self.weight_packed}
+        if hasattr(self, "weight_scale"):
+            compressed_data["weight_scale"] = self.weight_scale
+        if hasattr(self, "weight_shape"):
+            ws = self.weight_shape
+            if isinstance(ws, torch.Tensor):
+                compressed_data["weight_shape"] = [int(x) for x in ws.tolist()]
+            elif isinstance(ws, (list, tuple)):
+                compressed_data["weight_shape"] = [int(x) for x in ws]
+            else:
+                compressed_data["weight_shape"] = ws
+        if hasattr(self, "weight_zero_point"):
+            compressed_data["weight_zero_point"] = self.weight_zero_point
+
+        quant_args = None
+        if hasattr(self, "quantization_scheme") and self.quantization_scheme:
+            if hasattr(self.quantization_scheme, "weights"):
+                quant_args = self.quantization_scheme.weights
+
+        return compressed_data, quant_args
 
     def forward(self, input: Tensor) -> Tensor:
         from compressed_tensors.quantization import QuantizationStatus
 
         if self.quantization_status == QuantizationStatus.COMPRESSED:
-            weight_data = self.compressor.decompress_module(self)
+            # Real packed weights are int32. If it's float, it's not actually compressed.
+            if self.weight_packed.dtype == torch.int32:
+                compressed_data, quant_args = self._build_compressed_data()
+                if not hasattr(self, "_logged_on_the_fly"):
+                    logger.debug("On-the-fly decompression for %s", self.__class__.__name__)
+                    self._logged_on_the_fly = True
+                weight_data = self.compressor.decompress_weight(
+                    compressed_data=compressed_data,
+                    quantization_args=quant_args,
+                )
+            else:
+                weight_data = self.weight_packed
         else:
             weight_data = self.weight
 
@@ -767,11 +1021,37 @@ class _QuantCompressedLinear(QuantModule):
         from compressed_tensors.quantization import QuantizationStatus
 
         if self.quantization_status == QuantizationStatus.COMPRESSED:
-            self.weight = nn.Parameter(self.compressor.decompress_module(self), requires_grad=False)
+            compressed_data, quant_args = self._build_compressed_data()
+
+            # Skip non-pack-quantized weights (e.g., vision modules stored as BF16)
+            if isinstance(compressed_data["weight_packed"], torch.Tensor):
+                if compressed_data["weight_packed"].dtype != torch.int32:
+                    return
+
+            decompressed = self.compressor.decompress_weight(
+                compressed_data=compressed_data,
+                quantization_args=quant_args,
+            )
+            # Clear any placeholder before registering the real parameter
+            self._parameters.pop("weight", None)
+            self._buffers.pop("weight", None)
+            if "weight" in self.__dict__:
+                del self.__dict__["weight"]
+            param = nn.Parameter(decompressed, requires_grad=False)
+            self._parameters["weight"] = param
+            self.__dict__["weight"] = param
+
         if hasattr(self, "weight_packed"):
             del self.weight_packed
         if hasattr(self, "weight_scale"):
             del self.weight_scale
+        if hasattr(self, "weight_shape"):
+            if "weight_shape" in self._parameters:
+                del self._parameters["weight_shape"]
+            else:
+                delattr(self, "weight_shape")
+        if self.quantization_status == QuantizationStatus.COMPRESSED:
+            self.quantization_status = QuantizationStatus.FROZEN
 
 
 class _QuantFP8Linear(QuantModule):
@@ -882,6 +1162,20 @@ except ImportError:
     pass
 
 
+try:
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeExperts
+
+    # Qwen3_5MoeSparseMoeBlock registration is handled by register_sparse_moe_on_the_fly
+    # (auto-detected via gate.top_k + gate.num_experts + experts pattern).
+    # Only the fused expert weights need explicit registration.
+    if Qwen3_5MoeExperts not in QuantModuleRegistry:
+        QuantModuleRegistry.register({Qwen3_5MoeExperts: "hf.Qwen3_5MoeExperts"})(
+            _QuantQwen35MoeExperts
+        )
+except ImportError:
+    pass
+
+
 class _QuantGptOssExperts(_QuantFunctionalMixin):
     """Quantized wrapper for `transformers.GptOssExperts`.
 
@@ -925,15 +1219,22 @@ class _QuantGptOssExperts(_QuantFunctionalMixin):
 
     @property
     def functionals_to_replace(self):
-        def _quantized_bmm(batch1, batch2):
+        # Use torch.ops.aten to bypass Python dispatch and avoid RecursionError
+        # (torch.matmul / __matmul__ can dispatch to each other)
+        _aten_bmm = torch.ops.aten.bmm
+        _aten_matmul = torch.ops.aten.matmul
+
+        def _quantized_bmm(batch1, batch2, *, out=None):
             batch1 = self.down_proj_input_quantizer(batch1) if self._down_proj_mul else batch1
             self._down_proj_mul = not self._down_proj_mul  # toggle the flag
-            return torch._bmm(batch1, batch2)
+            if out is not None:
+                return torch.ops.aten.bmm.out(batch1, batch2, out=out)
+            return _aten_bmm(batch1, batch2)
 
         def _tensor_matmul(self_t, other):
             self_t = self.down_proj_input_quantizer(self_t) if self._down_proj_mul else self_t
             self._down_proj_mul = not self._down_proj_mul
-            return torch.matmul(self_t, other)
+            return _aten_matmul(self_t, other)
 
         return [
             (torch, "bmm", _quantized_bmm),
@@ -995,17 +1296,21 @@ def register_falcon_linears_on_the_fly(model):
             QuantModuleRegistry.register({linear_type: linear_type.__name__})(_QuantLinear)
 
 
+def _has_num_experts(obj):
+    # n_routed_experts: NemotronH-style MoE
+    return hasattr(obj, "num_experts") or hasattr(obj, "n_routed_experts")
+
+
 def _is_sparse_moe_block(module):
     """Check if a module is structurally a sparse MoE block compatible with _QuantSparseMoe.
 
-    All HuggingFace MoE blocks (Mixtral, Qwen3Moe, Qwen2Moe, Qwen3Next, Llama4, MiniMax, etc.)
-    share a common structural pattern: a ``gate`` (TopKRouter) sub-module with routing attributes
-    (``top_k`` and ``num_experts``), and an ``experts`` sub-module.
+    All HuggingFace MoE blocks (Mixtral, Qwen3Moe, Qwen2Moe, Qwen3Next, Llama4, MiniMax,
+    NemotronH, etc.) share a common structural pattern: a ``gate`` (TopKRouter) sub-module with
+    routing attributes (``top_k`` and ``num_experts`` or ``n_routed_experts``), and an ``experts``
+    sub-module.
 
     This function detects that pattern instead of relying on class names, making it forward-compatible
-    with new MoE architectures. Some MoE models (e.g. Glm4MoeMoE) have ``gate`` and ``experts`` but
-    use a different routing interface (``n_routed_experts`` instead of ``num_experts``, custom
-    ``route_tokens_to_experts``), so we require ``num_experts`` to be present to avoid false positives.
+    with new MoE architectures.
     """
     if not hasattr(module, "experts"):
         return False
@@ -1013,13 +1318,16 @@ def _is_sparse_moe_block(module):
     # Primary: gate sub-module has topk/top_k + num_experts (standard TopKRouter pattern)
     if hasattr(module, "gate"):
         gate = module.gate
-        has_topk = hasattr(gate, "top_k")
-        has_num_experts = hasattr(gate, "num_experts")
-        if has_topk and has_num_experts:
+        if hasattr(gate, "top_k") and _has_num_experts(gate):
             return True
 
     # Fallback: top_k + num_experts on the block itself (older transformers, e.g. v4.x Qwen3Next)
-    return hasattr(module, "top_k") and hasattr(module, "num_experts")
+    if hasattr(module, "top_k"):
+        if not _has_num_experts(module) and hasattr(module.experts, "__len__"):
+            module.num_experts = len(module.experts)
+        return _has_num_experts(module)
+
+    return False
 
 
 def register_sparse_moe_on_the_fly(model):
@@ -1081,11 +1389,15 @@ def setup_model_for_gradient_checkpointing(model: nn.Module):
                 "Disable gradient checkpointing after AutoQuantize if this is not desired!"
             )
             model.gradient_checkpointing_enable({"use_reentrant": True})
-            model.train()  # Model needs to be in training mode to enable gradient checkpointing
-            # Set all dropout layers to eval mode for deterministic auto-quantize scores
-            for name, module in model.named_modules():
-                if isinstance(model, torch.nn.Dropout):
-                    module.eval()
+            for m in model.modules():
+                if hasattr(m, "gradient_checkpointing"):
+                    m.train()  # Make sure the module is in training mode to enable gradient checkpointing
+                else:
+                    # Eval mode for non-checkpointed modules to avoid fused kernels
+                    # that bypass linear layers. E.g. in nemotron-h, the Mamba layer's
+                    # training path uses a fused kernel that takes out_proj weights
+                    # directly, skipping the linear module's forward (and thus quantization).
+                    m.eval()
         except Exception as e:
             warnings.warn(
                 f"AutoQuantize: Error enabling gradient checkpointing for huggingface model due to: {e}, "
