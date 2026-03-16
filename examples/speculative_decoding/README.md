@@ -24,6 +24,7 @@ For full documentation on the EAGLE3 algorithm, configuration options, and best 
 | After Training | Evaluation, export and deployment | \[[Link](#model-validation)\] |
 | Custom Datasets | Other dataset options and custom data format | \[[Link](#custom-datasets)\] |
 | Support Matrix | Supported models for speculative decoding training | \[[Link](#support-matrix)\] |
+| Model-Specific Guides | Step-by-step notebooks for individual models | \[[Link](#model-specific-guides)\] |
 | Speculation Module Checkpoints | View pre-trained speculation modules ready to deploy! | \[[Link](#speculation-module-checkpoints)\] |
 | Resources | Extra links to relevant resources | \[[Link](#resources)\] |
 
@@ -197,6 +198,14 @@ To use your own datasets, please preprocess your data into a `.jsonl` file with 
 | Mistral | ✅ | ✅ | ✅ |
 | Phi 3 | ✅ | ✅ | ✅ |
 | QWen 1.5,2,2.5,3 | ✅ | ✅ | ✅ |
+
+## Model-Specific Guides
+
+The following step-by-step notebooks cover EAGLE3 training for specific models:
+
+| Model | Guide |
+| :---: | :---: |
+| Cosmos Reason 2 | [Notebook](guides/train_eagle_head_cosmos_reason2.ipynb) |
 
 ## Speculation Module Checkpoints
 
