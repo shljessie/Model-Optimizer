@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from torch.cuda import nvtx
 import transformers
 from packaging.version import Version
 from torch import nn
@@ -657,6 +658,7 @@ class HFEagleModel(EagleModel):
 
         return combined_attention_mask
 
+    @nvtx.range("prepare_eagle_inputs")
     def _prepare_eagle_inputs(
         self,
         input_ids,
@@ -746,6 +748,7 @@ class HFEagleModel(EagleModel):
             tensor_mask = tensor_mask.repeat(batch_size, 1, 1, 1)
             return tensor_mask
 
+    @nvtx.range("base_model_forward")
     def _base_model_forward(
         self,
         input_ids,
@@ -794,6 +797,7 @@ class HFEagleModel(EagleModel):
         )
         return full_logits[:, :, reverse_mapping]
 
+    @nvtx.range("eagle_forward")
     def _eagle_forward(
         self,
         eagle_input_hidden_states,
@@ -977,6 +981,7 @@ class HFEagleModel(EagleModel):
             train_acc=train_accs,
         )
 
+    @nvtx.range("eagle_loss")
     def _eagle_loss(
         self,
         base_model_logits,
