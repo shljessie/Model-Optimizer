@@ -52,7 +52,7 @@ def init_child_from_parent(
     descriptor: ModelDescriptor,
     pruning_mixin,
     parent_checkpoint_dir: str,
-    model_config_overrides_dict: dict,
+    model_config_overrides_dict: dict | str,
     output_checkpoint_dir: str,
     gqa_init_mode: GQAInitMode,
     mlp_init_mode: MlpInitMode,
@@ -86,7 +86,9 @@ def init_child_from_parent(
 
     copy_tokenizer(parent_checkpoint_dir, output_checkpoint_dir)
 
-    parent_model_config = load_model_config(parent_checkpoint_dir)
+    parent_model_config = load_model_config(
+        parent_checkpoint_dir, trust_remote_code=descriptor.requires_trust_remote_code()
+    )
     parent_state_dict = load_state_dict(parent_checkpoint_dir)
 
     # Parse JSON if string
@@ -108,6 +110,7 @@ def init_child_from_parent(
         parent_checkpoint_dir,
         model_config_overrides=global_config_overrides,
         ignore_unexpected_config_keys=True,
+        trust_remote_code=descriptor.requires_trust_remote_code(),
     )
 
     # Apply block-level overrides if any

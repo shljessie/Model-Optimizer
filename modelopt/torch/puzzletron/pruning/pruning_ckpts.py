@@ -151,7 +151,11 @@ def launch_hidden_dim_prune_ckpt(cfg: DictConfig):
         )
 
     # Load parent model config to get FFN configuration
-    parent_model_config = load_model_config(cfg.pruning.model_name_or_path)
+    descriptor = ModelDescriptorFactory.get(cfg.descriptor)
+    trust_remote_code = descriptor.requires_trust_remote_code()
+    parent_model_config = load_model_config(
+        cfg.pruning.model_name_or_path, trust_remote_code=trust_remote_code
+    )
     parent_hidden_size = parent_model_config.hidden_size
 
     # Get teacher's FFN configuration

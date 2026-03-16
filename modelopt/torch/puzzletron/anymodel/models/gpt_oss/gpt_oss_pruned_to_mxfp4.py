@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/tree/aa457edc3d64d81530159cd3a182932320c78f8c
 
 # MIT License
@@ -22,20 +37,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """
 Create a HuggingFace checkpoint with MXFP4 MoE weights from the original gpt-oss-120b model.
@@ -51,7 +52,7 @@ import argparse
 import json
 import os
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 import torch
 from safetensors import safe_open
@@ -132,8 +133,8 @@ def deduce_experts_for_layer(
     for student_idx in range(num_student_experts):
         # Get student expert weights
         prefix = f"model.layers.{layer}.mlp"
-        student_up = student_experts.get(f"{prefix}.experts.gate_up_proj")[student_idx]
-        student_down = student_experts.get(f"{prefix}.experts.down_proj")[student_idx]
+        student_up = student_experts.get(f"{prefix}.experts.gate_up_proj")[student_idx]  # type: ignore[index]
+        student_down = student_experts.get(f"{prefix}.experts.down_proj")[student_idx]  # type: ignore[index]
 
         # if student_gate is None or student_up is None or student_down is None:
         if student_up is None or student_down is None:
@@ -404,7 +405,7 @@ def copy_config_files(student_path: str, output_path: str):
         raise FileNotFoundError(f"config.json not found at {src_config}")
 
     with open(src_config, "r") as f:
-        config = json.load(f)
+        config = json.load(f)  # type: ignore[arg-type]
 
     # Set architecture to DeciGptOssForCausalLM for MXFP4 support
     config["architectures"] = ["DeciGptOssForCausalLM"]
@@ -422,7 +423,7 @@ def copy_config_files(student_path: str, output_path: str):
 
     dst_config = os.path.join(output_path, "config.json")
     with open(dst_config, "w") as f:
-        json.dump(config, f, indent=2)
+        json.dump(config, f, indent=2)  # type: ignore[arg-type]
 
 
 def main():

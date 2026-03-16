@@ -9,7 +9,6 @@ pruning_mixin:
   layer_descriptor:
     _target_: modelopt.torch.puzzletron.anymodel.models.gpt_oss.gpt_oss_model_descriptor.GptOssExpertRemovalLayerDescriptor
     target_name: "mlp.router"
-    
 hook_class: ${get_object:modelopt.torch.nas.plugins.megatron_hooks.base_hooks.RankedChoiceVotingHook}
 activation_hooks_kwargs:    # Additional kwargs to pass to the hook init
 

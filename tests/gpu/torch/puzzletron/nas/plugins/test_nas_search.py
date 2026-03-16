@@ -40,10 +40,12 @@ def _test_nas_search_multiprocess_job(
     dist.setup(timeout=timedelta(10))
     # Setup the test model and data.
     puzzle_dir, llama_checkpoint_path, dataset_path = setup_test_model_and_data(
-        project_root_path, tmp_path, rank
+        project_root_path, tmp_path, rank, "llama_3_1_8b_instruct"
     )
-    hydra_config_dir = project_root_path / "tests/gpu/torch/puzzletron/resources/configs"
-    hydra_config_name = "Llama-3_1-8B-ffn-pruning"
+    hydra_config_dir = (
+        project_root_path / "tests/gpu/torch/puzzletron/resources/configs/llama_3_1_8b_instruct"
+    )
+    hydra_config_name = "llama_3_1_8b_instruct"
 
     #
     # Run the mnt.convert() step

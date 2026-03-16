@@ -54,6 +54,18 @@ class ModelDescriptor(ABC):
         raise NotImplementedError
 
     @staticmethod
+    def requires_trust_remote_code() -> bool:
+        """Whether this model descriptor requires trust_remote_code=True for loading.
+
+        Models that use custom code (e.g., via auto_map in config) should override
+        this to return True.
+
+        Returns:
+            True if trust_remote_code=True is required, False otherwise.
+        """
+        return False
+
+    @staticmethod
     def mlp_no_op_post_init(decoder_layer: nn.Module):
         """Post-init callback to alter a decoder layer so that FFN/mlp subblock performs as no-op.
 
@@ -81,9 +93,11 @@ class ModelDescriptor(ABC):
         counterparts.
 
         Example for replacing a layernorm layer with identity:
+
             >>> decoder_layer.post_attention_layernorm = Same()
 
         Example for replacing an attention layer with zeroes:
+
             >>> decoder_layer.self_attn = MatchingZeros()
 
         In case the attention layer returns multiple outputs i.e `hidden_states, _ = self.self_attn()`,

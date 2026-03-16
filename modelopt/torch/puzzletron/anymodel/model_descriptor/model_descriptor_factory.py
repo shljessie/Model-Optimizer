@@ -32,14 +32,25 @@ _MODEL_TYPE_TO_DESCRIPTOR = {
     "qwen3": "qwen3",
     "nemotron_h": "nemotron_h",
     "nemotron_h_v2": "nemotron_h_v2",
-    "gpt_oss": "gpt_oss",
+    "gpt_oss_20b": "gpt_oss_20b",
 }
 
 
-def resolve_descriptor_from_pretrained(pretrained: str | None, trust_remote_code: bool = True):
-    """Resolve the model descriptor by loading the checkpoint config and mapping model_type."""
-    if not pretrained:
-        raise ValueError("pretrained must be provided")
+def resolve_descriptor_from_pretrained(pretrained: str, trust_remote_code: bool = False):
+    """Resolve the model descriptor by loading the checkpoint config and mapping model_type.
+
+    Args:
+        pretrained: Path to a pretrained model checkpoint or HuggingFace model identifier.
+        trust_remote_code: If True, allows execution of custom code from the model repository.
+            This is a security risk if the model source is untrusted. Only set to True if you
+            trust the source of the model. Defaults to False for security.
+
+    Returns:
+        The resolved ModelDescriptor class for the detected model type.
+
+    Raises:
+        ValueError: If pretrained is not provided or if the model type cannot be auto-detected.
+    """
 
     config = AutoConfig.from_pretrained(pretrained, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", None)

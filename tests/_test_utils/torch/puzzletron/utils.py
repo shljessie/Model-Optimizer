@@ -146,7 +146,7 @@ def create_and_save_small_hf_model(
 
         # Fix layer_types to match num_hidden_layers (newer transformers validates this)
         if hasattr(config, "layer_types") and config.layer_types is not None:
-            config.layer_types = config.layer_types[:config.num_hidden_layers]
+            config.layer_types = config.layer_types[: config.num_hidden_layers]
 
         # Fix rope_scaling to be consistent with max_position_embeddings
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:

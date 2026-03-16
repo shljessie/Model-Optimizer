@@ -177,9 +177,7 @@ class GptOssModelDescriptor(ModelDescriptor):
         Note: Expert removal works for unquantized models (test models).
         Production models use MXFP4 quantization which is not yet supported.
         """
-        return {
-            "expert_removal": ExpertRemovalPruningMixIn(GptOssExpertRemovalLayerDescriptor())
-        }
+        return {"expert_removal": ExpertRemovalPruningMixIn(GptOssExpertRemovalLayerDescriptor())}
 
 
 @dataclass

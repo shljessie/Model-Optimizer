@@ -135,9 +135,10 @@ class Converter(ABC):
         cls,
         input_dir: Path,
         output_dir: Path,
+        trust_remote_code: bool = False,
     ):
         """Convert config and add block_configs."""
-        config = load_model_config(input_dir)
+        config = load_model_config(input_dir, trust_remote_code=trust_remote_code)
 
         block_configs = cls.create_block_configs_from_main_config(config)
         out_config = copy.deepcopy(config)
@@ -179,7 +180,10 @@ class Converter(ABC):
             output_dir: Path to the output AnyModel checkpoint.
         """
         cls.copy_checkpoint_files(input_dir, output_dir)
-        config = cls.convert_configs_in_dirs(input_dir, output_dir)
+        trust_remote_code = descriptor.requires_trust_remote_code()
+        config = cls.convert_configs_in_dirs(
+            input_dir, output_dir, trust_remote_code=trust_remote_code
+        )
         cls.convert_model_weights(
             input_dir, output_dir, descriptor=descriptor, num_hidden_layers=config.num_hidden_layers
         )

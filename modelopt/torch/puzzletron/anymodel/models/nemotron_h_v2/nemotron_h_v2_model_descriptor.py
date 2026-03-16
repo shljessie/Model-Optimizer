@@ -72,6 +72,10 @@ class NemotronHV2ModelDescriptor(ModelDescriptor):
         return decoder_cls_list
 
     @staticmethod
+    def requires_trust_remote_code() -> bool:
+        return True
+
+    @staticmethod
     def block_config_to_layer_overrides(block_config: BlockConfig):
         override_kwargs = {}
         if block_config.ffn is not None and block_config.ffn.intermediate_size is not None:

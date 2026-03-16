@@ -202,7 +202,8 @@ def load_and_shard_model(
 
     with runtime.device:
         if model_config is None:
-            model_config = load_model_config(checkpoint_path)
+            trust_remote_code = descriptor.requires_trust_remote_code()
+            model_config = load_model_config(checkpoint_path, trust_remote_code=trust_remote_code)
 
         if owned_block_indexes == "auto":
             owned_block_indexes = set(
