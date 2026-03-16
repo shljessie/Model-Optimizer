@@ -8,6 +8,9 @@ This folder contains an end-to-end runnable speculative decoding fine‑tuning p
 
 This example focuses on training with Hugging Face. To train with Megatron‑LM, see the [Megatron‑LM example](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/post_training/modelopt).
 
+For full documentation on the EAGLE3 algorithm, configuration options, and best practices, see the
+[Speculative Decoding documentation](https://nvidia.github.io/Model-Optimizer/guides/5_speculative_decoding.html).
+
 ## Contents
 
 <div align="center">
@@ -89,9 +92,9 @@ To customize the draft model architecture (number of layers, MLP size, etc.) or 
 
 For large models, you can export intermediate hidden states to disk and train only the draft model. This significantly reduces GPU memory requirements, but requires several to tens of terabytes of disk storage depending on dataset size.
 
-### Dumpping Hidden States to Disk
+### Dumping Hidden States to Disk
 
-We support two backends for generating base model hidden states. For better effciency, it is recommended to use TRT-LLM:
+Two backends are supported. TRT-LLM is recommended for higher throughput (requires TRT-LLM installation):
 
 ```bash
 python collect_hidden_states/compute_hidden_states_trtllm.py \
@@ -100,18 +103,17 @@ python collect_hidden_states/compute_hidden_states_trtllm.py \
             --output-dir $HIDDEN_STATES_DIR
 ```
 
-**NOTE**: TRT-LLM installation needed for the above command.
-
-Alternatively, you can generate the same hidden states with HF:
+HuggingFace backend (no extra dependencies):
 
 ```bash
 python collect_hidden_states/compute_hidden_states_hf.py \
             --model $BASE_MODEL \
-            --input-data input_conversations/daring-anteater.jsonl  \
+            --input-data input_conversations/daring-anteater.jsonl \
             --output-dir $HIDDEN_STATES_DIR
 ```
 
-**NOTE**: See [`run_hf_compute_hiddens_dp.sh`](./collect_hidden_states/run_hf_compute_hiddens_dp.sh) and [`run_trtllm_compute_hiddens_dp.sh`](./collect_hidden_states/run_trtllm_compute_hiddens_dp.sh) for a simple example using data parallelism (DP) to accelerate hidden state generation.
+See [`run_hf_compute_hiddens_dp.sh`](./collect_hidden_states/run_hf_compute_hiddens_dp.sh) and [`run_trtllm_compute_hiddens_dp.sh`](./collect_hidden_states/run_trtllm_compute_hiddens_dp.sh) for data-parallel hidden state generation.
+For a detailed explanation of offline training, see the [Workflow documentation](https://nvidia.github.io/Model-Optimizer/guides/5_speculative_decoding.html#offline-training).
 
 ### Train Draft Model with Dumped Hidden States
 
@@ -146,50 +148,15 @@ This exports the model from a ModelOpt checkpoint to a deployment-compatible for
 
 ## Deployment
 
-The exported checkpoint can be deployed on TRT-LLM or SGLang.
+The exported checkpoint can be deployed on TRT-LLM, vLLM, or SGLang. For full deployment
+instructions including server configuration, see the
+[Deployment section in the documentation](https://nvidia.github.io/Model-Optimizer/guides/5_speculative_decoding.html#deployment).
 
-### TRT-LLM
-
-To serve the checkpoint with TRT-LLM, run trtllm-serve with:
-
-```bash
-trtllm-serve <base_model_checkpoint> --host 0.0.0.0 --port 8000 --backend pytorch --max_batch_size 32 --max_num_tokens 8192 --max_seq_len 8192 --extra_llm_api_options extra-llm-api-config.yml
-```
-
-, with `extra-llm-api-config.yml` being
-
-```yaml
-enable_attention_dp: false
-disable_overlap_scheduler: true
-enable_autotuner: false
-
-cuda_graph_config:
-    max_batch_size: 1
-
-speculative_config:
-    decoding_type: Eagle
-    max_draft_len: 3
-    speculative_model_dir: <draft_model_checkpoint>
-
-kv_cache_config:
-    enable_block_reuse: false
-```
-
-Please refer to [TRT-LLM Doc: Speculative Decoding](https://nvidia.github.io/TensorRT-LLM/examples/llm_speculative_decoding.html) for detailed usage.
-
-### vLLM
-
-Please refer to [VLLM Doc: Speculative Decoding](https://docs.vllm.ai/en/latest/features/spec_decode/) for detailed usage.
-
-Optionally, you can convert the exported checkpoint to contain target model information, which is accepted by vLLM to simplify depployment:
+For vLLM, you can optionally convert the exported checkpoint to include target model metadata:
 
 ```bash
 python scripts/convert_to_vllm_ckpt.py --input <exported_ckpt> --verifier <target_model> --output <output_dir>
 ```
-
-### SGLang
-
-Please refer to [SGLang Doc: Speculative Decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-3-Decoding) for detailed usage.
 
 ### SpecDec Bench
 
