@@ -77,6 +77,10 @@ ENABLE_CP_TTT_PATCH = False
 # module variable to cache attention mask for cp ttt
 CACHED_SHARD_TTT_MASKS = {}
 
+# ALL_ATTENTION_FUNCTIONS["flex_attention"] = partial(
+#     ALL_ATTENTION_FUNCTIONS["flex_attention"], kernel_options={"BACKEND": "FLASH"}
+# )
+
 
 def _get_empty_cache(config):
     """Return an empty cache. Handle different versions of transformers for unit tests."""
@@ -658,6 +662,7 @@ class HFEagleModel(EagleModel):
         return combined_attention_mask
 
     @nvtx.range("prepare_eagle_inputs")
+    @torch.compile(dynamic=False)
     def _prepare_eagle_inputs(
         self,
         input_ids,
@@ -810,6 +815,7 @@ class HFEagleModel(EagleModel):
         return full_logits[:, :, reverse_mapping]
 
     @nvtx.range("eagle_forward")
+    @torch.compile(dynamic=False, mode="max-autotune")
     def _eagle_forward(
         self,
         eagle_input_hidden_states,
@@ -1004,6 +1010,7 @@ class HFEagleModel(EagleModel):
         )
 
     @nvtx.range("eagle_loss")
+    @torch.compile(dynamic=False, fullgraph=True)
     def _eagle_loss(
         self,
         base_output_softmax_logits,
