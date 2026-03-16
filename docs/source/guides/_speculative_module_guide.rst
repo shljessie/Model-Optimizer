@@ -30,6 +30,7 @@ mtsp.convert
     mtsp.convert(model: nn.Module, mode: str | list | dict) -> nn.Module
 
 Converts ``model`` in-place into a speculative decoding model and returns it.
+The result is the same Python object as the input.
 
 **Parameters**
 
@@ -51,33 +52,10 @@ Converts ``model`` in-place into a speculative decoding model and returns it.
         # 3. Algorithm name only — uses all defaults
         mtsp.convert(model, "medusa")
 
-**What convert() does**
-
-Internally, ``convert()`` delegates to the ``SpeculativeDecodingModeRegistry``, which routes
-each algorithm name to its registered conversion function:
-
-.. code-block:: text
-
-    convert(model, [("eagle", config)])
-        │
-        ├─ looks up "eagle" in SpeculativeDecodingModeRegistry
-        │  → EagleModeDescriptor.convert → convert_to_eagle_model()
-        │
-        └─ convert_to_eagle_model():
-              1. Resolves model class in EagleDMRegistry
-              2. Merges user config with built-in architecture defaults
-              3. Wraps model as EagleModel (a DynamicModule subclass)
-              4. Calls eagle_model.modify() to store all config as attributes
-              5. Attaches the draft module; freezes base model if configured
-
-The result is the same Python object as the input—``convert()`` modifies the model in-place
-and also returns it. After conversion the model's ``forward()`` is replaced with a
-training-compatible forward that computes speculative decoding losses.
-
 .. note::
 
-    ``convert()`` is designed to be called once, immediately after loading the base model and
-    before moving it to GPU. The trainer then moves the converted model to the target device.
+    Call ``convert()`` once, immediately after loading the base model and before moving it to
+    GPU. The trainer then moves the converted model to the target device.
 
 
 Supported algorithms

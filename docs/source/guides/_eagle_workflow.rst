@@ -205,4 +205,61 @@ directories that serving frameworks can load directly.
 Deployment
 ----------
 
-The exported checkpoint can be deployed on TRT-LLM, vLLM, or SGLang.
+The exported checkpoint separates the base model and draft module into independent directories.
+Below are deployment instructions for each supported serving framework.
+
+TRT-LLM
+^^^^^^^
+
+.. code-block:: bash
+
+    trtllm-serve <base_model_checkpoint> \
+        --host 0.0.0.0 --port 8000 \
+        --backend pytorch \
+        --max_batch_size 32 \
+        --max_num_tokens 8192 \
+        --max_seq_len 8192 \
+        --extra_llm_api_options extra-llm-api-config.yml
+
+where ``extra-llm-api-config.yml`` is:
+
+.. code-block:: yaml
+
+    enable_attention_dp: false
+    disable_overlap_scheduler: true
+    enable_autotuner: false
+
+    cuda_graph_config:
+        max_batch_size: 1
+
+    speculative_config:
+        decoding_type: Eagle
+        max_draft_len: 3
+        speculative_model_dir: <draft_model_checkpoint>
+
+    kv_cache_config:
+        enable_block_reuse: false
+
+See `TRT-LLM speculative decoding docs <https://nvidia.github.io/TensorRT-LLM/examples/llm_speculative_decoding.html>`_
+for full configuration options.
+
+vLLM
+^^^^
+
+Optionally convert the exported checkpoint to include target model metadata accepted by vLLM:
+
+.. code-block:: bash
+
+    python scripts/convert_to_vllm_ckpt.py \
+        --input <exported_ckpt> \
+        --verifier <target_model> \
+        --output <output_dir>
+
+See `vLLM speculative decoding docs <https://docs.vllm.ai/en/latest/features/spec_decode/>`_ for
+serving instructions.
+
+SGLang
+^^^^^^
+
+See `SGLang EAGLE-3 decoding docs <https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-3-Decoding>`_
+for serving instructions.

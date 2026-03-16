@@ -9,13 +9,20 @@ ModelOpt implements the **EAGLE3** algorithm, which attaches a lightweight autor
 module to a frozen base model. The draft module operates at the feature level—predicting future
 hidden states rather than tokens directly—to achieve high acceptance rates at low compute cost.
 
+Medusa is also supported for models that require it; see :ref:`Medusa <speculative-medusa>` below.
 
 
-.. toctree::
-    :maxdepth: 1
-    :caption: Module Guide
+Where to Start
+--------------
 
-    ./_speculative_module_guide.rst
+- **New to speculative decoding?** Start with the :doc:`Workflow <_eagle_workflow>` for a
+  step-by-step guide from model conversion to deployment.
+- **Tuning training or architecture?** See the :doc:`Configuration Reference <_eagle_config_reference>`
+  for all available options.
+- **Want better acceptance rates?** See :doc:`Best Practices <_eagle_best_practices>` for data
+  synthesis, draft model configuration, and vocabulary compression.
+- **Looking for the Python API?** See the :doc:`Module Guide <_speculative_module_guide>`.
+
 
 .. toctree::
     :maxdepth: 1
@@ -24,6 +31,12 @@ hidden states rather than tokens directly—to achieve high acceptance rates at 
     ./_eagle_workflow.rst
     ./_eagle_config_reference.rst
     ./_eagle_best_practices.rst
+
+.. toctree::
+    :maxdepth: 1
+    :caption: Reference
+
+    ./_speculative_module_guide.rst
 
 
 .. _speculative-concepts:
@@ -58,3 +71,23 @@ Compared to earlier EAGLE versions, EAGLE3 uses auxiliary hidden states from **m
 layers** of the base model as additional input to the draft decoder, not just the final layer output.
 This richer signal enables the draft module to more accurately predict the base model's next-layer
 representations, resulting in higher token acceptance rates and greater inference speedup.
+
+.. _speculative-medusa:
+
+Medusa algorithm
+----------------
+
+Medusa is an alternative speculative decoding algorithm that adds *K* independent prediction heads
+on top of the base model, each predicting a future token position in parallel. Unlike EAGLE3, Medusa
+does not use a separate autoregressive draft decoder.
+
+Medusa is supported alongside EAGLE3 in ModelOpt. To use it, pass ``"medusa"`` as the algorithm name
+to :meth:`mtsp.convert() <modelopt.torch.speculative.speculative_decoding.convert>` with a
+:class:`MedusaConfig <modelopt.torch.speculative.config.MedusaConfig>` dict:
+
+.. code-block:: python
+
+    mtsp.convert(model, [("medusa", {"medusa_num_heads": 2, "medusa_num_layers": 1})])
+
+The training and checkpointing workflow is identical to EAGLE3. See the
+:doc:`Module Guide <_speculative_module_guide>` for the full API reference.
