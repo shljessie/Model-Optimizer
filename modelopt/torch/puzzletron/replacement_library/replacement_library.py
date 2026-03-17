@@ -123,10 +123,12 @@ class ReplacementLibrary:
     @property
     def model_config(self) -> DeciLMConfig:
         if self._model_config is None:
+            trust_remote_code = self.descriptor.requires_trust_remote_code()
             self._model_config = load_model_config(
                 self.get_arbitrary_checkpoint_dir(),
                 self.model_config_overrides,
                 ignore_unexpected_config_keys=True,
+                trust_remote_code=trust_remote_code,
             )
         return self._model_config
 

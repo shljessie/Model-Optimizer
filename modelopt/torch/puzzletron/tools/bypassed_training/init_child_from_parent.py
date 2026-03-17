@@ -86,7 +86,9 @@ def init_child_from_parent(
 
     copy_tokenizer(parent_checkpoint_dir, output_checkpoint_dir)
 
-    parent_model_config = load_model_config(parent_checkpoint_dir)
+    parent_model_config = load_model_config(
+        parent_checkpoint_dir, trust_remote_code=descriptor.requires_trust_remote_code()
+    )
     parent_state_dict = load_state_dict(parent_checkpoint_dir)
 
     # Parse JSON if string
@@ -108,6 +110,7 @@ def init_child_from_parent(
         parent_checkpoint_dir,
         model_config_overrides=global_config_overrides,
         ignore_unexpected_config_keys=True,
+        trust_remote_code=descriptor.requires_trust_remote_code(),
     )
 
     # Apply block-level overrides if any
@@ -126,7 +129,10 @@ def init_child_from_parent(
             model_class = _get_model_class_from_config(child_model_config)
             # AutoModelForCausalLM uses from_config(); concrete model classes use _from_config()
             if model_class is AutoModelForCausalLM:
-                child_model = model_class.from_config(child_model_config, trust_remote_code=True)
+                trust_remote_code = descriptor.requires_trust_remote_code()
+                child_model = model_class.from_config(
+                    child_model_config, trust_remote_code=trust_remote_code
+                )
             else:
                 child_model = model_class._from_config(child_model_config)
 

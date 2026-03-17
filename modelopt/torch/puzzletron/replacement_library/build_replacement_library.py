@@ -39,6 +39,10 @@ from typing import Any, Type
 import pandas as pd
 from omegaconf import DictConfig
 
+from modelopt.torch.puzzletron.anymodel.model_descriptor import (
+    ModelDescriptor,
+    ModelDescriptorFactory,
+)
 from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import (
     AttentionConfig,
     BlockConfig,
@@ -65,6 +69,7 @@ CHECKPOINTS_DIR_NAME = "ckpts"
 
 def build_replacement_library(
     master_puzzle_dir: Path | str,
+    descriptor: ModelDescriptor,
     teacher_checkpoint_dir: Path | str | None = None,
     add_ffn_no_ops: bool = True,
     add_attention_no_ops: bool = True,
@@ -76,20 +81,22 @@ def build_replacement_library(
     master_puzzle_dir = Path(master_puzzle_dir)
     (master_puzzle_dir / "ckpts").mkdir(exist_ok=True)
     teacher_checkpoint_dir = infer_teacher_dir(master_puzzle_dir, teacher_checkpoint_dir)
+    trust_remote_code = descriptor.requires_trust_remote_code()
     subblocks_df = _build_subblocks_df(
         master_puzzle_dir,
         teacher_checkpoint_dir,
         add_ffn_no_ops,
         add_attention_no_ops,
+        trust_remote_code=trust_remote_code,
     )
     block_library_df = _build_block_library_from_subblocks(subblocks_df)
 
     layer_replacements = _build_layer_replacements(
-        block_library_df, master_puzzle_dir, teacher_checkpoint_dir
+        block_library_df, master_puzzle_dir, teacher_checkpoint_dir, trust_remote_code
     )
 
     single_sequence_replacement_solutions = _build_single_sequence_replacement_solutions(
-        layer_replacements, teacher_checkpoint_dir
+        layer_replacements, teacher_checkpoint_dir, trust_remote_code
     )
 
     json_dump(block_library_df.to_dict(orient="records"), master_puzzle_dir / "block_library.json")
@@ -112,11 +119,13 @@ def launch_build_replacement_library(cfg: DictConfig) -> None:
         f"Build replacement library config: {format_global_config(cfg.build_replacement_library, title='Build replacement library')}"
     )
 
+    descriptor = ModelDescriptorFactory.get(cfg.descriptor)
     build_replacement_library(
         master_puzzle_dir=cfg.puzzle_dir,
         teacher_checkpoint_dir=cfg.teacher_dir,
         add_ffn_no_ops=cfg.build_replacement_library.add_ffn_no_ops,
         add_attention_no_ops=cfg.build_replacement_library.add_attention_no_ops,
+        descriptor=descriptor,
     )
 
 
@@ -191,9 +200,12 @@ def _build_subblocks_df(
     teacher_checkpoint_dir: Path | str,
     add_ffn_no_ops: bool,
     add_attention_no_ops: bool,
+    trust_remote_code: bool = False,
 ) -> pd.DataFrame:
     teacher_checkpoint_dir = Path(teacher_checkpoint_dir)
-    checkpoint_dirs = _get_last_checkpoint_from_each_experiment(master_puzzle_dir)
+    checkpoint_dirs = _get_last_checkpoint_from_each_experiment(
+        master_puzzle_dir, trust_remote_code=trust_remote_code
+    )
     checkpoint_dirs = [teacher_checkpoint_dir] + list(checkpoint_dirs - {teacher_checkpoint_dir})
     checkpoints_to_split = [teacher_checkpoint_dir]
 
@@ -203,7 +215,7 @@ def _build_subblocks_df(
         if len(subblocks_to_extract) > 0:
             subblock_rows_from_current_checkpoint = (
                 _construct_subblock_rows_from_current_checkpoint(
-                    checkpoint_dir, subblocks_to_extract
+                    checkpoint_dir, subblocks_to_extract, trust_remote_code=trust_remote_code
                 )
             )
             subblock_rows.extend(subblock_rows_from_current_checkpoint)
@@ -303,10 +315,10 @@ def _drop_duplicates_of_decomp_no_op(subblocks_df: pd.DataFrame) -> pd.DataFrame
 
 
 def _construct_subblock_rows_from_current_checkpoint(
-    checkpoint_dir: Path, subblocks_to_extract: list[str]
+    checkpoint_dir: Path, subblocks_to_extract: list[str], trust_remote_code: bool = False
 ) -> list[dict[str, Any]]:
     subblock_rows_from_current_checkpoint = []
-    model_config = load_model_config(checkpoint_dir)
+    model_config = load_model_config(checkpoint_dir, trust_remote_code=trust_remote_code)
     for block_idx, block_config in enumerate(model_config.block_configs):
         for subblock_to_extract in subblocks_to_extract:
             subblock_row = _init_empty_subblock_row(block_idx)
@@ -388,7 +400,9 @@ def _get_rows_with_no_op_subblock(
     return rows_with_no_op_subblock, subblock_cls
 
 
-def _get_last_checkpoint_from_each_experiment(master_puzzle_dir: Path | str) -> set[Path]:
+def _get_last_checkpoint_from_each_experiment(
+    master_puzzle_dir: Path | str, trust_remote_code: bool = False
+) -> set[Path]:
     master_puzzle_dir = Path(master_puzzle_dir)
     master_checkpoints_dir = master_puzzle_dir / CHECKPOINTS_DIR_NAME
     subdirs_of_master_checkpoints_dir = [
@@ -409,7 +423,11 @@ def _get_last_checkpoint_from_each_experiment(master_puzzle_dir: Path | str) -> 
             )
 
     # Filter out non-DeciLM checkpoints (e.g., unconverted Llama checkpoints)
-    valid_checkpoint_dirs = [cp for cp in checkpoint_dirs if is_valid_decilm_checkpoint(cp)]
+    valid_checkpoint_dirs = [
+        cp
+        for cp in checkpoint_dirs
+        if is_valid_decilm_checkpoint(cp, trust_remote_code=trust_remote_code)
+    ]
 
     experiment_dirs = [
         p if (p in subdirs_of_master_checkpoints_dir) else p.parent for p in valid_checkpoint_dirs
@@ -465,14 +483,15 @@ def _build_layer_replacements(
     block_library_df: pd.DataFrame,
     master_puzzle_dir: Path,
     teacher_checkpoint_dir: Path,
+    trust_remote_code: bool = False,
 ) -> list[dict]:
     layer_replacements_from_blocks = _build_layer_replacements_from_block_library(block_library_df)
     layer_replacements_from_checkpoints = _gather_layer_replacements_from_checkpoints(
-        master_puzzle_dir
+        master_puzzle_dir, trust_remote_code=trust_remote_code
     )
     layer_replacements = layer_replacements_from_blocks + layer_replacements_from_checkpoints
     layer_replacements = _filter_duplicate_teacher_replacements(
-        layer_replacements, teacher_checkpoint_dir
+        layer_replacements, teacher_checkpoint_dir, trust_remote_code
     )
     return layer_replacements
 
@@ -502,9 +521,13 @@ def _build_layer_replacements_from_block_library(block_library_df: pd.DataFrame)
     return layer_replacements
 
 
-def _gather_layer_replacements_from_checkpoints(master_puzzle_dir: str | Path) -> list[dict]:
+def _gather_layer_replacements_from_checkpoints(
+    master_puzzle_dir: str | Path, trust_remote_code: bool = False
+) -> list[dict]:
     gathered_layer_replacements = []
-    checkpoint_dirs = _get_last_checkpoint_from_each_experiment(master_puzzle_dir)
+    checkpoint_dirs = _get_last_checkpoint_from_each_experiment(
+        master_puzzle_dir, trust_remote_code=trust_remote_code
+    )
     for checkpoint_dir in checkpoint_dirs:
         if (layer_replacements_path := checkpoint_dir / "replacement_library.json").exists():
             layer_replacements = json.loads(layer_replacements_path.read_text())
@@ -523,8 +546,11 @@ def _gather_layer_replacements_from_checkpoints(master_puzzle_dir: str | Path) -
 def _filter_duplicate_teacher_replacements(
     layer_replacements: list[dict],
     teacher_checkpoint_dir: Path,
+    trust_remote_code: bool = False,
 ) -> list[dict]:
-    teacher_model_config = load_model_config(teacher_checkpoint_dir)
+    teacher_model_config = load_model_config(
+        teacher_checkpoint_dir, trust_remote_code=trust_remote_code
+    )
     filtered_layer_replacements = []
     for layer_replacement in layer_replacements:
         if replacement_is_teacher(
@@ -537,8 +563,11 @@ def _filter_duplicate_teacher_replacements(
 def _build_single_sequence_replacement_solutions(
     layer_replacements: list[dict],
     teacher_checkpoint_dir: Path,
+    trust_remote_code: bool = False,
 ) -> list[dict]:
-    teacher_model_config = load_model_config(teacher_checkpoint_dir)
+    teacher_model_config = load_model_config(
+        teacher_checkpoint_dir, trust_remote_code=trust_remote_code
+    )
     n_layer = teacher_model_config.num_hidden_layers
 
     teacher_replacements = dict()
