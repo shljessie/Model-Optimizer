@@ -38,7 +38,6 @@ import torch
 import transformers
 from packaging.version import Version
 from torch import nn
-from torch.cuda import nvtx
 from torch.nn import CrossEntropyLoss
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from transformers import Cache, DynamicCache, PretrainedConfig, PreTrainedModel
@@ -58,7 +57,7 @@ from ...export.plugins.hf_spec_export import (
 )
 from ..eagle.conversion import EagleDMRegistry
 from ..eagle.eagle_model import EagleModel
-from ..eagle.utils import expand_mask, make_causal_mask
+from ..eagle.utils import expand_mask, make_causal_mask, maybe_nvtx_range
 from ..medusa.conversion import MedusaDMRegistry
 from ..medusa.medusa_model import MedusaModel
 from ..utils import (
@@ -618,6 +617,13 @@ class HFEagleModel(EagleModel):
         # https://github.com/huggingface/transformers/blob/v4.56-release/src/transformers/trainer.py#L566
         self.is_quantized = False
 
+        if self.eagle_use_torch_compile:
+            self._prepare_eagle_inputs = torch.compile(self._prepare_eagle_inputs, dynamic=False)
+            self._eagle_forward = torch.compile(
+                self._eagle_forward, dynamic=False, mode="max-autotune"
+            )
+            self._eagle_loss = torch.compile(self._eagle_loss, dynamic=False, fullgraph=True)
+
         self._cached_attn_blk_masks = {}
 
     def _get_ttt_attention_mask(self, batch_size, seq_length, ttt_step):
@@ -657,8 +663,7 @@ class HFEagleModel(EagleModel):
 
         return combined_attention_mask
 
-    @nvtx.range("prepare_eagle_inputs")
-    @torch.compile(dynamic=False)
+    @maybe_nvtx_range("prepare_eagle_inputs")
     def _prepare_eagle_inputs(
         self,
         input_ids,
@@ -761,7 +766,7 @@ class HFEagleModel(EagleModel):
             tensor_mask = tensor_mask.repeat(batch_size, 1, 1, 1)
             return tensor_mask
 
-    @nvtx.range("base_model_forward")
+    @maybe_nvtx_range("base_model_forward")
     def _base_model_forward(
         self,
         input_ids,
@@ -810,8 +815,7 @@ class HFEagleModel(EagleModel):
         )
         return full_logits[:, :, reverse_mapping]
 
-    @nvtx.range("eagle_forward")
-    @torch.compile(dynamic=False, mode="max-autotune")
+    @maybe_nvtx_range("eagle_forward")
     def _eagle_forward(
         self,
         eagle_input_hidden_states,
@@ -1005,8 +1009,7 @@ class HFEagleModel(EagleModel):
             train_acc=train_accs,
         )
 
-    @nvtx.range("eagle_loss")
-    @torch.compile(dynamic=False, fullgraph=True)
+    @maybe_nvtx_range("eagle_loss")
     def _eagle_loss(
         self,
         base_output_softmax_logits,
