@@ -80,7 +80,8 @@ def filter_calib_modules(
         include_modules: If provided, only modules whose names match at least one fnmatch pattern
             are calibrated.  All others are skipped.
         exclude_modules: If provided, modules whose names match at least one fnmatch pattern are
-            skipped.
+            skipped.  When a module name matches both ``include_modules`` and ``exclude_modules``,
+            exclusion takes precedence and the module is skipped.
 
     Note:
         Only quantized linear modules (as identified by :func:`is_quantized_linear`) are filtered.
