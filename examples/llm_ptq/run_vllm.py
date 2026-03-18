@@ -116,6 +116,7 @@ def main():
         max_model_len=args.max_model_len,
         trust_remote_code=args.trust_remote_code,
         quantization=quantization,
+        enforce_eager=True,
     )
 
     # Get sampling params from config, with CLI/defaults as fallback
