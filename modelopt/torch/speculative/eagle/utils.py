@@ -79,6 +79,9 @@ def maybe_nvtx_range(*args, **kwargs):
     try:
         import torch.cuda.nvtx as nvtx
 
+        nvtx.range_push("nvtx init")
+        nvtx.range_pop("nvtx init")
+
         return nvtx.range(*args, **kwargs)
     except (ImportError, RuntimeError):
         # If NVTX is not available, return a no-op context manager
