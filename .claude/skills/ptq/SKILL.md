@@ -30,7 +30,7 @@ Skip remote mode and proceed with local execution below.
 **Case C — no config, but user clearly wants remote (e.g. "run on the cluster", "use SSH", mentions a hostname):**
 Ask the user for the following info, then create `~/.config/modelopt/clusters.yaml` before proceeding:
 
-```
+```text
 I need a few details to set up the remote cluster. Please provide:
 1. Login node hostname (e.g. cluster-login.example.com)
 2. SSH username
@@ -137,11 +137,14 @@ For MLP-only quantization (skipping attention), use configs with `MLP_ONLY` in t
 - **SLURM**: Read `references/slurm-setup.md` — it has container setup, account/partition selection, the job script template, smoke-test strategy, and monitoring instructions.
 - **Local GPU**: Check if Docker is available first — it's the cleanest isolation:
   - **Docker available**: use the TRT-LLM NGC container (version from `examples/llm_ptq/README.md`):
+
     ```bash
     docker run --gpus all -v <model_path>:<model_path> -v <output_path>:<output_path> \
         nvcr.io/nvidia/tensorrt-llm/release:<version> bash -c "pip install -e <modelopt_path>[hf] --quiet && python <ptq_script.py> ..."
     ```
+
   - **No Docker**: set up a virtual environment with conda (preferred) or venv:
+
     ```bash
     # conda
     conda create -n modelopt python=3.10 -y && conda activate modelopt

@@ -75,7 +75,6 @@ for n in sorted(names): print(n)
 
 Compare against the `enable`/`disable` patterns in the config. Add custom overrides using Pattern 6 if needed. Always verify with `mtq.print_quant_summary(model)` after quantization.
 
-
 ## Pattern 1: Custom Module with TensorQuantizer
 
 For modules that use raw `nn.Parameter` + `F.linear()` instead of `nn.Linear`, inject `TensorQuantizer` modules and apply them in the forward pass.
