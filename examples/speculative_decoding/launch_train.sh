@@ -86,6 +86,10 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       AR_VALIDATE_STEPS="${1#*=}"
       ;;
+    --num_ttt_steps*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      NUM_TTT_STEPS="${1#*=}"
+      ;;
     --cp_size*)
       if [[ "$1" != *=* ]]; then shift; fi
       CP_SIZE="${1#*=}"
@@ -110,6 +114,10 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       HEAD_NODE_IP="${1#*=}"
       ;;
+    --mix_hidden_states*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      MIX_HIDDEN_STATES="${1#*=}"
+      ;;
     *)
       >&2 printf "Error: Invalid argument ${1#*=}\n"
       exit 1
@@ -120,6 +128,7 @@ done
 
 set -x
 
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 NUM_NODES=${NUM_NODES:-1}
 GPU_PER_NODE=${GPU_PER_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
 TOTAL_GPU=$((NUM_NODES * GPU_PER_NODE))
@@ -148,6 +157,8 @@ CP_SIZE=${CP_SIZE:-1}
 DP_SHARD_SIZE=${DP_SHARD_SIZE:-$((TOTAL_GPU/CP_SIZE))}
 LOG_STEPS=${LOG_STEPS:-100}
 DRAFT_VOCAB_CACHE=${DRAFT_VOCAB_CACHE:-""}
+MIX_HIDDEN_STATES=${MIX_HIDDEN_STATES:-"False"}
+NUM_TTT_STEPS=${NUM_TTT_STEPS:-3}
 
 
 if [[ "$MODE" == "eagle3" ]]; then
@@ -181,7 +192,7 @@ fi
 
 if [[ "$TOTAL_GPU" -gt 1 ]]; then
   #Use FSDP2 when multi GPU available
-  FSDP_ARGS="--fsdp 'full_shard' --fsdp_config fsdp_config.json"
+  FSDP_ARGS="--fsdp 'full_shard' --fsdp_config ${SCRIPT_DIR}/fsdp_config.json"
 else
   #Otherwise, single GPU training
   FSDP_ARGS=""
@@ -207,7 +218,7 @@ fi
 
 # Disable tokenizers parallelism to avoid warning
 export TOKENIZERS_PARALLELISM=False
-CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 main.py \
+CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 ${SCRIPT_DIR}/main.py \
     --mode $MODE \
     --eagle_decoder_type $EAGLE_DECODER_TYPE \
     --model_name_or_path $MODEL \
@@ -233,6 +244,7 @@ CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 main.py \
     --disable_tqdm $DISABLE_TQDM \
     --estimate_ar $ESTIMATE_AR \
     --ar_validate_steps $AR_VALIDATE_STEPS \
+    --mix_hidden_states $MIX_HIDDEN_STATES \
     $DRAFT_VOCAB_CACHE_ARGS \
     $VLM_ARGS \
     $OFFLINE_TRAINING_ARGS \
@@ -240,6 +252,7 @@ CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 main.py \
     $FSDP_ARGS \
     --cp_size $CP_SIZE \
     --dp_shard_size $DP_SHARD_SIZE \
+    --num_ttt_steps $NUM_TTT_STEPS \
 "
 
 start_time=$(date +%s)
