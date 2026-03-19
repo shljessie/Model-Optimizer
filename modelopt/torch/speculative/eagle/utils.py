@@ -80,9 +80,9 @@ def maybe_nvtx_range(*args, **kwargs):
         import torch.cuda.nvtx as nvtx
 
         nvtx.range_push("nvtx init")
-        nvtx.range_pop("nvtx init")
+        nvtx.range_pop()
 
         return nvtx.range(*args, **kwargs)
-    except (ImportError, RuntimeError):
+    except Exception:
         # If NVTX is not available, return a no-op context manager
         return nullcontext()
