@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import argparse
-import pickle
 from collections import defaultdict
 
 import torch
@@ -254,6 +253,9 @@ def get_args() -> argparse.Namespace:
             "Useful for iterative pruning"
         ),
     )
+    parser.add_argument(
+        "--save_scores_path", type=str, default="scores.pt", help="Path to save scores"
+    )
 
     args = parser.parse_args()
 
@@ -280,7 +282,8 @@ def collect_scores(
     for i in range(num_layers):
         scores[i] = {}
         for metric in metrics:
-            scores[i][metric] = stats[metric][i]
+            scores[i][metric] = stats[metric][i].cpu()
+
     # print(f"{scores=}")
     print("Layers ordered by <MSE> importance:")
     res = sorted(
@@ -422,8 +425,7 @@ def estimate_layer_importance(args: argparse.Namespace):
     if is_pipeline_last_stage() and get_data_parallel_rank() == 0:
         scores = collect_scores(unwrapped_model)
         assert scores is not None
-        with open(f"scores_{get_pipeline_model_parallel_rank()}.p", "wb") as f:
-            pickle.dump(scores, f)
+        torch.save(scores, args.save_scores_path)
 
 
 if __name__ == "__main__":
