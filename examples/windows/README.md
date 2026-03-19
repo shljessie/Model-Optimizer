@@ -53,6 +53,16 @@ pip install nvidia-modelopt[onnx]
 
 To install ModelOpt-Windows through Microsoft's Olive, use the following commands:
 
+**For CUDA-capable RTX GPUs (RTX 40-series and above):**
+
+```bash
+pip install olive-ai[nvmo]
+pip install onnxruntime-genai-cuda
+pip install onnxruntime
+```
+
+**For other systems or if you prefer DirectML:**
+
 ```bash
 pip install olive-ai[nvmo]
 pip install onnxruntime-genai-directml>=0.4.0
