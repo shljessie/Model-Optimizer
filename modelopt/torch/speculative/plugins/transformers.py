@@ -626,6 +626,7 @@ class HFEagleModel(EagleModel):
         import torch._dynamo
 
         torch._dynamo.config.suppress_errors = True  # Allow fallback to eager mode
+        torch._dynamo.config.cache_size_limit = 2048
 
         # Individual try-catch for each function to maximize torch.compile usage
         try:
@@ -634,24 +635,23 @@ class HFEagleModel(EagleModel):
             print("Disabling torch.compile for _prepare_eagle_inputs due to compilation error.")
 
         try:
-            self._eagle_forward = torch.compile(
-                self._eagle_forward, dynamic=False, mode="max-autotune"
-            )
+            self._eagle_forward = torch.compile(self._eagle_forward, dynamic=False)
         except Exception:
             print("Disabling torch.compile for _eagle_forward due to compilation error.")
 
         try:
-            self._eagle_loss = torch.compile(self._eagle_loss, dynamic=False, fullgraph=True)
+            self._eagle_loss = torch.compile(self._eagle_loss, dynamic=False)
         except Exception:
             print("Disabling torch.compile for _eagle_loss due to compilation error.")
 
     def _get_ttt_attention_mask(self, batch_size, seq_length, ttt_step):
         # compile and cached flex attention masks in first call
-        if ttt_step not in self._cached_attn_blk_masks:
-            self._cached_attn_blk_masks.update(
-                {ttt_step: self._compute_ttt_attention_mask(batch_size, seq_length, ttt_step)}
+        cache_key = (ttt_step, seq_length)
+        if cache_key not in self._cached_attn_blk_masks:
+            self._cached_attn_blk_masks[cache_key] = self._compute_ttt_attention_mask(
+                batch_size, seq_length, ttt_step
             )
-        return self._cached_attn_blk_masks[ttt_step]
+        return self._cached_attn_blk_masks[cache_key]
 
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, past_key_values_length, device, dtype

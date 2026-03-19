@@ -110,6 +110,10 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       NUM_NODES="${1#*=}"
       ;;
+    --bucket_granularity*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      BUCKET_GRANULARITY="${1#*=}"
+      ;;
     --head_node_ip*)
       if [[ "$1" != *=* ]]; then shift; fi
       HEAD_NODE_IP="${1#*=}"
@@ -164,7 +168,7 @@ DRAFT_VOCAB_CACHE=${DRAFT_VOCAB_CACHE:-""}
 MIX_HIDDEN_STATES=${MIX_HIDDEN_STATES:-"False"}
 DISABLE_TORCH_COMPILE=${DISABLE_TORCH_COMPILE:-"False"}
 NUM_TTT_STEPS=${NUM_TTT_STEPS:-3}
-
+BUCKET_GRANULARITY=${BUCKET_GRANULARITY:-512}
 
 if [[ "$MODE" == "eagle3" ]]; then
   if [[ -n "$EAGLE_CONFIG" ]]; then
@@ -259,6 +263,7 @@ CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 ${SCRIPT_DIR}/mai
     --cp_size $CP_SIZE \
     --dp_shard_size $DP_SHARD_SIZE \
     --num_ttt_steps $NUM_TTT_STEPS \
+    --bucket_granularity $BUCKET_GRANULARITY \
 "
 
 start_time=$(date +%s)

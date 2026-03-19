@@ -111,6 +111,15 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     cp_size: int = field(default=1, metadata={"help": "Context parallelism size."})
     dp_shard_size: int = field(default=1, metadata={"help": "Data parallelism shard size."})
+    bucket_granularity: int = field(
+        default=512,
+        metadata={
+            "help": (
+                "Pad sequences to the nearest multiple of this value instead of training_seq_len. "
+                "Set to 0 to disable (always pad to training_seq_len)."
+            )
+        },
+    )
 
 
 @dataclass
@@ -237,8 +246,16 @@ def train():
 
     print_rank_0("Loading dataset...")
     if training_args.mode == "eagle3":
+        bucket_gran = training_args.bucket_granularity
+        if bucket_gran > 0 and training_args.cp_size > 1:
+            from math import lcm
+
+            bucket_gran = lcm(bucket_gran, training_args.cp_size)
         data_module = make_eagle_supervised_data_module(
-            tokenizer, data_args, train_len=training_args.training_seq_len
+            tokenizer,
+            data_args,
+            train_len=training_args.training_seq_len,
+            bucket_granularity=bucket_gran,
         )
 
     trainer = EagleTrainerWithAccLog(
