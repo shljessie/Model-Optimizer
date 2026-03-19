@@ -175,7 +175,7 @@ class LastHiddenImportanceHook(torch.nn.Module):
         if self.reference_load:  # the first call only swithches the accumultors
             self.reference_load = False
             return
-        print_rank_0("> Computing distances to stored refernces")
+        print_rank_0("> Computing distances to stored references")
 
         if len(self.hidden_distance) > 0:
             hidden_state_stats = self.gather_across_dp(torch.stack(self.hidden_distance))
