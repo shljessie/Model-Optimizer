@@ -13,6 +13,7 @@ Predictions and targets are in patchified space [B, seq_len, C].
 from __future__ import annotations
 
 import random
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -166,6 +167,16 @@ class LTX2TrainingForwardAdapter:
         ).to(dtype)
         pixel_coords[:, 0, ...] = pixel_coords[:, 0, ...] / self._fps
         return pixel_coords
+
+    def get_output_transforms(self, model: nn.Module) -> dict[str, Callable]:
+        # BasicAVTransformerBlock returns (TransformerArgs | None, TransformerArgs | None).
+        # Extract the video hidden state from the first element.
+        transforms: dict[str, Callable] = {}
+        if hasattr(model, "transformer_blocks"):
+            for i in range(len(model.transformer_blocks)):
+                path = f"transformer_blocks.{i}"
+                transforms[path] = lambda out, _i=i: out[0].x
+        return transforms
 
     def _create_conditioning_mask(
         self,

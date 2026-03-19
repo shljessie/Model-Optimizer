@@ -1,153 +1,226 @@
-# LTX-2 Distillation Training with ModelOpt
+# Quantization-Aware Distillation for Video Diffusion Models
 
-Knowledge distillation for LTX-2 DiT models using NVIDIA ModelOpt. A frozen **teacher** guides a trainable **student** through a combined loss:
+Unified trainer for quantization-aware distillation (QAD) of video diffusion
+models using NVIDIA ModelOpt. A frozen full-precision **teacher** guides a
+quantized **student** to recover quality lost from quantization:
 
-```text
-L_total = α × L_task + (1-α) × L_distill
+```
+L = alpha * L_task + (1 - alpha) * L_distill
 ```
 
-Currently supported:
+Optionally, layer-wise distillation matches intermediate transformer block
+outputs for stronger gradient signal:
 
-- **Quantization-Aware Distillation (QAD)** — student uses ModelOpt fake quantization
+```
+L_distill = (1 - gamma) * L_output + gamma * L_layer
+```
 
-Planned:
+Supported models:
 
-- **Sparsity-Aware Distillation (SAD)** — student uses ModelOpt sparsity
+| Backend | Model Family | Variants |
+|---------|-------------|----------|
+| `wan`   | Wan2.2      | `ti2v-5B`, `t2v-A14B`, `i2v-A14B` |
+| `ltx2`  | LTX-2       | -- |
+
+---
 
 ## Installation
 
 ```bash
-# From the distillation example directory
 cd examples/diffusers/distillation
 
-# Install Model-Optimizer (from repo root)
-pip install -e ../../..
-
-# Install all dependencies (ltx-trainer, ltx-core, ltx-pipelines, omegaconf)
-pip install -r requirements.txt
+# Install the distillation package + ONE model backend:
+pip install -e ".[wan]"    # For Wan2.2
+pip install -e ".[ltx2]"   # For LTX-2
 ```
+
+> **Note:** Install only one backend at a time. Their transitive dependencies
+> may conflict.
+
+---
 
 ## Quick Start
 
-### 1. Prepare Your Dataset
+### Smoke Test (Mock Data)
 
-Use the ltx-trainer preprocessing to extract latents and text embeddings:
+Verify the pipeline works end-to-end without real data:
 
 ```bash
-python -m ltx_trainer.preprocess \
+accelerate launch \
+    --config_file configs/accelerate/fsdp_wan.yaml \
+    --num_processes 8 \
+    train_general.py \
+    --config configs/wan_distillation.yaml \
+    model.model_path=/path/to/Wan2.2-TI2V-5B \
+    distillation.use_mock_data=true \
+    optimization.steps=100 \
+    wandb.enabled=false
+```
+
+### Prepare Real Data
+
+Preprocess raw videos + captions into latent space:
+
+```bash
+python -m src.preprocess \
+    --model_name wan \
+    --model_path /path/to/Wan2.2-TI2V-5B \
+    --model_variant ti2v-5B \
     --input_dir /path/to/videos \
-    --output_dir /path/to/preprocessed \
-    --model_path /path/to/ltx2/checkpoint.safetensors
+    --output_dir /path/to/preprocessed
 ```
 
-### 2. Configure
+### QAD Training
 
-Copy and edit the example config:
+Quantize the student with NVFP4 and distill from the full-precision teacher:
 
 ```bash
-cp configs/distillation_example.yaml configs/my_experiment.yaml
+accelerate launch \
+    --config_file configs/accelerate/fsdp_wan.yaml \
+    --num_processes 8 \
+    train_general.py \
+    --config configs/wan_distillation.yaml \
+    model.model_path=/path/to/Wan2.2-TI2V-5B \
+    data.preprocessed_data_root=/path/to/preprocessed \
+    distillation.quant_cfg=NVFP4_DEFAULT_CFG
 ```
 
-Key settings to update:
+### Layer-Wise Distillation
+
+Add intermediate layer matching on top of QAD:
+
+```bash
+accelerate launch \
+    --config_file configs/accelerate/fsdp_wan.yaml \
+    --num_processes 8 \
+    train_general.py \
+    --config configs/wan_distillation.yaml \
+    model.model_path=/path/to/Wan2.2-TI2V-5B \
+    data.preprocessed_data_root=/path/to/preprocessed \
+    distillation.quant_cfg=NVFP4_DEFAULT_CFG \
+    'distillation.layer_distillation_modules=[blocks.9,blocks.19,blocks.29]' \
+    distillation.layer_distillation_weight=0.5
+```
+
+`layer_distillation_modules` accepts module paths (e.g. `blocks.9` for Wan,
+`transformer_blocks.5` for LTX-2). Since QAD uses the same architecture for
+teacher and student, the same module name is used for both.
+
+---
+
+## Configuration
+
+### Config Inheritance
+
+Model configs inherit shared defaults from `configs/default.yaml`:
+
+```
+configs/
+├── default.yaml              # Shared: optimization, checkpoints, flow matching, ...
+├── wan_distillation.yaml     # Wan-specific: model, validation dims, wandb tags
+└── ltx2_distillation.yaml    # LTX-2-specific
+```
+
+Create a new experiment by overriding the base:
 
 ```yaml
-model:
-  model_path: "/path/to/ltx2/checkpoint.safetensors"
-  text_encoder_path: "/path/to/gemma/model"
+# configs/my_experiment.yaml
+defaults: default.yaml
 
-data:
-  preprocessed_data_root: "/path/to/preprocessed/data"
+model:
+  model_name: "wan"
+  model_path: "/path/to/checkpoint"
 
 distillation:
-  distillation_alpha: 0.5       # 1.0 = pure task loss, 0.0 = pure distillation
-  quant_cfg: "FP8_DEFAULT_CFG"  # or INT8_DEFAULT_CFG, NVFP4_DEFAULT_CFG, null
-
-# IMPORTANT: disable ltx-trainer's built-in quantization
-acceleration:
-  quantization: null
+  quant_cfg: "NVFP4_DEFAULT_CFG"
 ```
 
-### 3. Run Training
+### CLI Overrides
 
-#### Single GPU
+Any config field can be overridden via dotted OmegaConf syntax:
 
 ```bash
-python distillation_trainer.py --config configs/my_experiment.yaml
+train_general.py --config configs/wan_distillation.yaml \
+    optimization.learning_rate=1e-5 \
+    optimization.steps=5000
 ```
 
-#### Multi-GPU (Single Node) with Accelerate
+### Key Fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `distillation.quant_cfg` | null | ModelOpt quantization config (e.g. `NVFP4_DEFAULT_CFG`) |
+| `distillation.distillation_alpha` | 0.0 | Loss mixing: 0 = pure distillation, 1 = pure task loss |
+| `distillation.layer_distillation_modules` | null | Module paths for layer distillation (null = disabled) |
+| `distillation.layer_distillation_weight` | 0.0 | gamma: mixing ratio between output (0) and layer (1) distillation |
+| `distillation.layer_distillation_normalize` | true | L2-normalize features before layer loss (scale-invariant) |
+| `distillation.resume_from_checkpoint` | "latest" | Resume path or "latest" for auto-resume |
+| `optimization.learning_rate` | 2e-6 | Learning rate |
+| `optimization.steps` | 10000 | Total training steps |
+| `checkpoints.must_save_by` | null | Minutes; save and exit for Slurm time limits |
+
+---
+
+## Slurm
+
+`slurm_example.sh` is a ready-to-use launcher that handles container setup,
+dependency installation, and multi-node coordination. Edit the default config
+section inside the script (paths, partition, account) for your cluster, then:
 
 ```bash
-accelerate launch \
-    --config_file configs/accelerate/fsdp.yaml \
-    --num_processes 8 \
-    distillation_trainer.py --config configs/my_experiment.yaml
+# LTX-2 single node
+./slurm_example.sh --model ltx2 \
+    --model-path /path/to/ltx-2-19b-dev.safetensors \
+    --text-encoder-path /path/to/gemma-3-12b-it
+
+# Wan multi-node
+./slurm_example.sh --model wan --model-path /path/to/Wan2.2-TI2V-5B --nodes 2
+
+# Dry run (print sbatch script without submitting)
+./slurm_example.sh --model wan --model-path /path/to/Wan2.2-TI2V-5B --dry-run
+
+# With config overrides
+./slurm_example.sh --model wan --model-path /path/to/Wan2.2-TI2V-5B \
+    optimization.steps=5000 optimization.learning_rate=1e-5
 ```
 
-#### Multi-node Training with Accelerate
+### Time-Limit-Aware Training
 
-To launch on multiple nodes, make sure to set the following environment variables on each node:
-
-- `NUM_NODES`: Total number of nodes
-- `GPUS_PER_NODE`: Number of GPUs per node
-- `NODE_RANK`: Unique rank/index of this node (0-based)
-- `MASTER_ADDR`: IP address of the master node (rank 0)
-- `MASTER_PORT`: Communication port (e.g., 29500)
-
-Then run this (on every node):
+For long runs across multiple Slurm jobs:
 
 ```bash
-accelerate launch \
-    --config_file configs/accelerate/fsdp.yaml \
-    --num_machines $NUM_NODES \
-    --num_processes $((NUM_NODES * GPUS_PER_NODE)) \
-    --machine_rank $NODE_RANK \
-    --main_process_ip $MASTER_ADDR \
-    --main_process_port $MASTER_PORT \
-    distillation_trainer.py --config configs/my_experiment.yaml
+./slurm_example.sh --model wan --model-path /path/to/Wan2.2-TI2V-5B \
+    --time 04:00:00 \
+    checkpoints.must_save_by=230 \
+    distillation.resume_from_checkpoint=latest
 ```
 
-**Config overrides** can be passed via CLI using dotted notation:
+The trainer saves a checkpoint after 230 minutes, and subsequent jobs resume
+automatically.
 
-```bash
-accelerate launch ... distillation_trainer.py \
-    --config configs/my_experiment.yaml \
-    ++distillation.distillation_alpha=0.6 \
-    ++distillation.quant_cfg=INT8_DEFAULT_CFG \
-    ++optimization.learning_rate=1e-5
+---
+
+## Outputs
+
+```
+outputs/
+├── model_weights_final.safetensors   # Inference-ready weights
+├── checkpoints/
+│   ├── step_000500/                  # Training state (FSDP shards, optimizer, ...)
+│   └── step_001000/
+└── validation/
+    ├── step_000500/
+    │   ├── video_000.mp4
+    │   └── video_001.mp4
+    └── step_001000/
 ```
 
-## Configuration Reference
+---
 
-### Calibration
+## Adding a New Model
 
-Before training begins, calibration runs full denoising inference to collect activation statistics for accurate quantizer scales. This is cached as a step-0 checkpoint and reused on subsequent runs.
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `calibration_prompts_file` | null | Text file with one prompt per line. Use the HuggingFace dataset 'Gustavosta/Stable-Diffusion-Prompts' if null. |
-| `calibration_size` | 128 | Number of prompts (each runs a full denoising loop) |
-| `calibration_n_steps` | 30 | Denoising steps per prompt |
-| `calibration_guidance_scale` | 4.0 | CFG scale (should match inference-time) |
-
-### Checkpoint Resume
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `resume_from_checkpoint` | null | `"latest"` to auto-detect, or explicit path |
-| `must_save_by` | null | Minutes after which to save and exit (for Slurm time limits) |
-| `restore_quantized_checkpoint` | null | Restore a pre-quantized model (skips calibration) |
-| `save_quantized_checkpoint` | null | Path to save the final quantized model |
-
-### Custom Quantization Configs
-
-To define custom quantization configs, add entries to `CUSTOM_QUANT_CONFIGS` in `distillation_trainer.py`:
-
-```python
-CUSTOM_QUANT_CONFIGS["MY_FP8_CFG"] = {
-    "quant_cfg": mtq.FP8_DEFAULT_CFG["quant_cfg"],
-    "algorithm": "max",
-}
-```
-
-Then reference it in your YAML: `quant_cfg: MY_FP8_CFG`.
+1. Create `src/models/<name>/` with `loader.py`, `adapter.py`, `pipeline.py`
+2. Register with `@register_backend("name")` in `src/models/__init__.py`
+3. Add dependency extra in `pyproject.toml`
+4. Add import guard in `src/models/_deps.py`
+5. Create config YAML (with `defaults: default.yaml`) and FSDP config

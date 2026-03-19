@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from .config import TrainerConfig
 from .dataset import LatentDataset, MockDataset, create_dataloader
+from .feature_extractor import FeatureExtractor
 from .interfaces import (
     CachedEmbeddings,
     InferencePipeline,
@@ -42,6 +43,23 @@ DTYPE_MAP = {
 
 def _is_global_rank0() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _resolve_layer_pairs(
+    modules: list[str | list[str]],
+) -> list[tuple[str, str]]:
+    """Normalize layer specs into ``(teacher_path, student_path)`` pairs.
+
+    Plain strings are treated as shared paths (self-distillation shorthand).
+    Two-element lists map ``[teacher_path, student_path]`` explicitly.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in modules:
+        if isinstance(entry, str):
+            pairs.append((entry, entry))
+        else:
+            pairs.append((entry[0], entry[1]))
+    return pairs
 
 
 class DistillationTrainer:
@@ -105,6 +123,13 @@ class DistillationTrainer:
         # --- Apply ModelOpt quantization after FSDP wrapping ---
         if config.distillation.quant_cfg is not None:
             self._apply_quantization()
+
+        # --- Layer-wise distillation hooks ---
+        self._layer_pairs: list[tuple[str, str]] = []
+        self._student_extractor: FeatureExtractor | None = None
+        self._teacher_extractor: FeatureExtractor | None = None
+        if config.distillation.layer_distillation_modules:
+            self._init_layer_distillation()
 
         # --- Dataloader ---
         self._init_dataloaders()
@@ -434,16 +459,60 @@ class DistillationTrainer:
         else:
             raise ValueError("Either data.preprocessed_data_root or distillation.use_mock_data must be set")
 
+        # Don't pass distributed=True here: accelerator.prepare() adds its
+        # own DistributedSampler.  Doing both causes double-sharding and an
+        # empty dataloader when the dataset is small.
         self._dataloader = create_dataloader(
             train_ds, cfg.optimization.batch_size, cfg.data.num_dataloader_workers,
-            shuffle=True, distributed=distributed,
+            shuffle=True, distributed=False,
         )
         self._val_dataloader = create_dataloader(
             val_ds, cfg.optimization.batch_size, cfg.data.num_dataloader_workers,
-            shuffle=False, distributed=distributed,
+            shuffle=False, distributed=False,
         )
         self._dataloader = self._accelerator.prepare(self._dataloader)
         self._val_dataloader = self._accelerator.prepare(self._val_dataloader)
+
+    def _init_layer_distillation(self) -> None:
+        """Set up forward hooks for layer-wise distillation.
+
+        Hooks are registered on the *unwrapped* inner modules so that
+        user-facing module paths (e.g. ``"blocks.9"``) resolve correctly
+        even when the model is wrapped by FSDP.  The hooks still fire
+        during FSDP forward because FSDP delegates to the inner module.
+        """
+        cfg = self._config.distillation
+        modules = cfg.layer_distillation_modules
+        assert modules  # caller checks non-null/non-empty
+
+        self._layer_pairs = _resolve_layer_pairs(modules)
+        teacher_paths = [t for t, _s in self._layer_pairs]
+        student_paths = [s for _t, s in self._layer_pairs]
+
+        # Unwrap FSDP/DDP so we hook onto the original module hierarchy
+        unwrapped_student = self._accelerator.unwrap_model(self._student)
+        unwrapped_teacher = self._accelerator.unwrap_model(self._teacher)
+
+        # Collect per-module output transforms from the adapter (if available)
+        output_transforms: dict[str, object] = {}
+        if hasattr(self._adapter, "get_output_transforms"):
+            output_transforms = self._adapter.get_output_transforms(unwrapped_student)
+
+        self._teacher_extractor = FeatureExtractor(
+            unwrapped_teacher, teacher_paths, output_transforms=output_transforms,
+        )
+        self._student_extractor = FeatureExtractor(
+            unwrapped_student, student_paths, output_transforms=output_transforms,
+        )
+
+        logger.info(
+            "Layer-wise distillation enabled: %d layer pairs, weight=%.2f, "
+            "loss=%s, normalize=%s",
+            len(self._layer_pairs),
+            cfg.layer_distillation_weight,
+            cfg.layer_distillation_loss_type,
+            cfg.layer_distillation_normalize,
+        )
 
     def _init_wandb(self) -> None:
         import wandb
@@ -523,24 +592,36 @@ class DistillationTrainer:
         if alpha < 1.0:
             with torch.no_grad():
                 teacher_pred = self._adapter.forward_model(self._teacher, inputs)
-            distill_loss = self._compute_distillation_loss(
+            output_distill_loss = self._compute_distillation_loss(
                 student_pred, teacher_pred, inputs.loss_mask
             )
+
+            # Layer-wise distillation loss
+            if self._layer_pairs:
+                layer_loss = self._compute_layer_distillation_loss()
+                gamma = self._config.distillation.layer_distillation_weight
+                distill_loss = (1.0 - gamma) * output_distill_loss + gamma * layer_loss
+            else:
+                layer_loss = torch.tensor(0.0, device=device)
+                distill_loss = output_distill_loss
         else:
+            output_distill_loss = torch.tensor(0.0, device=device)
+            layer_loss = torch.tensor(0.0, device=device)
             distill_loss = torch.tensor(0.0, device=device)
 
         total_loss = alpha * task_loss + (1.0 - alpha) * distill_loss
 
         # Log individual losses
         if self._accelerator.is_main_process and self._wandb_run is not None:
-            self._wandb_run.log(
-                {
-                    "loss/task": task_loss.item(),
-                    "loss/distillation": distill_loss.item(),
-                    "loss/total": total_loss.item(),
-                },
-                step=self._global_step,
-            )
+            log_dict = {
+                "loss/task": task_loss.item(),
+                "loss/distillation_output": output_distill_loss.item(),
+                "loss/distillation_total": distill_loss.item(),
+                "loss/total": total_loss.item(),
+            }
+            if self._layer_pairs:
+                log_dict["loss/distillation_layer"] = layer_loss.item()
+            self._wandb_run.log(log_dict, step=self._global_step)
 
         return total_loss
 
@@ -564,6 +645,42 @@ class DistillationTrainer:
             loss = loss.mul(mask).div(mask.mean())
 
         return loss.mean()
+
+    def _compute_layer_distillation_loss(self) -> Tensor:
+        """Compute distillation loss across hooked intermediate layers."""
+        assert self._student_extractor is not None
+        assert self._teacher_extractor is not None
+
+        s_feats = self._student_extractor.get_features()
+        t_feats = self._teacher_extractor.get_features()
+
+        cfg = self._config.distillation
+        normalize = cfg.layer_distillation_normalize
+        loss_type = cfg.layer_distillation_loss_type
+
+        losses = []
+        for t_path, s_path in self._layer_pairs:
+            s = s_feats[s_path]
+            t = t_feats[t_path]
+
+            if normalize:
+                s = torch.nn.functional.normalize(s.float(), dim=-1)
+                t = torch.nn.functional.normalize(t.float(), dim=-1)
+
+            if loss_type == "mse":
+                losses.append(torch.nn.functional.mse_loss(s, t))
+            elif loss_type == "cosine":
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    s.flatten(start_dim=1), t.flatten(start_dim=1), dim=-1
+                )
+                losses.append(1.0 - cos_sim.mean())
+            else:
+                raise ValueError(f"Unknown layer distillation loss type: {loss_type}")
+
+        self._student_extractor.clear()
+        self._teacher_extractor.clear()
+
+        return torch.stack(losses).mean()
 
     # ------------------------------------------------------------------
     # Validation
@@ -589,12 +706,18 @@ class DistillationTrainer:
         n_batches = 0
         alpha = self._config.distillation.distillation_alpha
         device = self._accelerator.device
+        wdtype = self._weight_dtype
 
         for batch in self._val_dataloader:
+            # Match training dtype handling
+            for k, v in batch.items():
+                if v.is_floating_point() and v.dtype != wdtype:
+                    batch[k] = v.to(dtype=wdtype)
+
             latents = batch["latents"]
             B = latents.shape[0]
             noise = torch.randn_like(latents)
-            timesteps = self._sample_timesteps(B, device)
+            timesteps = self._sample_timesteps(B, device).to(dtype=wdtype)
 
             inputs = self._adapter.prepare_inputs(batch, noise, timesteps)
             student_pred = self._adapter.forward_model(self._student, inputs)
@@ -622,9 +745,9 @@ class DistillationTrainer:
 
         if self._accelerator.is_main_process:
             logger.info(
-                f"Validation loss (step {self._global_step}): "
-                f"task={val_losses['task']:.4f} distill={val_losses['distill']:.4f} "
-                f"total={val_losses['total']:.4f}"
+                f"Validation loss (step {self._global_step}, {n_batches} batches): "
+                f"task={val_losses['task']:.6e} distill={val_losses['distill']:.6e} "
+                f"total={val_losses['total']:.6e}"
             )
             if self._wandb_run is not None:
                 self._wandb_run.log(

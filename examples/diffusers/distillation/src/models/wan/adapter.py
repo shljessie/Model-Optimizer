@@ -7,6 +7,8 @@ plus noise application and loss.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -71,6 +73,10 @@ class WanTrainingForwardAdapter:
     ) -> Tensor:
         loss = (pred - targets).pow(2).mean()
         return loss
+
+    def get_output_transforms(self, model: nn.Module) -> dict[str, Callable]:
+        # WanAttentionBlock.forward returns x: Tensor directly -- no transform needed.
+        return {}
 
 
 def create_wan_adapter(variant: str | None = None) -> WanTrainingForwardAdapter:

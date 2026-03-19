@@ -2,26 +2,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Easy-to-use SLURM Launch Script for LTX-2 Distillation Training
+# Example SLURM launch script for QAD (Quantization-Aware Distillation) training.
 #
-# This script provides a simple interface to launch multi-node training jobs.
-# It handles container setup, environment variables, and SLURM configuration.
+# Supports both LTX-2 and Wan models. The script handles container setup,
+# multi-node distributed training via accelerate, and SLURM configuration.
+#
+# Before running, fill in the required parameters in the "Default Config" section below:
+#   - PARTITION / ACCOUNT: Your SLURM cluster partition and account
+#   - ROOT_PATH:           Working directory containing Model-Optimizer and models
+#   - CONTAINER:           Path to your container image (.sqsh / .sif)
+#   - MOUNTS:              Filesystem mount spec for the container
 #
 # Usage:
-#   ./slurm/launch.sh [options]
+#   ./slurm_example.sh --model ltx2 --model-path /path/to/ltx-2-19b-dev.safetensors \
+#       --text-encoder-path /path/to/gemma-3-12b-it [options] [config_overrides...]
+#   ./slurm_example.sh --model wan --model-path /path/to/Wan2.2-TI2V-5B [options] [config_overrides...]
 #
 # Examples:
-#   # Launch with defaults (2 nodes, 8 GPUs each)
-#   ./slurm/launch.sh
+#   # Wan multi-node
+#   ./slurm_example.sh --model wan --model-path /path/to/Wan2.2-TI2V-5B --nodes 2
 #
-#   # Launch with 4 nodes
-#   ./slurm/launch.sh --nodes 4
+#   # With config overrides
+#   ./slurm_example.sh --model ltx2 --model-path /path/to/checkpoint \
+#       optimization.steps=5000 optimization.learning_rate=1e-5
 #
-#   # Launch with custom config
-#   ./slurm/launch.sh --config configs/my_experiment.yaml --nodes 4
-#
-#   # Dry run (print command without submitting)
-#   ./slurm/launch.sh --dry-run
+#   # Dry run (print sbatch script without submitting)
+#   ./slurm_example.sh --model ltx2 --model-path /path/to/checkpoint --dry-run
 
 set -eo pipefail
 
@@ -29,36 +35,40 @@ set -eo pipefail
 ### Default Config ###
 ######################
 
-# Job settings
-JOB_NAME="ltx2-distillation"
-PARTITION="batch_block1,interactive,batch_short"
-ACCOUNT="adlr_psx_numerics"
-TIME_LIMIT="00:30:00"
+# --- SLURM settings (modify for your cluster) ---
+JOB_NAME=""
+PARTITION="your-partition"
+ACCOUNT="your-account"
+TIME_LIMIT="04:00:00"
 
-# Cluster resources
+# --- Cluster resources ---
 NUM_NODES=1
 GPUS_PER_NODE=8
-# CPUS_PER_TASK=64
 
-# Paths (modify these for your environment)
+# --- Paths (modify for your environment) ---
+# Root working directory
 ROOT_PATH="/path/to/workdir"
-MODELOPT_PATH="$ROOT_PATH/sources/Model-Optimizer"
+# Model-Optimizer source tree (mounted into the container)
+MODELOPT_PATH="$ROOT_PATH/Model-Optimizer"
 DISTILL_PATH="$MODELOPT_PATH/examples/diffusers/distillation"
-CONTAINER="$ROOT_PATH/containers/ltx-distillation2.sqsh"
+# Container image
+CONTAINER="$ROOT_PATH/container.sqsh"
+# Container mount spec (adjust for your filesystem)
+MOUNTS="$MODELOPT_PATH:/opt/modelopt"
 
-# Model paths
-MODEL_PATH="$ROOT_PATH/models/LTX-2"
-TRANSFORMER_PATH="$MODEL_PATH/ltx-2-19b-dev.safetensors"
-GEMMA_PATH="$ROOT_PATH/models/gemma-3-12b-it-qat-q4_0-unquantized"
+# --- Model selection ---
+MODEL=""              # "ltx2" or "wan"  (required)
+MODEL_PATH=""         # Path to model checkpoint
+TEXT_ENCODER_PATH=""  # Path to text encoder (Gemma for LTX-2; not needed for Wan)
 
-# Output paths
-OUTPUT_DIR="$ROOT_PATH/results/$JOB_NAME"
+# --- Output ---
+OUTPUT_DIR=""
 
-# Training config (absolute paths)
-CONFIG="$DISTILL_PATH/configs/ltx2_distillation.yaml"
+# --- Training config & overrides ---
+CONFIG=""
 OVERRIDES=""
 
-# Flags
+# --- Flags ---
 DRY_RUN=false
 
 ######################
@@ -67,74 +77,47 @@ DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --job-name)
-            JOB_NAME="$2"
-            shift 2
-            ;;
-        --partition)
-            PARTITION="$2"
-            shift 2
-            ;;
-        --account)
-            ACCOUNT="$2"
-            shift 2
-            ;;
-        --time)
-            TIME_LIMIT="$2"
-            shift 2
-            ;;
-        --nodes)
-            NUM_NODES="$2"
-            shift 2
-            ;;
-        --gpus)
-            GPUS_PER_NODE="$2"
-            shift 2
-            ;;
-        --config)
-            CONFIG="$2"
-            shift 2
-            ;;
-        --container)
-            CONTAINER="$2"
-            shift 2
-            ;;
-        --output-dir)
-            OUTPUT_DIR="$2"
-            shift 2
-            ;;
-        --model-path)
-            MODEL_PATH="$2"
-            shift 2
-            ;;
-        --dry-run)
-            DRY_RUN=true
-            shift
-            ;;
+        --model)            MODEL="$2";              shift 2 ;;
+        --model-path)       MODEL_PATH="$2";         shift 2 ;;
+        --text-encoder-path) TEXT_ENCODER_PATH="$2"; shift 2 ;;
+        --job-name)         JOB_NAME="$2";           shift 2 ;;
+        --partition)        PARTITION="$2";           shift 2 ;;
+        --account)          ACCOUNT="$2";             shift 2 ;;
+        --time)             TIME_LIMIT="$2";         shift 2 ;;
+        --nodes)            NUM_NODES="$2";          shift 2 ;;
+        --gpus)             GPUS_PER_NODE="$2";      shift 2 ;;
+        --config)           CONFIG="$2";             shift 2 ;;
+        --container)        CONTAINER="$2";          shift 2 ;;
+        --output-dir)       OUTPUT_DIR="$2";         shift 2 ;;
+        --dry-run)          DRY_RUN=true;            shift ;;
         --help|-h)
-            echo "Usage: $0 [options] [config_overrides...]"
+            echo "Usage: $0 --model <ltx2|wan> [options] [config_overrides...]"
+            echo ""
+            echo "Required:"
+            echo "  --model MODEL           Model backend: 'ltx2' or 'wan'"
+            echo "  --model-path PATH       Path to model checkpoint"
             echo ""
             echo "Options:"
-            echo "  --job-name NAME     Job name (default: $JOB_NAME)"
-            echo "  --partition PART    SLURM partition (default: $PARTITION)"
-            echo "  --account ACCT      SLURM account (default: $ACCOUNT)"
-            echo "  --time TIME         Time limit HH:MM:SS (default: $TIME_LIMIT)"
-            echo "  --nodes N           Number of nodes (default: $NUM_NODES)"
-            echo "  --gpus N            GPUs per node (default: $GPUS_PER_NODE)"
-            echo "  --config FILE       Training config YAML (default: $CONFIG)"
-            echo "  --container FILE    Container image (default: $CONTAINER)"
-            echo "  --output-dir DIR    Output directory (default: $OUTPUT_DIR)"
-            echo "  --model-path PATH   Model checkpoint path"
-            echo "  --dry-run           Print command without submitting"
-            echo "  --help              Show this help message"
+            echo "  --text-encoder-path PATH  Text encoder path (required for LTX-2)"
+            echo "  --job-name NAME         SLURM job name"
+            echo "  --partition PART        SLURM partition"
+            echo "  --account ACCT          SLURM account"
+            echo "  --time TIME             Time limit HH:MM:SS (default: $TIME_LIMIT)"
+            echo "  --nodes N               Number of nodes (default: $NUM_NODES)"
+            echo "  --gpus N                GPUs per node (default: $GPUS_PER_NODE)"
+            echo "  --config FILE           Training config YAML (auto-detected from model)"
+            echo "  --container FILE        Container image"
+            echo "  --output-dir DIR        Output directory"
+            echo "  --dry-run               Print sbatch script without submitting"
             echo ""
-            echo "Config overrides (passed to trainer):"
-            echo "  distillation.distillation_alpha=0.5"
+            echo "Config overrides (passed as OmegaConf dotlist):"
+            echo "  optimization.steps=5000"
             echo "  optimization.learning_rate=1e-5"
+            echo "  distillation.distillation_alpha=0.5"
             exit 0
             ;;
         *)
-            # Collect as config overrides
+            # Collect remaining args as config overrides
             OVERRIDES="$OVERRIDES $1"
             shift
             ;;
@@ -145,6 +128,48 @@ done
 ### Validate       ###
 ######################
 
+if [[ -z "$MODEL" ]]; then
+    echo "Error: --model is required (ltx2 or wan)"
+    echo "Run '$0 --help' for usage."
+    exit 1
+fi
+
+if [[ -z "$MODEL_PATH" ]]; then
+    echo "Error: --model-path is required"
+    exit 1
+fi
+
+# Set model-specific defaults
+case "$MODEL" in
+    ltx2)
+        CONFIG="${CONFIG:-$DISTILL_PATH/configs/ltx2_distillation.yaml}"
+        ACCELERATE_CONFIG="$DISTILL_PATH/configs/accelerate/fsdp_ltx2.yaml"
+        JOB_NAME="${JOB_NAME:-ltx2-qad}"
+        INSTALL_CMD=""
+        # LTX-2 needs text encoder path
+        if [[ -n "$TEXT_ENCODER_PATH" ]]; then
+            MODEL_OVERRIDES="model.model_path=$MODEL_PATH model.text_encoder_path=$TEXT_ENCODER_PATH"
+        else
+            MODEL_OVERRIDES="model.model_path=$MODEL_PATH"
+        fi
+        ;;
+    wan)
+        CONFIG="${CONFIG:-$DISTILL_PATH/configs/wan_distillation.yaml}"
+        ACCELERATE_CONFIG="$DISTILL_PATH/configs/accelerate/fsdp_wan.yaml"
+        JOB_NAME="${JOB_NAME:-wan-qad}"
+        # Wan requires extra system packages and pip dependencies
+        INSTALL_CMD="echo 'Installing Wan dependencies...'
+apt-get update -qq && apt-get install -y -qq libgl1 > /dev/null 2>&1
+pip install -e '${DISTILL_PATH}[wan]' --quiet 2>&1 | tail -3
+echo 'Install done.'"
+        MODEL_OVERRIDES="model.model_path=$MODEL_PATH"
+        ;;
+    *)
+        echo "Error: Unknown model '$MODEL'. Use 'ltx2' or 'wan'."
+        exit 1
+        ;;
+esac
+
 if [[ ! -f "$CONFIG" ]]; then
     echo "Error: Config file not found: $CONFIG"
     exit 1
@@ -152,26 +177,18 @@ fi
 
 if [[ ! -f "$CONTAINER" ]] && [[ "$DRY_RUN" == "false" ]]; then
     echo "Warning: Container not found: $CONTAINER"
-    echo "  Set CONTAINER env var or use --container option"
 fi
 
 ######################
 ### Setup          ###
 ######################
 
-# Create output and log directories
+OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_PATH/results/$JOB_NAME}"
 LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOG_DIR"
 
-# Total GPUs
 TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
-
-# Container mounts
-MOUNTS="/lustre:/lustre,$MODELOPT_PATH:/opt/modelopt"
-
-# Accelerate config (absolute paths)
-ACCELERATE_CONFIG="$DISTILL_PATH/configs/accelerate/fsdp_ltx2.yaml"
 
 TRAINER_SCRIPT="$DISTILL_PATH/train_general.py"
 TRAINER_CWD="$DISTILL_PATH"
@@ -180,34 +197,21 @@ TRAINER_CWD="$DISTILL_PATH"
 ### Build Command  ###
 ######################
 
-# Full command to run inside the container
-# - Use MASTER_IP_PLACEHOLDER for the master node IP (replaced at runtime)
-# - Add any setup, exports, or preprocessing here
+# Part 1: Environment setup (evaluated at runtime inside the container)
 read -r -d '' CONTAINER_CMD <<'CMDEOF' || true
 set -eo pipefail
 
-# ============ Environment Setup ============
 export TOKENIZERS_PARALLELISM=false
-export HF_TOKEN=
-export WANDB_API_KEY=
 
-# ============ Debug Info ============
-echo "Container started on $(hostname)"
-echo "SLURM_NODEID: $SLURM_NODEID"
-echo "SLURM_PROCID: $SLURM_PROCID"
-echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "=== Node $(hostname) | SLURM_NODEID=$SLURM_NODEID ==="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
-# Machine rank for this node (SLURM_NODEID is 0, 1, 2, ... for each node)
 MACHINE_RANK=${SLURM_NODEID:-0}
-echo "MACHINE_RANK: $MACHINE_RANK"
-
-# ============ Training ============
 CMDEOF
 
-# Append the accelerate launch command (these variables expand now)
-# Note: MACHINE_RANK is evaluated at runtime inside the container
+# Part 2: Optional install step + accelerate launch (variables expanded now)
 CONTAINER_CMD="$CONTAINER_CMD
+$INSTALL_CMD
 cd $TRAINER_CWD
 
 accelerate launch \\
@@ -220,8 +224,7 @@ accelerate launch \\
     --main_process_port 29500 \\
     $TRAINER_SCRIPT \\
     --config $CONFIG \\
-    model.model_path=$TRANSFORMER_PATH \\
-    model.text_encoder_path=$GEMMA_PATH \\
+    $MODEL_OVERRIDES \\
     output_dir=$OUTPUT_DIR \\
     $OVERRIDES
 "
@@ -231,7 +234,7 @@ accelerate launch \\
 ######################
 
 echo "========================================"
-echo "LTX-2 Distillation - SLURM Launch"
+echo "QAD Training ($MODEL) - SLURM Launch"
 echo "========================================"
 echo "Job Name:        $JOB_NAME"
 echo "Partition:       $PARTITION"
@@ -240,9 +243,10 @@ echo "Time Limit:      $TIME_LIMIT"
 echo "Nodes:           $NUM_NODES"
 echo "GPUs/Node:       $GPUS_PER_NODE"
 echo "Total GPUs:      $TOTAL_GPUS"
+echo "Model:           $MODEL"
+echo "Model Path:      $MODEL_PATH"
 echo "Config:          $CONFIG"
 echo "Output Dir:      $OUTPUT_DIR"
-echo "Container:       $CONTAINER"
 echo "Overrides:       $OVERRIDES"
 echo "========================================"
 echo ""
@@ -251,7 +255,6 @@ echo ""
 ### Build Script   ###
 ######################
 
-# Build the final sbatch script (single source of truth)
 read -r -d '' SBATCH_SCRIPT <<EOF || true
 #!/bin/bash
 #SBATCH --job-name=$JOB_NAME
@@ -263,25 +266,22 @@ read -r -d '' SBATCH_SCRIPT <<EOF || true
 #SBATCH --gres=gpu:$GPUS_PER_NODE
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
-#SBATCH --comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading"}}
 
 set -eo pipefail
 
-# Get master node info
+# Get master node IP for multi-node rendezvous
 head_node=\$(scontrol show hostnames \$SLURM_JOB_NODELIST | head -n 1)
 head_node_ip=\$(srun --nodes=1 --ntasks=1 -w "\$head_node" hostname --ip-address | head -n 1)
 echo "Master node: \$head_node (\$head_node_ip)"
 echo "SLURM_JOB_NODELIST: \$SLURM_JOB_NODELIST"
-echo "SLURM_NNODES: \$SLURM_NNODES"
 
-# Container command (with master IP placeholder replaced)
+# Embed the container command and replace the master IP placeholder at runtime
 read -r -d '' CONTAINER_CMD <<'INNEREOF' || true
 $CONTAINER_CMD
 INNEREOF
 CONTAINER_CMD=\${CONTAINER_CMD//MASTER_IP_PLACEHOLDER/\$head_node_ip}
 
-# Run on all nodes (--nodes and --ntasks match SLURM allocation)
-# Use srun --output to get separate log files per node (%t = task/node id, %j = job id)
+# Launch on all allocated nodes
 srun --nodes=\$SLURM_NNODES --ntasks-per-node=1 \\
     --output="$LOG_DIR/slurm-%j-%t.out" \\
     --error="$LOG_DIR/slurm-%j-%t.err" \\
@@ -303,5 +303,5 @@ else
     echo "Submitting job..."
     echo "$SBATCH_SCRIPT" | sbatch
     echo ""
-    echo "Job submitted! Check logs/ for output."
+    echo "Job submitted! Logs: $LOG_DIR/"
 fi

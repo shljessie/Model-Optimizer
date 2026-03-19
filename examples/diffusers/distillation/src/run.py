@@ -46,11 +46,51 @@ def parse_args():
     return args, overrides
 
 
+def _load_config_with_defaults(config_path: str) -> OmegaConf:
+    """Load a YAML config, resolving a ``defaults`` base config if present.
+
+    If the YAML contains a top-level ``defaults`` key (a path relative to the
+    config file's directory), that base config is loaded first and the current
+    config is merged on top.  The ``defaults`` key is removed before merging.
+
+    Example::
+
+        # configs/wan_distillation.yaml
+        defaults: default.yaml      # resolved relative to configs/
+
+        model:
+          model_name: "wan"
+          ...
+    """
+    from pathlib import Path
+
+    raw = OmegaConf.load(config_path)
+    if "defaults" not in raw:
+        return raw
+
+    defaults_path = Path(config_path).parent / raw.defaults
+    if not defaults_path.exists():
+        raise FileNotFoundError(
+            f"defaults config not found: {defaults_path} "
+            f"(referenced from {config_path})"
+        )
+    base = OmegaConf.load(str(defaults_path))
+
+    # Remove the 'defaults' key so it doesn't leak into TrainerConfig
+    raw_dict = OmegaConf.to_container(raw)
+    raw_dict.pop("defaults")
+    override = OmegaConf.create(raw_dict)
+
+    merged = OmegaConf.merge(base, override)
+    logger.info(f"Loaded defaults from {defaults_path}")
+    return merged
+
+
 def main():
     args, cli_overrides = parse_args()
 
-    # Load YAML config
-    base_config = OmegaConf.load(args.config)
+    # Load YAML config (with optional defaults inheritance)
+    base_config = _load_config_with_defaults(args.config)
 
     # Apply CLI overrides (dot-notation, e.g. optimization.learning_rate=1e-5)
     if cli_overrides:
@@ -71,9 +111,9 @@ def main():
     model_name = trainer_config.model.model_name
     model_variant = trainer_config.model.model_variant
     logger.info(f"Using model backend: {model_name}" + (f" (variant={model_variant})" if model_variant else ""))
-    loader, create_adapter, pipeline_cls = get_model_backend(model_name, variant=model_variant)
+    loader, create_strategy, pipeline_cls = get_model_backend(model_name, variant=model_variant)
 
-    adapter = create_adapter()
+    adapter = create_strategy()
     pipeline = pipeline_cls() if pipeline_cls is not None else None
 
     # Create trainer and run
