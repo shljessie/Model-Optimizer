@@ -68,8 +68,9 @@ class LTX2TrainingForwardAdapter:
         from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
         from ltx_core.types import SpatioTemporalScaleFactors
 
-        self._patchifier = VideoLatentPatchifier(patch_size=1)
-        self._audio_patchifier = AudioPatchifier(patch_size=1)
+        self.patch_size = 1
+        self._patchifier = VideoLatentPatchifier(patch_size=self.patch_size)
+        self._audio_patchifier = AudioPatchifier(patch_size=self.patch_size)
         self._scale_factors = SpatioTemporalScaleFactors.default()
         self._fps = fps
         self._first_frame_p = first_frame_conditioning_p

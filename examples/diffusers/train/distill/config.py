@@ -182,9 +182,29 @@ class ValidationConfig(BaseModel):
 class FlowMatchingConfig(BaseModel):
     timestep_sampling_mode: str = Field(
         default="logit_normal",
-        description="'logit_normal', 'uniform', or 'shifted_logit_normal'.",
+        description=(
+            "Timestep sampling strategy: "
+            "'uniform' - U(0,1); "
+            "'logit_normal' - sigmoid(N(mu, sigma)); "
+            "'shifted_logit_normal' - post-sigmoid shift: "
+            "  t = (s*t)/(1+(s-1)*t), used by Wan (shift=8); "
+            "'resolution_dependent' - logit_normal with mu auto-computed "
+            "  from patchified seq_length (LTX-2 style)."
+        ),
     )
-    timestep_sampling_params: dict = Field(default_factory=dict)
+    mu: float = Field(
+        default=0.0, description="Mean of the normal for logit_normal / shifted modes."
+    )
+    sigma: float = Field(
+        default=1.0, description="Std of the normal for logit_normal / shifted modes."
+    )
+    shift: float = Field(
+        default=1.0,
+        description=(
+            "Shift factor for shifted_logit_normal. "
+            "Wan uses shift=8. shift=1 is equivalent to logit_normal."
+        ),
+    )
 
 
 class CheckpointConfig(BaseModel):

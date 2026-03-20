@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -50,35 +49,9 @@ from .interfaces import (
     TrainingForwardAdapter,
     free_gpu_memory,
 )
+from .utils import get_seq_length, is_global_rank0, resolve_layer_pairs, to_dtype
 
 logger = logging.getLogger(__name__)
-
-DTYPE_MAP = {
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-    "float32": torch.float32,
-}
-
-
-def _is_global_rank0() -> bool:
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-
-def _resolve_layer_pairs(
-    modules: list[str | list[str]],
-) -> list[tuple[str, str]]:
-    """Normalize layer specs into ``(teacher_path, student_path)`` pairs.
-
-    Plain strings are treated as shared paths (self-distillation shorthand).
-    Two-element lists map ``[teacher_path, student_path]`` explicitly.
-    """
-    pairs: list[tuple[str, str]] = []
-    for entry in modules:
-        if isinstance(entry, str):
-            pairs.append((entry, entry))
-        else:
-            pairs.append((entry[0], entry[1]))
-    return pairs
 
 
 class DistillationTrainer:
@@ -110,7 +83,7 @@ class DistillationTrainer:
             gradient_accumulation_steps=config.optimization.gradient_accumulation_steps,
         )
 
-        model_dtype = DTYPE_MAP[config.model.dtype]
+        model_dtype = to_dtype(config.model.dtype)
         self._weight_dtype = model_dtype
 
         # --- Load inference components and cache embeddings (before training) ---
@@ -127,7 +100,7 @@ class DistillationTrainer:
 
         logger.info("Loading teacher model ...")
         teacher_path = config.distillation.teacher_model_path or config.model.model_path
-        teacher_dtype = DTYPE_MAP[config.distillation.teacher_dtype]
+        teacher_dtype = to_dtype(config.distillation.teacher_dtype)
         self._teacher = self._loader.load_transformer(
             teacher_path, device="cpu", dtype=teacher_dtype
         )
@@ -155,7 +128,7 @@ class DistillationTrainer:
         self._init_dataloaders()
 
         # --- WandB ---
-        if config.wandb.enabled and _is_global_rank0():
+        if config.wandb.enabled and is_global_rank0():
             self._init_wandb()
 
         # --- Resume ---
@@ -339,7 +312,7 @@ class DistillationTrainer:
 
         step0_dir = self._get_checkpoints_dir() / "step_000000_quantized"
 
-        if _is_global_rank0():
+        if is_global_rank0():
             step0_dir.mkdir(parents=True, exist_ok=True)
         self._accelerator.wait_for_everyone()
 
@@ -348,7 +321,7 @@ class DistillationTrainer:
         self._accelerator.wait_for_everyone()
 
         # Save modelopt architecture metadata (rank 0 only)
-        if _is_global_rank0():
+        if is_global_rank0():
             try:
                 modelopt_state = mto.modelopt_state(self._student)
                 torch.save(modelopt_state, step0_dir / "modelopt_state.pt")
@@ -382,7 +355,7 @@ class DistillationTrainer:
                     config=gen_config,
                     device="cuda",
                 )
-                if _is_global_rank0() and (i + 1) % 10 == 0:
+                if is_global_rank0() and (i + 1) % 10 == 0:
                     logger.info(f"  Calibration: {i + 1}/{len(self._cached_calib_embeds)}")
 
     def _init_optimizer(self) -> None:
@@ -523,7 +496,7 @@ class DistillationTrainer:
         modules = cfg.layer_distillation_modules
         assert modules  # caller checks non-null/non-empty
 
-        self._layer_pairs = _resolve_layer_pairs(modules)
+        self._layer_pairs = resolve_layer_pairs(modules)
         teacher_paths = [t for t, _s in self._layer_pairs]
         student_paths = [s for _t, s in self._layer_pairs]
 
@@ -566,26 +539,46 @@ class DistillationTrainer:
             config=self._config.model_dump(),
         )
 
-    def _sample_timesteps(self, batch_size: int, device: torch.device) -> Tensor:
-        mode = self._config.flow_matching.timestep_sampling_mode
-        params = self._config.flow_matching.timestep_sampling_params
+    def _sample_timesteps(
+        self, batch_size: int, device: torch.device, seq_length: int | None = None
+    ) -> Tensor:
+        """Sample noise levels t ∈ (0, 1) for flow matching.
+
+        Strategies:
+          - uniform: t ~ U(0,1)
+          - logit_normal: t = sigmoid(N(mu, sigma))  [SD3-style]
+          - shifted_logit_normal: logit_normal + post-sigmoid shift
+              t_shifted = (shift * t) / (1 + (shift - 1) * t)
+              Wan uses shift=8; shift=1 reduces to logit_normal.
+          - resolution_dependent: logit_normal where mu is computed from
+              seq_length via linear interpolation (LTX-2 style).
+        """
+        fm = self._config.flow_matching
+        mode = fm.timestep_sampling_mode
 
         if mode == "uniform":
             return torch.rand(batch_size, device=device)
 
         if mode == "logit_normal":
-            mu = params.get("mu", 0.0)
-            sigma = params.get("sigma", 1.0)
-            normal = torch.randn(batch_size, device=device) * sigma + mu
+            normal = torch.randn(batch_size, device=device) * fm.sigma + fm.mu
             return torch.sigmoid(normal)
 
         if mode == "shifted_logit_normal":
-            mu = params.get("mu", 0.0)
-            sigma = params.get("sigma", 1.0)
-            shift = params.get("shift", 1.0)
-            normal = torch.randn(batch_size, device=device) * sigma + mu
+            normal = torch.randn(batch_size, device=device) * fm.sigma + fm.mu
             sigmas = torch.sigmoid(normal)
-            return (sigmas * shift) / (1 + (shift - 1) * sigmas)
+            s = fm.shift
+            return (sigmas * s) / (1 + (s - 1) * sigmas)
+
+        if mode == "resolution_dependent":
+            assert seq_length is not None, (
+                "resolution_dependent mode requires seq_length "
+                "(adapter must implement get_seq_length)"
+            )
+            # LTX-2 recipe: linear interpolation of mu from seq_length
+            # seq_len 1024 -> mu 0.95, seq_len 4096 -> mu 2.05
+            mu = 0.95 + (2.05 - 0.95) / (4096 - 1024) * (seq_length - 1024)
+            normal = torch.randn(batch_size, device=device) * fm.sigma + mu
+            return torch.sigmoid(normal)
 
         raise ValueError(f"Unknown timestep sampling mode: {mode}")
 
@@ -605,7 +598,8 @@ class DistillationTrainer:
 
         # Sample noise and timesteps (in weight dtype to avoid float32 promotion)
         noise = torch.randn_like(latents)
-        timesteps = self._sample_timesteps(batch_size, device).to(dtype=wdtype)
+        seq_length = get_seq_length(latents, getattr(self._adapter, "patch_size", 1))
+        timesteps = self._sample_timesteps(batch_size, device, seq_length).to(dtype=wdtype)
 
         # Adapter: prepare model-specific inputs
         inputs = self._adapter.prepare_inputs(
@@ -727,7 +721,8 @@ class DistillationTrainer:
             latents = batch["latents"]
             batch_size = latents.shape[0]
             noise = torch.randn_like(latents)
-            timesteps = self._sample_timesteps(batch_size, device).to(dtype=wdtype)
+            seq_length = get_seq_length(latents, getattr(self._adapter, "patch_size", 1))
+            timesteps = self._sample_timesteps(batch_size, device, seq_length).to(dtype=wdtype)
 
             inputs = self._adapter.prepare_inputs(
                 batch, noise, timesteps, pipeline=self._inference_pipeline
@@ -790,7 +785,7 @@ class DistillationTrainer:
             device=str(self._accelerator.device),
         )
 
-        if _is_global_rank0() and videos:
+        if is_global_rank0() and videos:
             self._save_validation_videos(videos)
 
     def _save_validation_videos(self, videos: list[Tensor]) -> None:
@@ -843,14 +838,14 @@ class DistillationTrainer:
 
         logger.info(f"Saving training state at step {self._global_step} ...")
 
-        if _is_global_rank0():
+        if is_global_rank0():
             tmp_dir.mkdir(parents=True, exist_ok=True)
         self._accelerator.wait_for_everyone()
 
         self._accelerator.save_state(str(tmp_dir))
         self._accelerator.wait_for_everyone()
 
-        if _is_global_rank0():
+        if is_global_rank0():
             # Save ModelOpt state
             if self._config.distillation.quant_cfg is not None:
                 try:
@@ -882,7 +877,7 @@ class DistillationTrainer:
         self._cleanup_checkpoints()
         self._accelerator.wait_for_everyone()
 
-        return final_dir if _is_global_rank0() else None
+        return final_dir if is_global_rank0() else None
 
     def _cleanup_checkpoints(self) -> None:
         """Remove old training checkpoints, keeping only the last N.
@@ -890,7 +885,7 @@ class DistillationTrainer:
         Excludes step_XXXXXX_tmp (incomplete) and step_000000_quantized
         (calibration-only checkpoint, not training state).
         """
-        if not _is_global_rank0():
+        if not is_global_rank0():
             return
         keep_n = self._config.checkpoints.keep_last_n
         ckpt_dir = self._get_checkpoints_dir()
@@ -964,7 +959,7 @@ class DistillationTrainer:
         self._accelerator.wait_for_everyone()
         full_state_dict = self._accelerator.get_state_dict(self._student)
 
-        if not _is_global_rank0():
+        if not is_global_rank0():
             return None
 
         from safetensors.torch import save_file
@@ -973,7 +968,7 @@ class DistillationTrainer:
         out_dir.mkdir(parents=True, exist_ok=True)
         save_path = out_dir / "model_weights_final.safetensors"
 
-        save_dtype = DTYPE_MAP.get(self._config.checkpoints.precision, torch.bfloat16)
+        save_dtype = to_dtype(self._config.checkpoints.precision)
         state_dict = {k: v.to(save_dtype) for k, v in full_state_dict.items()}
         save_file(state_dict, str(save_path))
         logger.info(f"Saved inference-ready weights to {save_path}")
@@ -981,7 +976,7 @@ class DistillationTrainer:
 
     def save_quantized_model(self, path: str | Path | None = None) -> None:
         """Save ModelOpt quantized model (global rank 0 only)."""
-        if not _is_global_rank0():
+        if not is_global_rank0():
             return
 
         import modelopt.torch.opt as mto
@@ -1007,7 +1002,7 @@ class DistillationTrainer:
         # Slurm time-limit
         must_save_by = cfg.checkpoints.must_save_by
         save_deadline = (train_start + must_save_by * 60) if must_save_by else None
-        if save_deadline and _is_global_rank0():
+        if save_deadline and is_global_rank0():
             logger.info(
                 f"Time-limit save enabled: will save and exit after {must_save_by:.0f} minutes"
             )
@@ -1021,7 +1016,7 @@ class DistillationTrainer:
         # Create data iterator
         data_iter = iter(self._dataloader)
 
-        if _is_global_rank0():
+        if is_global_rank0():
             logger.info(
                 f"Starting training: steps={total_steps}, grad_accum={grad_accum}, "
                 f"batch_size={cfg.optimization.batch_size}"
@@ -1034,7 +1029,7 @@ class DistillationTrainer:
             initial=start_micro,
             total=total_micro,
             desc="Training",
-            disable=not _is_global_rank0(),
+            disable=not is_global_rank0(),
         )
 
         for micro_step in pbar:
@@ -1117,7 +1112,7 @@ class DistillationTrainer:
         if cfg.distillation.quant_cfg is not None:
             self.save_quantized_model()
 
-        if _is_global_rank0():
+        if is_global_rank0():
             logger.info(
                 f"Training complete at step {self._global_step}. Elapsed: {elapsed / 60:.1f} min"
             )
