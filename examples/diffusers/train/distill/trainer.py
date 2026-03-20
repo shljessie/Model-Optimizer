@@ -162,10 +162,6 @@ class DistillationTrainer:
         if config.distillation.resume_from_checkpoint is not None:
             self._load_training_state()
 
-    # ------------------------------------------------------------------
-    # Initialization helpers
-    # ------------------------------------------------------------------
-
     def _init_inference_pipeline(self, dtype: torch.dtype) -> None:
         cfg = self._config
         pipeline = self._inference_pipeline
@@ -570,10 +566,6 @@ class DistillationTrainer:
             config=self._config.model_dump(),
         )
 
-    # ------------------------------------------------------------------
-    # Timestep sampling
-    # ------------------------------------------------------------------
-
     def _sample_timesteps(self, batch_size: int, device: torch.device) -> Tensor:
         mode = self._config.flow_matching.timestep_sampling_mode
         params = self._config.flow_matching.timestep_sampling_params
@@ -596,10 +588,6 @@ class DistillationTrainer:
             return (sigmas * shift) / (1 + (shift - 1) * sigmas)
 
         raise ValueError(f"Unknown timestep sampling mode: {mode}")
-
-    # ------------------------------------------------------------------
-    # Training step
-    # ------------------------------------------------------------------
 
     def _training_step(self, batch: dict[str, Tensor]) -> Tensor:
         alpha = self._config.distillation.distillation_alpha
@@ -707,10 +695,6 @@ class DistillationTrainer:
         self._teacher_extractor.clear()
 
         return torch.stack(losses).mean()
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _run_validation(self) -> None:
@@ -841,10 +825,6 @@ class DistillationTrainer:
         # [C,F,H,W] -> [F,H,W,C], float [0,1] -> uint8
         frames = video_tensor.permute(1, 2, 3, 0).clamp(0, 1).mul(255).byte().cpu()
         tvio.write_video(str(path), frames, fps=fps)
-
-    # ------------------------------------------------------------------
-    # Checkpointing
-    # ------------------------------------------------------------------
 
     def _get_checkpoints_dir(self) -> Path:
         return Path(self._config.output_dir) / "checkpoints"
@@ -979,10 +959,6 @@ class DistillationTrainer:
             self._global_step = metadata.get("global_step", 0)
             logger.info(f"Resumed at global_step={self._global_step}")
 
-    # ------------------------------------------------------------------
-    # Model saving (end of training)
-    # ------------------------------------------------------------------
-
     def _save_final_model(self) -> Path | None:
         """Save inference-ready model weights as safetensors."""
         self._accelerator.wait_for_everyone()
@@ -1020,10 +996,6 @@ class DistillationTrainer:
         logger.info(f"Saving quantized model to {path}")
         mto.save(self._student, str(path))
         logger.info("Quantized model saved")
-
-    # ------------------------------------------------------------------
-    # Main training loop
-    # ------------------------------------------------------------------
 
     def train(self) -> dict:
         cfg = self._config

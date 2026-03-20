@@ -69,11 +69,6 @@ class CachedEmbeddings:
     negative: dict[str, Tensor]
 
 
-# ---------------------------------------------------------------------------
-# Protocols
-# ---------------------------------------------------------------------------
-
-
 @runtime_checkable
 class ModelLoader(Protocol):
     def load_transformer(
