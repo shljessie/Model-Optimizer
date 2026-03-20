@@ -1451,6 +1451,7 @@ def get_quant_config(
     default_quantization = {
         "quant_algo": None,
         "kv_cache_quant_algo": None,
+        "scale_fmt": "ue8m0",
     }
 
     quant_config["quantization"] = default_quantization
