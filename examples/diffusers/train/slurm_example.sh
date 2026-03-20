@@ -202,7 +202,7 @@ mkdir -p "$LOG_DIR"
 
 TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
-TRAINER_SCRIPT="$DISTILL_PATH/train_general.py"
+TRAINER_SCRIPT="$DISTILL_PATH/train.py"
 TRAINER_CWD="$DISTILL_PATH"
 
 ######################

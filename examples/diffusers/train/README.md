@@ -49,7 +49,7 @@ Verify the pipeline works end-to-end without real data:
 accelerate launch \
     --config_file configs/accelerate/fsdp_wan.yaml \
     --num_processes 8 \
-    train_general.py \
+    train.py \
     --config configs/wan_distillation.yaml \
     model.model_path=/path/to/Wan2.2-TI2V-5B \
     distillation.use_mock_data=true \
@@ -82,7 +82,7 @@ Quantize the student with NVFP4 and distill from the full-precision teacher:
 accelerate launch \
     --config_file configs/accelerate/fsdp_wan.yaml \
     --num_processes 8 \
-    train_general.py \
+    train.py \
     --config configs/wan_distillation.yaml \
     model.model_path=/path/to/Wan2.2-TI2V-5B \
     data.preprocessed_data_root=/path/to/preprocessed \
@@ -97,7 +97,7 @@ Add intermediate layer matching on top of QAD:
 accelerate launch \
     --config_file configs/accelerate/fsdp_wan.yaml \
     --num_processes 8 \
-    train_general.py \
+    train.py \
     --config configs/wan_distillation.yaml \
     model.model_path=/path/to/Wan2.2-TI2V-5B \
     data.preprocessed_data_root=/path/to/preprocessed \
@@ -144,7 +144,7 @@ distillation:
 Any config field can be overridden via dotted OmegaConf syntax:
 
 ```bash
-train_general.py --config configs/wan_distillation.yaml \
+train.py --config configs/wan_distillation.yaml \
     optimization.learning_rate=1e-5 \
     optimization.steps=5000
 ```

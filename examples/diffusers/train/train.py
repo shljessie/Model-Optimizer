@@ -19,7 +19,7 @@
 ``distill/run.py`` uses relative imports so it cannot be invoked as a plain
 script.  This wrapper sits one level up and delegates via an absolute import:
 
-    accelerate launch train_general.py --config configs/my_config.yaml
+    accelerate launch train.py --config configs/my_config.yaml
 """
 
 from distill.run import main
