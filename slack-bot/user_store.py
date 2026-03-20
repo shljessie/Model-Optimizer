@@ -103,8 +103,27 @@ class UserStore:
         return None
 
     def get_claude_env(self, user_id: str) -> dict[str, str]:
-        """Build environment variables for this user's Claude subprocess."""
+        """Build environment variables for this user's Claude subprocess.
+
+        Loads:
+        1. System env
+        2. User's personal env file (HF_TOKEN, NGC credentials, etc.)
+        3. Claude auth credentials
+        """
         env = os.environ.copy()
+
+        # Load user's personal env vars
+        env_file = self.user_dir(user_id) / "env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    env[key.strip()] = value.strip()
+
+        # Apply Claude auth
         auth = self._read_auth(user_id)
         if auth is None:
             return env
@@ -124,6 +143,58 @@ class UserStore:
                 env["CLAUDE_CONFIG_DIR"] = config_dir
 
         return env
+
+    def set_env_var(self, user_id: str, key: str, value: str):
+        """Set a personal env var for this user."""
+        env_file = self.user_dir(user_id) / "env"
+        existing = {}
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    existing[k.strip()] = v.strip()
+        existing[key] = value
+        env_file.write_text("\n".join(f"{k}={v}" for k, v in sorted(existing.items())) + "\n")
+
+    def get_env_vars(self, user_id: str) -> dict[str, str]:
+        """List user's personal env vars (values masked)."""
+        env_file = self.user_dir(user_id) / "env"
+        result = {}
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    result[k.strip()] = v.strip()[:4] + "..." if len(v.strip()) > 4 else v.strip()
+        return result
+
+    def remove_env_var(self, user_id: str, key: str) -> bool:
+        """Remove a personal env var."""
+        env_file = self.user_dir(user_id) / "env"
+        if not env_file.exists():
+            return False
+        lines = []
+        removed = False
+        for line in env_file.read_text().splitlines():
+            if line.strip().startswith(f"{key}="):
+                removed = True
+            else:
+                lines.append(line)
+        if removed:
+            env_file.write_text("\n".join(lines) + "\n" if lines else "")
+        return removed
+
+    def get_claude_config_dir(self, user_id: str) -> str:
+        """Return the path to this user's Claude config directory."""
+        auth = self._read_auth(user_id)
+        if auth and auth.get("config_dir"):
+            return auth["config_dir"]
+        return str(self.user_dir(user_id) / "claude-config")
 
     def remove_auth(self, user_id: str) -> bool:
         """Remove user's auth credentials."""

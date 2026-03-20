@@ -38,7 +38,7 @@ from slack_bolt.async_app import AsyncApp
 
 from job_manager import WorkspaceManager
 from key_store import KeyStore
-from session_manager import run_claude
+from session_manager import run_claude_streaming
 from user_store import UserStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -69,6 +69,9 @@ workspace_mgr = WorkspaceManager(repo_dir=REPO_DIR)
 # Onboarding state machines
 onboarding_state: dict[str, str] = {}
 cluster_setup_state: dict[str, dict] = {}
+
+# Store last full response per user for /modelopt logs
+_last_response: dict[str, str] = {}
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -125,9 +128,13 @@ HELP_MSG = """*ModelOpt Bot Commands*
 • `/modelopt setup` — onboard (auth + cluster config)
 • `/modelopt add-cluster` — configure a remote cluster
 • `/modelopt clusters` — list your configured clusters
+• `/modelopt set-env KEY=VALUE` — set personal env var (DM only, e.g. `HF_TOKEN`, `NGC_API_KEY`)
+• `/modelopt env` — list your env vars
+• `/modelopt unset-env KEY` — remove an env var
 
-*Workspaces:*
+*Workspaces & Logs:*
 • `/modelopt workspaces` — list your workspaces
+• `/modelopt logs` — upload full output of last task as a file
 • `/modelopt cleanup` — remove old workspaces
 • `/modelopt status` — show your current status
 
@@ -361,6 +368,34 @@ async def handle_slash_command(ack, command, say, respond):
         else:
             await respond(text="No clusters configured. Use `/modelopt add-cluster` to set one up.")
 
+    elif subcmd == "set-env":
+        if command.get("channel_name") != "directmessage":
+            await respond(text=":warning: Use this command in a DM with me (contains secrets).")
+            return
+        if not args or "=" not in args:
+            await respond(text="Usage: `/modelopt set-env HF_TOKEN=hf_abc123...`\n\nCommon variables: `HF_TOKEN`, `NGC_API_KEY`, `DOCKER_TOKEN`")
+            return
+        key, _, value = args.partition("=")
+        user_store.set_env_var(user_id, key.strip(), value.strip())
+        await respond(text=f"`{key.strip()}` saved.")
+
+    elif subcmd == "env":
+        env_vars = user_store.get_env_vars(user_id)
+        if env_vars:
+            lines = [f"• `{k}` = `{v}`" for k, v in env_vars.items()]
+            await respond(text="*Your env vars* (values masked):\n" + "\n".join(lines) + "\n\nUse `/modelopt set-env KEY=VALUE` to add/update, `/modelopt unset-env KEY` to remove.")
+        else:
+            await respond(text="No personal env vars set.\n\nUse `/modelopt set-env HF_TOKEN=hf_abc...` to add one.")
+
+    elif subcmd == "unset-env":
+        if not args:
+            await respond(text="Usage: `/modelopt unset-env HF_TOKEN`")
+            return
+        if user_store.remove_env_var(user_id, args.strip()):
+            await respond(text=f"`{args.strip()}` removed.")
+        else:
+            await respond(text=f"`{args.strip()}` not found.")
+
     elif subcmd == "workspaces":
         if not user_store.is_registered(user_id):
             await respond(text="Not registered yet. Use `/modelopt setup` first.")
@@ -395,6 +430,18 @@ async def handle_slash_command(ack, command, say, respond):
 
     elif subcmd in ("help", ""):
         await respond(text=HELP_MSG)
+
+    elif subcmd == "logs":
+        last = _last_response.get(user_id)
+        if not last:
+            await respond(text="No recent task output. Run a task first.")
+            return
+        await app.client.files_upload_v2(
+            channel=channel,
+            content=last,
+            filename="modelopt_task_log.md",
+            title="Last Task Output",
+        )
 
     else:
         # Treat as a prompt
@@ -485,31 +532,95 @@ async def _run_job(user_id: str, prompt: str, say_func, channel: str, thread_ts:
         f"Workspace root: {ws_root} (contains per-model workspaces). "
         f"Upstream repo: {workspace_mgr.repo_dir} (read-only, use for fresh copies). "
         f"Read skills/common/workspace-management.md before creating workspaces. "
-        f"Check existing workspaces with: ls $MODELOPT_WORKSPACE_ROOT/"
+        f"Check existing workspaces with: ls $MODELOPT_WORKSPACE_ROOT/ "
+        f"SAFETY: You are running unattended — no human can approve actions. "
+        f"NEVER run destructive commands (rm -rf /, kill -9, fdisk, mkfs, etc.). "
+        f"NEVER modify files outside your workspace ({ws_root}) or the user's remote home directory. "
+        f"Do NOT modify the upstream repo ({workspace_mgr.repo_dir}). "
+        f"Do NOT modify system files, global configs, or other users' data. "
+        f"If a task seems risky or ambiguous, output a warning instead of proceeding."
     )
 
-    session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"modelopt-slack-{user_id}"))
+    # Session per Slack thread: messages in the same thread share context,
+    # new top-level messages start fresh sessions.
+    # thread_ts is the parent message ts (or the message's own ts if it IS the parent).
+    session_key = f"modelopt-slack-{user_id}-{thread_ts or 'ephemeral'}"
+    session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, session_key))
 
     if thread_ts:
-        await say_func(text=":rocket: Working on it...", thread_ts=thread_ts)
+        await say_func(
+            text=":rocket: Working on it — this may take a while. I'll let you know when it's done.",
+            thread_ts=thread_ts,
+        )
 
+    # Stream internally to keep idle detection alive. Only send final result to Slack.
+    full_response = ""
     try:
-        response = await run_claude(
+        async for chunk in run_claude_streaming(
             prompt=prompt,
             cwd=workspace,
             env=env,
             session_id=session_id,
             system_prompt_extra=bot_context,
-        )
+        ):
+            full_response += chunk.text
+            if chunk.is_final:
+                break
+
     except Exception as e:
-        response = f":x: Failed: {e}"
+        full_response += f"\n\n:x: Failed: {e}"
         logger.error("Request failed for user %s: %s", user_id, e)
 
+    # Send final response
+    if not full_response.strip():
+        full_response = "No response from Claude."
+
+    # Save for /modelopt logs
+    _last_response[user_id] = full_response
+
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
-    if channel and len(response) > MAX_SLACK_LENGTH:
-        await send_long_response(say_func, response, thread_ts, channel)
+    if channel and len(full_response) > MAX_SLACK_LENGTH:
+        await send_long_response(say_func, full_response, thread_ts, channel)
     else:
-        await say_func(text=truncate(response), **kwargs)
+        await say_func(text=truncate(full_response), **kwargs)
+
+
+# ─── Auto Cleanup ────────────────────────────────────────────────────
+
+SESSION_MAX_AGE_DAYS = int(os.environ.get("SESSION_MAX_AGE_DAYS", "30"))
+CLEANUP_INTERVAL_HOURS = int(os.environ.get("CLEANUP_INTERVAL_HOURS", "6"))
+
+
+async def _auto_cleanup_loop():
+    """Periodically clean up old sessions and workspaces."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_HOURS * 3600)
+        try:
+            import time
+
+            cutoff = time.time() - SESSION_MAX_AGE_DAYS * 86400
+            total_removed = 0
+
+            for uid in user_store.list_users():
+                # Clean old Claude sessions
+                config_dir = Path(user_store.get_claude_config_dir(uid))
+                sessions_dir = config_dir / "projects"
+                if sessions_dir.exists():
+                    for entry in sessions_dir.iterdir():
+                        if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                            import shutil
+                            shutil.rmtree(entry, ignore_errors=True)
+                            total_removed += 1
+
+                # Clean old workspaces (older than 7 days, not the default)
+                ws_root = user_store.jobs_dir(uid)
+                removed = await workspace_mgr.cleanup_old(ws_root, max_age_days=SESSION_MAX_AGE_DAYS)
+                total_removed += removed
+
+            if total_removed:
+                logger.info("Auto-cleanup: removed %d old sessions/workspaces", total_removed)
+        except Exception as e:
+            logger.error("Auto-cleanup error: %s", e)
 
 
 # ─── Main ────────────────────────────────────────────────────────────
@@ -538,6 +649,10 @@ async def main():
         logger.error("Claude CLI not found in PATH — bot will not work")
 
     logger.info("Registered users: %d", len(user_store.list_users()))
+    logger.info("Auto-cleanup: every %dh, sessions older than %dd", CLEANUP_INTERVAL_HOURS, SESSION_MAX_AGE_DAYS)
+
+    # Start background cleanup task
+    asyncio.create_task(_auto_cleanup_loop())
 
     handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
     await handler.start_async()

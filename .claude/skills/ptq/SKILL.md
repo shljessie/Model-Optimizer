@@ -144,7 +144,7 @@ For MLP-only quantization (skipping attention), use configs with `MLP_ONLY` in t
 
     ```bash
     docker run --gpus all -v <model_path>:<model_path> -v <output_path>:<output_path> \
-        nvcr.io/nvidia/tensorrt-llm/release:<version> bash -c "pip install -e <modelopt_path>[hf] --quiet && python <ptq_script.py> ..."
+        nvcr.io/nvidia/tensorrt-llm/release:<version> bash -c "pip install --no-build-isolation -e <modelopt_path>[hf] --quiet && python <ptq_script.py> ..."
     ```
 
   - **No Docker**: set up a virtual environment with conda (preferred) or venv:
@@ -155,7 +155,7 @@ For MLP-only quantization (skipping attention), use configs with `MLP_ONLY` in t
     # or venv
     python -m venv modelopt-env && source modelopt-env/bin/activate
 
-    pip install nvidia-modelopt[hf]
+    pip install --no-build-isolation nvidia-modelopt[hf]
     ```
 
 **GPU memory**: Estimate `num_params × 2 bytes` for BF16. Use `device_map="auto"` for multi-GPU. If the model exceeds single-node memory, see the FSDP2 section in `references/slurm-setup.md`.

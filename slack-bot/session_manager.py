@@ -6,7 +6,7 @@
 """Claude Code subprocess runner for jobs.
 
 Runs Claude CLI in a job's working directory with the user's auth credentials.
-Supports streaming output for real-time Slack relay.
+Uses streaming output so progress is visible in real time.
 """
 
 import asyncio
@@ -14,13 +14,14 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))  # 10 min default
+# If no output for this long, assume the process is stuck.
+# Must be generous — agent may sleep/poll for long-running SLURM jobs.
+IDLE_TIMEOUT = int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "7200"))  # 2 hours
 
 
 @dataclass
@@ -32,72 +33,18 @@ class StreamChunk:
     is_error: bool = False
 
 
-async def run_claude(
-    prompt: str,
-    cwd: Path,
-    env: dict[str, str],
-    session_id: str | None = None,
-    timeout: int = CLAUDE_TIMEOUT,
-    system_prompt_extra: str | None = None,
-) -> str:
-    """Run Claude CLI and return the full output.
-
-    Args:
-        prompt: The user's prompt
-        cwd: Working directory (job dir with skills)
-        env: Environment variables (includes user's API key)
-        session_id: Optional session ID for multi-turn within a job
-        timeout: Max seconds to wait
-        system_prompt_extra: Extra context appended to system prompt
-    """
-    cmd = _build_cmd(prompt, session_id, system_prompt_extra=system_prompt_extra)
-
-    logger.info("Running claude in %s: %.80s...", cwd, prompt)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-
-        stdout_text = stdout.decode(errors="replace")
-        stderr_text = stderr.decode(errors="replace")
-
-        if proc.returncode != 0:
-            logger.error("Claude CLI error (rc=%d): %s", proc.returncode, stderr_text[:500])
-            return stdout_text or f"Claude CLI error (exit {proc.returncode}): {stderr_text[:500]}"
-
-        return stdout_text or "No response from Claude."
-
-    except asyncio.TimeoutError:
-        logger.error("Claude CLI timed out after %ds", timeout)
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return f"Request timed out after {timeout}s. The job may still be running on the cluster — check with `/modelopt status`."
-
-    except Exception as e:
-        logger.error("Claude CLI error: %s", e)
-        return f"Error running Claude: {e}"
-
-
 async def run_claude_streaming(
     prompt: str,
     cwd: Path,
     env: dict[str, str],
     session_id: str | None = None,
-    timeout: int = CLAUDE_TIMEOUT,
+    idle_timeout: int = IDLE_TIMEOUT,
     system_prompt_extra: str | None = None,
-) -> AsyncIterator[StreamChunk]:
-    """Run Claude CLI with streaming output (stream-json format).
+):
+    """Run Claude CLI with streaming output.
 
-    Yields StreamChunk objects as Claude produces output. Useful for
-    real-time relay to Slack (update message progressively).
+    Yields StreamChunk objects as Claude produces output.
+    No total timeout — only kills if idle for idle_timeout seconds.
     """
     cmd = _build_cmd(prompt, session_id, streaming=True, system_prompt_extra=system_prompt_extra)
 
@@ -117,42 +64,55 @@ async def run_claude_streaming(
 
     buffer = ""
     try:
-        async def _read_stream():
-            nonlocal buffer
-            while True:
-                chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=timeout)
-                if not chunk:
-                    break
-                buffer += chunk.decode(errors="replace")
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    proc.stdout.read(4096), timeout=idle_timeout
+                )
+            except asyncio.TimeoutError:
+                # No output for idle_timeout — kill process
+                logger.error("Claude idle for %ds, killing", idle_timeout)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                yield StreamChunk(
+                    text=f"\n\nNo output for {idle_timeout // 60}m — process appears stuck. Killed.",
+                    is_final=True,
+                    is_error=True,
+                )
+                return
 
-                # Parse complete JSON lines
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                        text = _extract_text_from_event(event)
-                        if text:
-                            yield StreamChunk(text=text)
-                    except json.JSONDecodeError:
-                        # Not JSON — might be plain text output
-                        yield StreamChunk(text=line)
+            if not chunk:
+                break  # EOF — process finished
 
-        async for chunk in _read_stream():
-            yield chunk
+            buffer += chunk.decode(errors="replace")
 
-    except asyncio.TimeoutError:
+            # Parse complete JSON lines
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    text = _extract_text_from_event(event)
+                    if text:
+                        yield StreamChunk(text=text)
+                except json.JSONDecodeError:
+                    yield StreamChunk(text=line)
+
+    except Exception as e:
+        logger.error("Stream read error: %s", e)
+        yield StreamChunk(
+            text=f"\nStream error: {e}",
+            is_final=True,
+            is_error=True,
+        )
         try:
             proc.kill()
         except Exception:
             pass
-        yield StreamChunk(
-            text=f"\n\nTimed out after {timeout}s.",
-            is_final=True,
-            is_error=True,
-        )
         return
 
     await proc.wait()
@@ -190,7 +150,7 @@ def _build_cmd(
         cmd.extend(["--append-system-prompt", system_prompt_extra])
 
     if streaming:
-        cmd.extend(["--output-format", "stream-json"])
+        cmd.extend(["--output-format", "stream-json", "--verbose"])
 
     if session_id:
         cmd.extend(["--session-id", session_id])
@@ -208,10 +168,28 @@ def _extract_text_from_event(event: dict) -> str:
         for block in content:
             if block.get("type") == "text":
                 parts.append(block["text"])
+            elif block.get("type") == "tool_use":
+                # Show tool usage so user sees activity during long waits
+                tool = block.get("name", "")
+                if tool == "Bash":
+                    cmd = block.get("input", {}).get("command", "")
+                    if cmd:
+                        # Truncate long commands
+                        cmd_short = cmd[:120] + "..." if len(cmd) > 120 else cmd
+                        parts.append(f"\n`$ {cmd_short}`\n")
+                elif tool == "Read":
+                    path = block.get("input", {}).get("file_path", "")
+                    parts.append(f"\n_Reading {path}_\n")
+                elif tool == "Edit":
+                    path = block.get("input", {}).get("file_path", "")
+                    parts.append(f"\n_Editing {path}_\n")
+                elif tool == "Write":
+                    path = block.get("input", {}).get("file_path", "")
+                    parts.append(f"\n_Writing {path}_\n")
         return "".join(parts)
 
     # Result message (final)
     if event.get("type") == "result":
-        return ""  # Already captured via assistant messages
+        return ""
 
     return ""

@@ -103,7 +103,7 @@ Only submit the full calibration job after the smoke test exits cleanly.
 
 ## 5. Monitor Until Completion
 
-After submitting the final job, do not stop — the goal is a finished checkpoint, not a submitted job. Poll until done:
+After submitting the final job, do not stop — the goal is a finished checkpoint, not a submitted job. Poll with sleep until done:
 
 ```bash
 while squeue -j $JOBID -h 2>/dev/null | grep -q .; do
@@ -113,7 +113,9 @@ echo "Job $JOBID finished"
 sacct -j $JOBID --format=JobID,State,ExitCode,Elapsed
 ```
 
-If the session may not stay open that long, use the `CronCreate` tool to set up a periodic check, or ask the user to check back. Once the job ends, tail the last 50 lines of the log and verify the export directory before reporting success.
+**IMPORTANT**: Always use `sleep`-based polling (as above) rather than `CronCreate` or background tasks. This keeps output in the current session so the user can see progress. The sleep loop will wait as long as needed — even hours — until the job completes or fails.
+
+Once the job ends, tail the last 50 lines of the log and verify the export directory before reporting success.
 
 ---
 

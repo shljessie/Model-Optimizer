@@ -137,11 +137,12 @@ class WorkspaceManager:
             })
         return result
 
-    async def cleanup_old(self, workspace_root: Path) -> int:
-        """Remove workspaces older than WORKSPACE_MAX_AGE. Returns count removed."""
-        if WORKSPACE_MAX_AGE <= 0 or not workspace_root.exists():
+    async def cleanup_old(self, workspace_root: Path, max_age_days: int | None = None) -> int:
+        """Remove workspaces older than max_age_days. Returns count removed."""
+        max_age_secs = (max_age_days * 86400) if max_age_days else WORKSPACE_MAX_AGE
+        if max_age_secs <= 0 or not workspace_root.exists():
             return 0
-        cutoff = time.time() - WORKSPACE_MAX_AGE
+        cutoff = time.time() - max_age_secs
         removed = 0
         for entry in sorted(workspace_root.iterdir()):
             if entry.is_dir() and entry.stat().st_mtime < cutoff:
