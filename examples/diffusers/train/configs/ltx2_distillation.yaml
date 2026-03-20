@@ -13,6 +13,11 @@ defaults: default.yaml
 distillation:
   with_audio: true
 
+# LTX-2: mu is auto-computed from patchified seq_length each batch,
+# matching the official LTX-2 trainer (seq_len 1024->4096 maps to mu 0.95->2.05).
+flow_matching:
+  timestep_sampling_mode: "resolution_dependent"
+
 model:
   model_name: "ltx2"
   model_path: "/path/to/ltx2-checkpoint.safetensors"

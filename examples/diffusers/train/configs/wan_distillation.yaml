@@ -19,6 +19,11 @@ model:
 distillation:
   calibration_guidance_scale: 5.0
 
+# Wan uses shifted logit-normal with shift=8 (matches original Wan training)
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  shift: 8.0
+
 validation:
   video_dims: [832, 480, 81]
   frame_rate: 24.0

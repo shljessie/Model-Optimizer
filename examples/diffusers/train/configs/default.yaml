@@ -62,9 +62,9 @@ validation:
 
 flow_matching:
   timestep_sampling_mode: "logit_normal"
-  timestep_sampling_params:
-    mu: 0.0
-    sigma: 1.0
+  mu: 0.0
+  sigma: 1.0
+  shift: 1.0  # Only used by shifted_logit_normal mode
 
 checkpoints:
   interval: 1000
