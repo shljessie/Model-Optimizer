@@ -71,6 +71,8 @@ class LTX2InferencePipeline:
         self._text_encoder = None
         self._vae_decoder = None
         self._vae_encoder = None
+        self._patchifier = VideoLatentPatchifier(patch_size=1) if LTX_CORE_AVAILABLE else None
+        self._scale_factors = SpatioTemporalScaleFactors.default() if LTX_CORE_AVAILABLE else None
 
     def load_components(self, model_config, device: str, dtype: torch.dtype) -> None:
         if not LTX_TRAINER_AVAILABLE:
@@ -235,9 +237,6 @@ class LTX2InferencePipeline:
         seed = config.get("seed", 42)
         fps = config.get("frame_rate", 25.0)
 
-        patchifier = VideoLatentPatchifier(patch_size=1)
-        scale_factors = SpatioTemporalScaleFactors.default()
-
         pixel_shape = VideoPixelShape(
             batch=1,
             frames=num_frames,
@@ -246,10 +245,10 @@ class LTX2InferencePipeline:
             fps=fps,
         )
         video_tools = VideoLatentTools(
-            patchifier=patchifier,
+            patchifier=self._patchifier,
             target_shape=VideoLatentShape.from_pixel_shape(shape=pixel_shape),
             fps=fps,
-            scale_factors=scale_factors,
+            scale_factors=self._scale_factors,
             causal_fix=True,
         )
 
