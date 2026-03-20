@@ -2,6 +2,21 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Encrypted per-user API key storage.
 
@@ -28,6 +43,7 @@ class KeyStore:
     """Manages encrypted per-user Anthropic API keys."""
 
     def __init__(self, data_dir: str | Path):
+        """Initialize the key store with the given data directory."""
         self._data_dir = Path(data_dir)
         self._keys_dir = self._data_dir / "keys"
         self._keys_dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +83,7 @@ class KeyStore:
         return False
 
     def has_key(self, user_id: str) -> bool:
+        """Return True if an encrypted key exists for this user."""
         return self._key_path(user_id).exists()
 
     # ── Internal ─────────────────────────────────────────────────────
@@ -142,5 +159,7 @@ class KeyStore:
     def _decrypt_fallback(self, data: dict, aad: str) -> str:
         key_material = hashlib.sha256(self._master_key + aad.encode()).digest()
         encrypted = base64.b64decode(data["ct"])
-        decrypted = bytes(a ^ b for a, b in zip(encrypted, key_material * (len(encrypted) // 32 + 1)))
+        decrypted = bytes(
+            a ^ b for a, b in zip(encrypted, key_material * (len(encrypted) // 32 + 1))
+        )
         return decrypted.decode()

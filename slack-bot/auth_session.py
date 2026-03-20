@@ -2,6 +2,21 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Interactive Claude session for authentication.
 
@@ -13,6 +28,7 @@ The credentials are stored in a per-user CLAUDE_CONFIG_DIR.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -26,6 +42,7 @@ class AuthSession:
     """Manages a temporary interactive Claude session for login."""
 
     def __init__(self, user_id: str, data_dir: str):
+        """Initialize the auth session for the given user."""
         self.user_id = user_id
         self.config_dir = tempfile.mkdtemp(prefix=f"claude-auth-{user_id}-")
         self._data_dir = data_dir
@@ -58,20 +75,17 @@ class AuthSession:
         def _navigate_to_login():
             import time
 
+            assert self._child is not None
             # Wait for theme picker
             time.sleep(4)
-            try:
+            with contextlib.suppress(Exception):
                 self._child.read_nonblocking(16384, timeout=3)
-            except Exception:
-                pass
 
             # Select default theme (press Enter)
             self._child.send("\r")
             time.sleep(3)
-            try:
+            with contextlib.suppress(Exception):
                 self._child.read_nonblocking(16384, timeout=3)
-            except Exception:
-                pass
 
             # At login menu — select option 2 (Console account)
             # Press down arrow once, then Enter
@@ -116,9 +130,12 @@ class AuthSession:
         port = None
         if url and self._child:
             try:
-                import subprocess as _sp
+                import subprocess as _sp  # nosec B404
+
                 pid = self._child.pid
-                ss = _sp.run(["ss", "-tlnp"], capture_output=True, text=True).stdout
+                ss = _sp.run(  # nosec B603 B607
+                    ["ss", "-tlnp"], capture_output=True, text=True
+                ).stdout
                 for line in ss.split("\n"):
                     if str(pid) in line:
                         m = re.search(r":(\d+)\s", line)
@@ -150,6 +167,7 @@ class AuthSession:
 
         def _poll():
             import time
+
             start = time.time()
             while time.time() - start < timeout:
                 if config_file.exists():
@@ -160,7 +178,7 @@ class AuthSession:
                     except Exception:
                         pass
                 # Also check if process exited
-                if not self._child.isalive():
+                if self._child and not self._child.isalive():
                     # Check one more time
                     if config_file.exists():
                         try:
@@ -275,15 +293,14 @@ class AuthSession:
         return await asyncio.to_thread(_submit)
 
     def get_config_dir(self) -> str:
+        """Return the temporary config directory path."""
         return self.config_dir
 
     def close(self):
         """Kill the interactive session."""
         if self._child:
-            try:
+            with contextlib.suppress(Exception):
                 self._child.close(force=True)
-            except Exception:
-                pass
             self._child = None
 
     def __del__(self):

@@ -2,6 +2,21 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """User workspace management.
 
@@ -59,7 +74,8 @@ class WorkspaceManager:
     """Manages per-user workspace roots and repo copies."""
 
     def __init__(self, repo_dir: str | Path):
-        """
+        """Initialize the workspace manager.
+
         Args:
             repo_dir: Path to the shared Model-Optimizer repo (upstream, read-only).
         """
@@ -69,6 +85,7 @@ class WorkspaceManager:
 
     @property
     def repo_dir(self) -> Path:
+        """Return the upstream repo directory."""
         return self._repo_dir
 
     async def create_workspace(
@@ -127,14 +144,16 @@ class WorkspaceManager:
         for entry in sorted(workspace_root.iterdir()):
             if not entry.is_dir():
                 continue
-            result.append({
-                "name": entry.name,
-                "path": str(entry),
-                "modified": time.strftime(
-                    "%Y-%m-%d %H:%M", time.localtime(entry.stat().st_mtime)
-                ),
-                "size_mb": self._dir_size_mb(entry),
-            })
+            result.append(
+                {
+                    "name": entry.name,
+                    "path": str(entry),
+                    "modified": time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(entry.stat().st_mtime)
+                    ),
+                    "size_mb": self._dir_size_mb(entry),
+                }
+            )
         return result
 
     async def cleanup_old(self, workspace_root: Path, max_age_days: int | None = None) -> int:
@@ -164,7 +183,9 @@ class WorkspaceManager:
             exclude_args.extend(["--exclude", excl])
 
         cmd = [
-            "rsync", "-a", "--quiet",
+            "rsync",
+            "-a",
+            "--quiet",
             *exclude_args,
             f"{self._repo_dir}/",
             f"{dest}/",

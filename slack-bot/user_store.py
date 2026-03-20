@@ -2,6 +2,21 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Per-user data management: auth, cluster config, onboarding state.
 
@@ -24,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 
 class AuthMethod(str, Enum):
+    """Authentication method choices for a user."""
+
     SHARED_KEY = "shared_key"  # Use the server's default ANTHROPIC_API_KEY
     OWN_KEY = "own_key"  # User provided their own sk-ant-... key
     LOGIN = "login"  # User authenticated via `claude auth login` (headless browser flow)
@@ -33,6 +50,7 @@ class UserStore:
     """Manages per-user data: auth credentials, cluster configs, onboarding state."""
 
     def __init__(self, data_dir: str | Path, key_store: KeyStore):
+        """Initialize the user store with the given data directory and key store."""
         self._data_dir = Path(data_dir)
         self._users_dir = self._data_dir / "users"
         self._users_dir.mkdir(parents=True, exist_ok=True)
@@ -41,14 +59,17 @@ class UserStore:
     # ── User Directory ───────────────────────────────────────────────
 
     def user_dir(self, user_id: str) -> Path:
+        """Return the base directory for a user's data."""
         return self._users_dir / user_id
 
     def jobs_dir(self, user_id: str) -> Path:
+        """Return (and create) the jobs/workspace root directory for a user."""
         d = self.user_dir(user_id) / "jobs"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     def is_registered(self, user_id: str) -> bool:
+        """Return True if the user has completed onboarding."""
         return (self.user_dir(user_id) / "auth.json").exists()
 
     # ── Auth ─────────────────────────────────────────────────────────
@@ -75,6 +96,7 @@ class UserStore:
         self._ensure_user_dir(user_id)
         # Copy the credentials into the user's persistent dir
         import shutil
+
         user_auth_dir = self.user_dir(user_id) / "claude-config"
         if user_auth_dir.exists():
             shutil.rmtree(user_auth_dir)
@@ -83,6 +105,7 @@ class UserStore:
         logger.info("User %s registered with claude login auth", user_id)
 
     def get_auth_method(self, user_id: str) -> AuthMethod | None:
+        """Return the auth method for this user, or None if not registered."""
         auth = self._read_auth(user_id)
         if auth is None:
             return None
@@ -208,9 +231,11 @@ class UserStore:
     # ── Cluster Config ───────────────────────────────────────────────
 
     def get_clusters_yaml_path(self, user_id: str) -> Path:
+        """Return the path to the user's cluster config file."""
         return self.user_dir(user_id) / "clusters.yaml"
 
     def has_clusters(self, user_id: str) -> bool:
+        """Return True if the user has a cluster config file."""
         return self.get_clusters_yaml_path(user_id).exists()
 
     def save_clusters_yaml(self, user_id: str, content: str) -> None:
@@ -221,6 +246,7 @@ class UserStore:
         logger.info("Saved cluster config for user %s", user_id)
 
     def read_clusters_yaml(self, user_id: str) -> str | None:
+        """Read and return the user's cluster config, or None if not set."""
         path = self.get_clusters_yaml_path(user_id)
         if path.exists():
             return path.read_text(encoding="utf-8")
@@ -247,9 +273,7 @@ class UserStore:
         if not self._users_dir.exists():
             return []
         return [
-            d.name
-            for d in self._users_dir.iterdir()
-            if d.is_dir() and (d / "auth.json").exists()
+            d.name for d in self._users_dir.iterdir() if d.is_dir() and (d / "auth.json").exists()
         ]
 
     # ── Internal ─────────────────────────────────────────────────────

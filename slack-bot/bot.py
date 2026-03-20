@@ -2,6 +2,21 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """ModelOpt Slack Bot — centralized bot with per-user sessions.
 
@@ -33,12 +48,11 @@ import re
 import uuid
 from pathlib import Path
 
-from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-from slack_bolt.async_app import AsyncApp
-
 from job_manager import WorkspaceManager
 from key_store import KeyStore
 from session_manager import run_claude_streaming
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+from slack_bolt.async_app import AsyncApp
 from user_store import UserStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -73,14 +87,19 @@ cluster_setup_state: dict[str, dict] = {}
 # Store last full response per user for /modelopt logs
 _last_response: dict[str, str] = {}
 
+# Keep strong references to background tasks to prevent GC
+_background_tasks: set = set()
+
 # ─── Helpers ─────────────────────────────────────────────────────────
 
 
 def strip_bot_mention(text: str) -> str:
+    """Remove @bot mention prefix from a message."""
     return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
 
 def truncate(text: str, limit: int = MAX_SLACK_LENGTH) -> str:
+    """Truncate text to the given limit, appending a notice if cut."""
     if len(text) <= limit:
         return text
     return text[:limit] + "\n\n... (truncated, full output in job dir)"
@@ -105,6 +124,7 @@ async def send_long_response(say, text: str, thread_ts: str, channel: str):
 
 
 def is_dm(event: dict) -> bool:
+    """Return True if the event is a direct message."""
     return event.get("channel_type") == "im"
 
 
@@ -198,7 +218,10 @@ async def handle_onboarding_response(event, say):
             user_store.setup_shared_key(user_id)
             del onboarding_state[user_id]
             await say(
-                text="Using shared team key. No setup needed!\n\nWould you like to configure a remote cluster? Reply `yes` or `no`.",
+                text=(
+                    "Using shared team key. No setup needed!\n\n"
+                    "Would you like to configure a remote cluster? Reply `yes` or `no`."
+                ),
                 thread_ts=thread_ts,
             )
             onboarding_state[user_id] = "awaiting_cluster_choice"
@@ -214,7 +237,9 @@ async def handle_onboarding_response(event, say):
         session = _auth_sessions.pop(user_id, None)
         if not session:
             onboarding_state.pop(user_id, None)
-            await say(text="Login session expired. Try `/modelopt setup` again.", thread_ts=thread_ts)
+            await say(
+                text="Login session expired. Try `/modelopt setup` again.", thread_ts=thread_ts
+            )
             return True
 
         try:
@@ -226,7 +251,10 @@ async def handle_onboarding_response(event, say):
                 onboarding_state.pop(user_id, None)
                 session.close()
                 await say(
-                    text="Logged in successfully!\n\nWould you like to configure a remote cluster? Reply `yes` or `no`.",
+                    text=(
+                        "Logged in successfully!\n\n"
+                        "Would you like to configure a remote cluster? Reply `yes` or `no`."
+                    ),
                     thread_ts=thread_ts,
                 )
                 onboarding_state[user_id] = "awaiting_cluster_choice"
@@ -250,7 +278,10 @@ async def handle_onboarding_response(event, say):
             await start_cluster_setup(user_id, say, thread_ts)
         else:
             await say(
-                text="All set! You can configure a cluster later with `/modelopt add-cluster`.\n\nTry: `@modelopt quantize Qwen3-0.6B with nvfp4`",
+                text=(
+                    "All set! You can configure a cluster later with `/modelopt add-cluster`."
+                    "\n\nTry: `@modelopt quantize Qwen3-0.6B with nvfp4`"
+                ),
                 thread_ts=thread_ts,
             )
         return True
@@ -269,7 +300,10 @@ async def start_cluster_setup(user_id, say, thread_ts):
     """Begin interactive cluster configuration."""
     cluster_setup_state[user_id] = {"step": "name"}
     await say(
-        text="Let's set up a remote cluster.\n\n*Step 1/5:* What would you like to call this cluster? (e.g., `cw-dfw`, `selene`, `my-workstation`)",
+        text=(
+            "Let's set up a remote cluster.\n\n*Step 1/5:* What would you like to call this"
+            " cluster? (e.g., `cw-dfw`, `selene`, `my-workstation`)"
+        ),
         thread_ts=thread_ts,
     )
 
@@ -283,7 +317,10 @@ async def handle_cluster_setup_response(user_id, text, say, thread_ts):
         state["name"] = text.strip().replace(" ", "-")
         state["step"] = "login_node"
         await say(
-            text=f"Cluster alias: *{state['name']}*\n\n*Step 2/5:* Login node hostname? (e.g., `cluster-login.example.com`)",
+            text=(
+                f"Cluster alias: *{state['name']}*\n\n*Step 2/5:* Login node hostname?"
+                " (e.g., `cluster-login.example.com`)"
+            ),
             thread_ts=thread_ts,
         )
     elif step == "login_node":
@@ -304,7 +341,11 @@ async def handle_cluster_setup_response(user_id, text, say, thread_ts):
         state["workspace"] = text.strip()
         state["step"] = "gpu_type"
         await say(
-            text="*Step 5/5:* GPU type on this cluster? (e.g., `H100`, `B200`, `A100` — used for format recommendations. Type `skip` if unknown.)",
+            text=(
+                "*Step 5/5:* GPU type on this cluster?"
+                " (e.g., `H100`, `B200`, `A100` — used for format recommendations."
+                " Type `skip` if unknown.)"
+            ),
             thread_ts=thread_ts,
         )
     elif step == "gpu_type":
@@ -332,7 +373,10 @@ async def handle_cluster_setup_response(user_id, text, say, thread_ts):
 
         user_store.save_clusters_yaml(user_id, yaml_content)
         await say(
-            text=f"Cluster *{name}* configured!\n\n```{yaml_content}```\nYou're all set. Try: `@modelopt quantize Qwen3-0.6B with nvfp4`",
+            text=(
+                f"Cluster *{name}* configured!\n\n```{yaml_content}```\n"
+                "You're all set. Try: `@modelopt quantize Qwen3-0.6B with nvfp4`"
+            ),
             thread_ts=thread_ts,
         )
 
@@ -373,7 +417,12 @@ async def handle_slash_command(ack, command, say, respond):
             await respond(text=":warning: Use this command in a DM with me (contains secrets).")
             return
         if not args or "=" not in args:
-            await respond(text="Usage: `/modelopt set-env HF_TOKEN=hf_abc123...`\n\nCommon variables: `HF_TOKEN`, `NGC_API_KEY`, `DOCKER_TOKEN`")
+            await respond(
+                text=(
+                    "Usage: `/modelopt set-env HF_TOKEN=hf_abc123...`\n\n"
+                    "Common variables: `HF_TOKEN`, `NGC_API_KEY`, `DOCKER_TOKEN`"
+                )
+            )
             return
         key, _, value = args.partition("=")
         user_store.set_env_var(user_id, key.strip(), value.strip())
@@ -383,9 +432,15 @@ async def handle_slash_command(ack, command, say, respond):
         env_vars = user_store.get_env_vars(user_id)
         if env_vars:
             lines = [f"• `{k}` = `{v}`" for k, v in env_vars.items()]
-            await respond(text="*Your env vars* (values masked):\n" + "\n".join(lines) + "\n\nUse `/modelopt set-env KEY=VALUE` to add/update, `/modelopt unset-env KEY` to remove.")
+            await respond(
+                text="*Your env vars* (values masked):\n"
+                + "\n".join(lines)
+                + "\n\nUse `/modelopt set-env KEY=VALUE` to add/update, `/modelopt unset-env KEY` to remove."
+            )
         else:
-            await respond(text="No personal env vars set.\n\nUse `/modelopt set-env HF_TOKEN=hf_abc...` to add one.")
+            await respond(
+                text="No personal env vars set.\n\nUse `/modelopt set-env HF_TOKEN=hf_abc...` to add one."
+            )
 
     elif subcmd == "unset-env":
         if not args:
@@ -403,7 +458,9 @@ async def handle_slash_command(ack, command, say, respond):
         ws_root = user_store.jobs_dir(user_id)
         workspaces = workspace_mgr.list_workspaces(ws_root)
         if not workspaces:
-            await respond(text="No workspaces yet. They'll be created when you run your first task.")
+            await respond(
+                text="No workspaces yet. They'll be created when you run your first task."
+            )
             return
         lines = ["*Your workspaces:*"]
         for w in workspaces[:15]:
@@ -423,7 +480,12 @@ async def handle_slash_command(ack, command, say, respond):
         if info:
             ws_root = user_store.jobs_dir(user_id)
             workspaces = workspace_mgr.list_workspaces(ws_root)
-            msg = f"*Auth:* {info['auth_method']}\n*Clusters:* {'configured' if info['has_clusters'] else 'none'}\n*Workspaces:* {len(workspaces)}"
+            clusters_str = "configured" if info["has_clusters"] else "none"
+            msg = (
+                f"*Auth:* {info['auth_method']}\n"
+                f"*Clusters:* {clusters_str}\n"
+                f"*Workspaces:* {len(workspaces)}"
+            )
             await respond(text=msg)
         else:
             await respond(text="Not registered yet. Use `/modelopt setup` first.")
@@ -461,7 +523,10 @@ async def handle_mention(event, say):
     thread_ts = event.get("thread_ts", event["ts"])
 
     if not text:
-        await say(text="How can I help? Try: `@modelopt quantize Qwen3-0.6B with nvfp4`", thread_ts=thread_ts)
+        await say(
+            text="How can I help? Try: `@modelopt quantize Qwen3-0.6B with nvfp4`",
+            thread_ts=thread_ts,
+        )
         return
 
     if not user_store.is_registered(user_id):
@@ -579,7 +644,7 @@ async def _run_job(user_id: str, prompt: str, say_func, channel: str, thread_ts:
     _last_response[user_id] = full_response
 
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
-    if channel and len(full_response) > MAX_SLACK_LENGTH:
+    if channel and thread_ts and len(full_response) > MAX_SLACK_LENGTH:
         await send_long_response(say_func, full_response, thread_ts, channel)
     else:
         await say_func(text=truncate(full_response), **kwargs)
@@ -609,12 +674,15 @@ async def _auto_cleanup_loop():
                     for entry in sessions_dir.iterdir():
                         if entry.is_dir() and entry.stat().st_mtime < cutoff:
                             import shutil
+
                             shutil.rmtree(entry, ignore_errors=True)
                             total_removed += 1
 
                 # Clean old workspaces (older than 7 days, not the default)
                 ws_root = user_store.jobs_dir(uid)
-                removed = await workspace_mgr.cleanup_old(ws_root, max_age_days=SESSION_MAX_AGE_DAYS)
+                removed = await workspace_mgr.cleanup_old(
+                    ws_root, max_age_days=SESSION_MAX_AGE_DAYS
+                )
                 total_removed += removed
 
             if total_removed:
@@ -627,6 +695,7 @@ async def _auto_cleanup_loop():
 
 
 async def main():
+    """Start the ModelOpt Slack bot."""
     logger.info("Starting ModelOpt Slack Bot...")
     logger.info("Repo dir: %s", REPO_DIR)
     logger.info("Data dir: %s", DATA_DIR)
@@ -649,10 +718,16 @@ async def main():
         logger.error("Claude CLI not found in PATH — bot will not work")
 
     logger.info("Registered users: %d", len(user_store.list_users()))
-    logger.info("Auto-cleanup: every %dh, sessions older than %dd", CLEANUP_INTERVAL_HOURS, SESSION_MAX_AGE_DAYS)
+    logger.info(
+        "Auto-cleanup: every %dh, sessions older than %dd",
+        CLEANUP_INTERVAL_HOURS,
+        SESSION_MAX_AGE_DAYS,
+    )
 
-    # Start background cleanup task
-    asyncio.create_task(_auto_cleanup_loop())
+    # Start background cleanup task (keep reference to prevent GC)
+    _cleanup_task = asyncio.create_task(_auto_cleanup_loop())
+    _background_tasks.add(_cleanup_task)
+    _cleanup_task.add_done_callback(_background_tasks.discard)
 
     handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
     await handler.start_async()

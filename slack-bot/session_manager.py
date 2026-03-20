@@ -2,6 +2,21 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Claude Code subprocess runner for jobs.
 
@@ -10,11 +25,12 @@ Uses streaming output so progress is visible in real time.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -66,16 +82,13 @@ async def run_claude_streaming(
     try:
         while True:
             try:
-                chunk = await asyncio.wait_for(
-                    proc.stdout.read(4096), timeout=idle_timeout
-                )
+                assert proc.stdout is not None  # guaranteed by PIPE
+                chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=idle_timeout)
             except asyncio.TimeoutError:
                 # No output for idle_timeout — kill process
                 logger.error("Claude idle for %ds, killing", idle_timeout)
-                try:
+                with contextlib.suppress(Exception):
                     proc.kill()
-                except Exception:
-                    pass
                 yield StreamChunk(
                     text=f"\n\nNo output for {idle_timeout // 60}m — process appears stuck. Killed.",
                     is_final=True,
@@ -109,15 +122,14 @@ async def run_claude_streaming(
             is_final=True,
             is_error=True,
         )
-        try:
+        with contextlib.suppress(Exception):
             proc.kill()
-        except Exception:
-            pass
         return
 
     await proc.wait()
 
     if proc.returncode != 0:
+        assert proc.stderr is not None  # guaranteed by PIPE
         stderr = await proc.stderr.read()
         stderr_text = stderr.decode(errors="replace")[:500]
         yield StreamChunk(
