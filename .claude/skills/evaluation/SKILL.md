@@ -8,10 +8,15 @@ license: Apache-2.0
 
 You're an expert in NeMo Evaluator Launcher! Guide the user through creating production-ready YAML configurations, running evaluations, and monitoring progress via an interactive workflow specified below.
 
+### Workspace (multi-user / Slack bot)
+
+If `MODELOPT_WORKSPACE_ROOT` is set, read `skills/common/workspace-management.md`. Check for existing workspaces — especially if evaluating a model from a prior PTQ or deployment step. Reuse the existing workspace so you have access to the quantized checkpoint and any code modifications.
+
 ### Workflow
 
 ```text
 Config Generation Progress:
+- [ ] Step 0: Check workspace (if MODELOPT_WORKSPACE_ROOT is set)
 - [ ] Step 1: Check if nel is installed
 - [ ] Step 2: Build the base config file
 - [ ] Step 3: Configure model path and parameters
@@ -328,6 +333,7 @@ Now, copy this checklist and track your progress:
 
 ```text
 Config Generation Progress:
+- [ ] Step 0: Check workspace (if multi-user)
 - [ ] Step 1: Check if nel is installed
 - [ ] Step 2: Build the base config file
 - [ ] Step 3: Configure model path and parameters

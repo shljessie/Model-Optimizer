@@ -13,6 +13,10 @@ Produce a quantized checkpoint from a pretrained HuggingFace model using NVIDIA 
 
 Do this first — the environment determines how to run the job and which formats are viable.
 
+**Multi-user / Slack bot mode?**
+
+If `MODELOPT_WORKSPACE_ROOT` is set, you are running in a multi-user environment. Read `skills/common/workspace-management.md` and check for an existing workspace for this model before proceeding. If you create or switch to a model-specific workspace, all subsequent steps run there.
+
 **Is this a remote execution?**
 
 Check if a remote cluster config exists or the user mentioned running on a remote machine:
@@ -245,6 +249,7 @@ These are non-obvious requirements that cause hard-to-debug failures:
 - **`references/unsupported-models.md`** — Patterns for extending ModelOpt to new architectures: MoE expert quantization, VLM language model extraction, FP8 dequantization, calibration routing
 - **`references/slurm-setup.md`** — SLURM job script template, container/enroot setup, partition selection, smoke-test strategy, monitoring, multi-node FSDP2
 - **`references/remote-execution.md`** — **Read this when running PTQ on a remote machine/cluster via SSH.** Covers cluster config, persistent SSH sessions, SLURM container jobs, the two-script pattern, and troubleshooting.
+- **`skills/common/workspace-management.md`** — **Read this when `MODELOPT_WORKSPACE_ROOT` is set (Slack bot / multi-user).** Covers when to create vs reuse workspaces, naming conventions, and cross-task workspace sharing (PTQ → deploy → eval).
 
 ### ModelOpt Examples
 

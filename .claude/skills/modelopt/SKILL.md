@@ -13,6 +13,10 @@ Orchestrates optimization pipelines by chaining skills. Supports three modes:
 
 This skill delegates to sub-skills. **Do not duplicate their logic — invoke them.**
 
+## Workspace Management
+
+If `MODELOPT_WORKSPACE_ROOT` is set (multi-user / Slack bot), read `skills/common/workspace-management.md` first. **All sub-skills in the pipeline must run in the same workspace** so they share the checkpoint and any code modifications. Create or reuse a workspace named after the model (e.g., `qwen3-0.6b`, `llama-3.1-8b-fp8`) before invoking any sub-skill.
+
 ## Pipeline Selection
 
 Determine which pipeline the user needs:

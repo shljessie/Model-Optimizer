@@ -2,217 +2,542 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+"""ModelOpt Slack Bot — centralized bot with per-user sessions.
 
-"""ModelOpt Slack Bot — connects Claude Code CLI with custom skills to Slack.
+Architecture:
+    - Single shared Model-Optimizer repo (upstream source)
+    - Per-user workspaces (agent decides when to create/reuse)
+    - User's cluster config injected into workspaces
+    - Claude CLI runs with user's auth credentials
 
-Uses Slack Socket Mode (no public URL needed) to receive messages and
-Claude Code CLI (subprocess) to process them with ModelOpt skills (ptq,
-deployment, evaluation, modelopt orchestrator).
+Auth options (per user):
+    1. Shared team key (no setup needed)
+    2. Anthropic Console account (interactive login via PTY)
+
+Usage:
+    @modelopt <prompt>           — run a prompt
+    /modelopt setup              — onboard (auth + optional cluster config)
+    /modelopt add-cluster        — interactive cluster setup
+    /modelopt clusters           — list configured clusters
+    /modelopt workspaces         — list your workspaces
+    /modelopt cleanup            — remove old workspaces
+    /modelopt status             — show session info
+    /modelopt help               — show commands
 """
 
 import asyncio
 import logging
 import os
 import re
-import shutil
-import subprocess  # nosec B404
+import uuid
 from pathlib import Path
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+
+from job_manager import WorkspaceManager
+from key_store import KeyStore
+from session_manager import run_claude
+from user_store import UserStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ───────────────────────────────────────────────────
 
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]  # xoxb-...
-SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]  # xapp-...
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 
-# Path to the modelopt_agent repo root (where .claude/skills/ lives)
-SKILLS_CWD = os.environ.get(
-    "SKILLS_CWD",
-    str(Path(__file__).resolve().parent.parent),  # default: parent of slack-bot/
+REPO_DIR = os.environ.get(
+    "REPO_DIR",
+    str(Path(__file__).resolve().parent.parent),
 )
 
-# Maximum response length for Slack (Slack truncates at 40k chars)
-MAX_SLACK_LENGTH = 39000
+DATA_DIR = os.environ.get("DATA_DIR", "/data/modelopt")
 
-# Timeout for Claude CLI calls (seconds)
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))  # 10 min default
+MAX_SLACK_LENGTH = 3900
 
-# ─── Slack App ───────────────────────────────────────────────────────
+# ─── Initialize Components ───────────────────────────────────────────
 
 app = AsyncApp(token=SLACK_BOT_TOKEN)
 
+key_store = KeyStore(data_dir=DATA_DIR)
+user_store = UserStore(data_dir=DATA_DIR, key_store=key_store)
+workspace_mgr = WorkspaceManager(repo_dir=REPO_DIR)
+
+# Onboarding state machines
+onboarding_state: dict[str, str] = {}
+cluster_setup_state: dict[str, dict] = {}
+
+# ─── Helpers ─────────────────────────────────────────────────────────
+
 
 def strip_bot_mention(text: str) -> str:
-    """Remove the @bot mention from the message text."""
     return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
 
-def truncate_response(text: str) -> str:
-    """Truncate response to fit Slack's message limit."""
-    if len(text) <= MAX_SLACK_LENGTH:
+def truncate(text: str, limit: int = MAX_SLACK_LENGTH) -> str:
+    if len(text) <= limit:
         return text
-    return text[:MAX_SLACK_LENGTH] + "\n\n... (truncated)"
+    return text[:limit] + "\n\n... (truncated, full output in job dir)"
 
 
-async def run_claude(prompt: str, thread_context: str = "") -> str:
-    """Run a prompt through Claude Code CLI as a subprocess."""
-    full_prompt = prompt
-    if thread_context:
-        full_prompt = f"Previous context:\n{thread_context}\n\nUser: {prompt}"
-
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        return "Error: `claude` CLI not found in PATH. Install Claude Code first."
-
-    cmd = [
-        claude_bin,
-        "--print",  # output text only (no interactive UI)
-        "--dangerously-skip-permissions",  # non-interactive mode
-        "--verbose",  # log tool calls for debugging
-        "-p",
-        full_prompt,
-    ]
-
-    logger.info("Running: claude --print -p '%s...'", full_prompt[:80])
-
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            cmd,
-            cwd=SKILLS_CWD,
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_TIMEOUT,
+async def send_long_response(say, text: str, thread_ts: str, channel: str):
+    """Send response, uploading as file if too long."""
+    if len(text) <= MAX_SLACK_LENGTH:
+        await say(text=text, thread_ts=thread_ts)
+    else:
+        await say(
+            text=truncate(text) + "\n\n_Full output uploaded as file._",
+            thread_ts=thread_ts,
+        )
+        await app.client.files_upload_v2(
+            channel=channel,
+            content=text,
+            filename="claude_response.md",
+            title="Full Claude Response",
+            thread_ts=thread_ts,
         )
 
-        if result.returncode != 0:
-            logger.error("Claude CLI stderr: %s", result.stderr[:500])
-            if result.stdout:
-                return result.stdout  # partial output may still be useful
-            return f"Claude CLI error (exit {result.returncode}): {result.stderr[:500]}"
 
-        return result.stdout or "No response from Claude."
+def is_dm(event: dict) -> bool:
+    return event.get("channel_type") == "im"
 
-    except subprocess.TimeoutExpired:
-        logger.error("Claude CLI timed out after %ds", CLAUDE_TIMEOUT)
-        return f"Request timed out after {CLAUDE_TIMEOUT}s. Try a simpler request."
+
+# ─── Onboarding ─────────────────────────────────────────────────────
+
+WELCOME_MSG = """Welcome to *ModelOpt Bot*!
+
+I need to set you up first. How would you like to authenticate with Claude?
+
+*1️⃣* Use shared team key (no setup needed)
+*2️⃣* Log in with your own Anthropic Console account
+
+Reply with `1` or `2`."""
+
+HELP_MSG = """*ModelOpt Bot Commands*
+
+*Run prompts:*
+• `@modelopt <prompt>` — run a ModelOpt task (PTQ, deploy, eval)
+
+*Setup:*
+• `/modelopt setup` — onboard (auth + cluster config)
+• `/modelopt add-cluster` — configure a remote cluster
+• `/modelopt clusters` — list your configured clusters
+
+*Workspaces:*
+• `/modelopt workspaces` — list your workspaces
+• `/modelopt cleanup` — remove old workspaces
+• `/modelopt status` — show your current status
+
+*Examples:*
+```
+@modelopt quantize Qwen3-0.6B with nvfp4
+@modelopt quantize and evaluate Llama-3.1-8B with fp8
+@modelopt deploy ./my-checkpoint with vLLM
+```"""
+
+# ─── Auth via interactive Claude session ─────────────────────────────
+
+_auth_sessions: dict = {}  # {user_id: AuthSession}
+
+
+async def _start_interactive_login(user_id: str, say, thread_ts: str | None):
+    """Start interactive Claude session, navigate to Console login, send URL to user."""
+    from auth_session import AuthSession
+
+    try:
+        session = AuthSession(user_id, DATA_DIR)
+        await say(text="Starting login... this takes a few seconds.", thread_ts=thread_ts)
+        url, port = await session.start_and_get_url()
+
+        if url:
+            _auth_sessions[user_id] = session
+            onboarding_state[user_id] = "awaiting_auth_code"
+            await say(
+                text=(
+                    "Open this link in your browser to sign in with your Anthropic Console account:\n\n"
+                    f"{url}\n\n"
+                    "After signing in, you'll see a code on the page. Paste that code back here."
+                ),
+                thread_ts=thread_ts,
+            )
+        else:
+            session.close()
+            onboarding_state.pop(user_id, None)
+            await say(
+                text="Could not start login flow. Try `/modelopt setup` again.",
+                thread_ts=thread_ts,
+            )
     except Exception as e:
-        logger.error("Claude CLI error: %s", e)
-        return f"Error running Claude: {e}"
+        logger.error("Interactive login error for %s: %s", user_id, e)
+        onboarding_state.pop(user_id, None)
+        await say(text=f"Login error: {e}\nTry `/modelopt setup` again.", thread_ts=thread_ts)
+
+
+# ─── Onboarding Response Handler ────────────────────────────────────
+
+
+async def handle_onboarding_response(event, say):
+    """Handle responses during the onboarding flow."""
+    user_id = event["user"]
+    text = event.get("text", "").strip()
+    thread_ts = event.get("thread_ts", event["ts"])
+    state = onboarding_state.get(user_id)
+
+    if state == "awaiting_auth_choice":
+        if text == "1":
+            user_store.setup_shared_key(user_id)
+            del onboarding_state[user_id]
+            await say(
+                text="Using shared team key. No setup needed!\n\nWould you like to configure a remote cluster? Reply `yes` or `no`.",
+                thread_ts=thread_ts,
+            )
+            onboarding_state[user_id] = "awaiting_cluster_choice"
+        elif text == "2":
+            await _start_interactive_login(user_id, say, thread_ts)
+        else:
+            await say(text="Please reply with `1` or `2`.", thread_ts=thread_ts)
+        return True
+
+    if state == "awaiting_auth_code":
+        # User pasted the code from the browser callback page
+        code = text.strip()
+        session = _auth_sessions.pop(user_id, None)
+        if not session:
+            onboarding_state.pop(user_id, None)
+            await say(text="Login session expired. Try `/modelopt setup` again.", thread_ts=thread_ts)
+            return True
+
+        try:
+            await say(text="Verifying code...", thread_ts=thread_ts)
+            success = await session.submit_code(code)
+
+            if success:
+                user_store.setup_login_auth(user_id, session.get_config_dir())
+                onboarding_state.pop(user_id, None)
+                session.close()
+                await say(
+                    text="Logged in successfully!\n\nWould you like to configure a remote cluster? Reply `yes` or `no`.",
+                    thread_ts=thread_ts,
+                )
+                onboarding_state[user_id] = "awaiting_cluster_choice"
+            else:
+                onboarding_state.pop(user_id, None)
+                session.close()
+                await say(
+                    text="Login failed. The code may be invalid or expired.\nTry `/modelopt setup` again.",
+                    thread_ts=thread_ts,
+                )
+        except Exception as e:
+            logger.error("Auth code error for %s: %s", user_id, e)
+            onboarding_state.pop(user_id, None)
+            session.close()
+            await say(text=f"Login error: {e}\nTry `/modelopt setup` again.", thread_ts=thread_ts)
+        return True
+
+    if state == "awaiting_cluster_choice":
+        del onboarding_state[user_id]
+        if text.lower() in ("yes", "y"):
+            await start_cluster_setup(user_id, say, thread_ts)
+        else:
+            await say(
+                text="All set! You can configure a cluster later with `/modelopt add-cluster`.\n\nTry: `@modelopt quantize Qwen3-0.6B with nvfp4`",
+                thread_ts=thread_ts,
+            )
+        return True
+
+    # Handle cluster setup flow
+    if user_id in cluster_setup_state:
+        return await handle_cluster_setup_response(user_id, text, say, thread_ts)
+
+    return False
+
+
+# ─── Cluster Setup ───────────────────────────────────────────────────
+
+
+async def start_cluster_setup(user_id, say, thread_ts):
+    """Begin interactive cluster configuration."""
+    cluster_setup_state[user_id] = {"step": "name"}
+    await say(
+        text="Let's set up a remote cluster.\n\n*Step 1/5:* What would you like to call this cluster? (e.g., `cw-dfw`, `selene`, `my-workstation`)",
+        thread_ts=thread_ts,
+    )
+
+
+async def handle_cluster_setup_response(user_id, text, say, thread_ts):
+    """Handle multi-step cluster configuration."""
+    state = cluster_setup_state[user_id]
+    step = state["step"]
+
+    if step == "name":
+        state["name"] = text.strip().replace(" ", "-")
+        state["step"] = "login_node"
+        await say(
+            text=f"Cluster alias: *{state['name']}*\n\n*Step 2/5:* Login node hostname? (e.g., `cluster-login.example.com`)",
+            thread_ts=thread_ts,
+        )
+    elif step == "login_node":
+        state["login_node"] = text.strip()
+        state["step"] = "user"
+        await say(
+            text="*Step 3/5:* SSH username? (default: your system username)",
+            thread_ts=thread_ts,
+        )
+    elif step == "user":
+        state["user"] = text.strip() if text.strip() else None
+        state["step"] = "workspace"
+        await say(
+            text="*Step 4/5:* Remote working directory? (e.g., `/home/username/modelopt` or `~/modelopt`)",
+            thread_ts=thread_ts,
+        )
+    elif step == "workspace":
+        state["workspace"] = text.strip()
+        state["step"] = "gpu_type"
+        await say(
+            text="*Step 5/5:* GPU type on this cluster? (e.g., `H100`, `B200`, `A100` — used for format recommendations. Type `skip` if unknown.)",
+            thread_ts=thread_ts,
+        )
+    elif step == "gpu_type":
+        gpu = text.strip() if text.strip().lower() != "skip" else None
+        del cluster_setup_state[user_id]
+
+        name = state["name"]
+        yaml_lines = ["clusters:", f"  {name}:"]
+        yaml_lines.append(f"    login_node: {state['login_node']}")
+        if state.get("user"):
+            yaml_lines.append(f"    user: {state['user']}")
+        yaml_lines.append(f"    workspace: {state['workspace']}")
+        if gpu:
+            yaml_lines.append(f"    gpu_type: {gpu}")
+        yaml_lines.append(f"\ndefault_cluster: {name}")
+
+        yaml_content = "\n".join(yaml_lines) + "\n"
+
+        existing = user_store.read_clusters_yaml(user_id)
+        if existing:
+            await say(
+                text=f"You already have a cluster config. Replacing with new one.\n\n```{yaml_content}```",
+                thread_ts=thread_ts,
+            )
+
+        user_store.save_clusters_yaml(user_id, yaml_content)
+        await say(
+            text=f"Cluster *{name}* configured!\n\n```{yaml_content}```\nYou're all set. Try: `@modelopt quantize Qwen3-0.6B with nvfp4`",
+            thread_ts=thread_ts,
+        )
+
+    return True
+
+
+# ─── Slash Command: /modelopt ────────────────────────────────────────
+
+
+@app.command("/modelopt")
+async def handle_slash_command(ack, command, say, respond):
+    """Handle /modelopt slash commands."""
+    await ack()
+    user_id = command["user_id"]
+    text = command.get("text", "").strip()
+    channel = command["channel_id"]
+
+    parts = text.split(maxsplit=1)
+    subcmd = parts[0].lower() if parts else ""
+    args = parts[1] if len(parts) > 1 else ""
+
+    if subcmd == "setup":
+        onboarding_state[user_id] = "awaiting_auth_choice"
+        await respond(text=WELCOME_MSG)
+
+    elif subcmd == "add-cluster":
+        await start_cluster_setup(user_id, respond, None)
+
+    elif subcmd == "clusters":
+        yaml = user_store.read_clusters_yaml(user_id)
+        if yaml:
+            await respond(text=f"Your cluster config:\n```{yaml}```")
+        else:
+            await respond(text="No clusters configured. Use `/modelopt add-cluster` to set one up.")
+
+    elif subcmd == "workspaces":
+        if not user_store.is_registered(user_id):
+            await respond(text="Not registered yet. Use `/modelopt setup` first.")
+            return
+        ws_root = user_store.jobs_dir(user_id)
+        workspaces = workspace_mgr.list_workspaces(ws_root)
+        if not workspaces:
+            await respond(text="No workspaces yet. They'll be created when you run your first task.")
+            return
+        lines = ["*Your workspaces:*"]
+        for w in workspaces[:15]:
+            lines.append(f"• `{w['name']}` — {w['size_mb']}MB (modified {w['modified']})")
+        await respond(text="\n".join(lines))
+
+    elif subcmd == "cleanup":
+        if not user_store.is_registered(user_id):
+            await respond(text="Not registered yet.")
+            return
+        ws_root = user_store.jobs_dir(user_id)
+        removed = await workspace_mgr.cleanup_old(ws_root)
+        await respond(text=f"Cleaned up {removed} old workspace(s).")
+
+    elif subcmd == "status":
+        info = user_store.user_info(user_id)
+        if info:
+            ws_root = user_store.jobs_dir(user_id)
+            workspaces = workspace_mgr.list_workspaces(ws_root)
+            msg = f"*Auth:* {info['auth_method']}\n*Clusters:* {'configured' if info['has_clusters'] else 'none'}\n*Workspaces:* {len(workspaces)}"
+            await respond(text=msg)
+        else:
+            await respond(text="Not registered yet. Use `/modelopt setup` first.")
+
+    elif subcmd in ("help", ""):
+        await respond(text=HELP_MSG)
+
+    else:
+        # Treat as a prompt
+        await respond(text="Processing...")
+        await _run_job(user_id, text, say_func=respond, channel=channel, thread_ts=None)
 
 
 # ─── Event Handlers ──────────────────────────────────────────────────
-
-# Store thread contexts: {(channel, thread_ts): [messages]}
-thread_history: dict[tuple[str, str], list[str]] = {}
-MAX_HISTORY = 20
 
 
 @app.event("app_mention")
 async def handle_mention(event, say):
     """Handle @bot mentions in channels."""
+    user_id = event["user"]
     text = strip_bot_mention(event.get("text", ""))
     channel = event["channel"]
     thread_ts = event.get("thread_ts", event["ts"])
 
     if not text:
-        await say("How can I help? Try: `quantize Qwen3-0.6B with fp8`", thread_ts=thread_ts)
+        await say(text="How can I help? Try: `@modelopt quantize Qwen3-0.6B with nvfp4`", thread_ts=thread_ts)
         return
 
-    # Build thread context
-    key = (channel, thread_ts)
-    history = thread_history.get(key, [])
-    context = "\n".join(history[-MAX_HISTORY:])
+    if not user_store.is_registered(user_id):
+        onboarding_state[user_id] = "awaiting_auth_choice"
+        await say(text=WELCOME_MSG, thread_ts=thread_ts)
+        return
 
-    # Acknowledge receipt
-    await say("Working on it...", thread_ts=thread_ts)
-
-    # Run Claude
-    response = await run_claude(text, thread_context=context)
-    response = truncate_response(response)
-
-    # Save to thread history
-    history.append(f"User: {text}")
-    history.append(f"Assistant: {response[:500]}")  # truncate for context
-    thread_history[key] = history[-MAX_HISTORY:]
-
-    await say(text=response, thread_ts=thread_ts)
+    await say(text=":hourglass_flowing_sand: Setting up job...", thread_ts=thread_ts)
+    await _run_job(user_id, text, say_func=say, channel=channel, thread_ts=thread_ts)
 
 
 @app.event("message")
 async def handle_dm(event, say):
     """Handle direct messages."""
-    # Skip bot's own messages and threaded replies handled by app_mention
     if event.get("bot_id") or event.get("subtype"):
         return
-
-    # Only handle DMs (channel type "im")
     if event.get("channel_type") != "im":
         return
 
+    user_id = event.get("user")
+    if not user_id:
+        return
     text = event.get("text", "").strip()
     if not text:
         return
 
-    channel = event["channel"]
     thread_ts = event.get("thread_ts", event["ts"])
+    channel = event["channel"]
 
-    key = (channel, thread_ts)
-    history = thread_history.get(key, [])
-    context = "\n".join(history[-MAX_HISTORY:])
+    if user_id in onboarding_state or user_id in cluster_setup_state:
+        handled = await handle_onboarding_response(event, say)
+        if handled:
+            return
 
-    response = await run_claude(text, thread_context=context)
-    response = truncate_response(response)
+    if not user_store.is_registered(user_id):
+        onboarding_state[user_id] = "awaiting_auth_choice"
+        await say(text=WELCOME_MSG, thread_ts=thread_ts)
+        return
 
-    history.append(f"User: {text}")
-    history.append(f"Assistant: {response[:500]}")
-    thread_history[key] = history[-MAX_HISTORY:]
+    await say(text=":hourglass_flowing_sand: Setting up job...", thread_ts=thread_ts)
+    await _run_job(user_id, text, say_func=say, channel=channel, thread_ts=thread_ts)
 
-    await say(text=response, thread_ts=thread_ts)
+
+# ─── Core Job Execution ─────────────────────────────────────────────
+
+
+async def _run_job(user_id: str, prompt: str, say_func, channel: str, thread_ts: str | None):
+    """Ensure a workspace exists and run Claude in it."""
+    clusters_yaml = user_store.read_clusters_yaml(user_id)
+    ws_root = user_store.jobs_dir(user_id)
+
+    try:
+        workspace = await workspace_mgr.ensure_default_workspace(ws_root, clusters_yaml)
+    except Exception as e:
+        logger.error("Failed to set up workspace for user %s: %s", user_id, e)
+        await say_func(
+            text=f":x: Failed to set up workspace: {e}",
+            **({"thread_ts": thread_ts} if thread_ts else {}),
+        )
+        return
+
+    env = user_store.get_claude_env(user_id)
+    env["MODELOPT_WORKSPACE_ROOT"] = str(ws_root)
+    env["MODELOPT_REPO_DIR"] = str(workspace_mgr.repo_dir)
+
+    bot_context = (
+        f"You are running via the ModelOpt Slack bot. "
+        f"Workspace root: {ws_root} (contains per-model workspaces). "
+        f"Upstream repo: {workspace_mgr.repo_dir} (read-only, use for fresh copies). "
+        f"Read skills/common/workspace-management.md before creating workspaces. "
+        f"Check existing workspaces with: ls $MODELOPT_WORKSPACE_ROOT/"
+    )
+
+    session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"modelopt-slack-{user_id}"))
+
+    if thread_ts:
+        await say_func(text=":rocket: Working on it...", thread_ts=thread_ts)
+
+    try:
+        response = await run_claude(
+            prompt=prompt,
+            cwd=workspace,
+            env=env,
+            session_id=session_id,
+            system_prompt_extra=bot_context,
+        )
+    except Exception as e:
+        response = f":x: Failed: {e}"
+        logger.error("Request failed for user %s: %s", user_id, e)
+
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    if channel and len(response) > MAX_SLACK_LENGTH:
+        await send_long_response(say_func, response, thread_ts, channel)
+    else:
+        await say_func(text=truncate(response), **kwargs)
 
 
 # ─── Main ────────────────────────────────────────────────────────────
 
 
 async def main():
-    """Start the ModelOpt Slack Bot."""
     logger.info("Starting ModelOpt Slack Bot...")
-    logger.info("Skills directory: %s", SKILLS_CWD)
-    logger.info("Looking for skills in: %s/.claude/skills/", SKILLS_CWD)
+    logger.info("Repo dir: %s", REPO_DIR)
+    logger.info("Data dir: %s", DATA_DIR)
 
-    # Verify claude CLI
+    if not Path(REPO_DIR).exists():
+        logger.error("Repo dir not found: %s", REPO_DIR)
+        return
+
+    skills_path = Path(REPO_DIR) / ".claude" / "skills"
+    if skills_path.exists():
+        skills = [d.name for d in skills_path.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
+        logger.info("Found skills: %s", ", ".join(skills))
+
+    import shutil
+
     claude_bin = shutil.which("claude")
     if claude_bin:
         logger.info("Claude CLI: %s", claude_bin)
     else:
         logger.error("Claude CLI not found in PATH — bot will not work")
 
-    # Verify skills directory exists
-    skills_path = Path(SKILLS_CWD) / ".claude" / "skills"
-    if skills_path.exists():
-        skills = [d.name for d in skills_path.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
-        logger.info("Found skills: %s", ", ".join(skills))
-    else:
-        logger.warning("Skills directory not found: %s", skills_path)
+    logger.info("Registered users: %d", len(user_store.list_users()))
 
     handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
     await handler.start_async()

@@ -35,7 +35,17 @@ The script handles: GPU detection, quantization flag auto-detection (FP8 vs FP4)
 
 ## Decision Flow
 
-### 0. Identify the checkpoint
+### 0. Check workspace (multi-user / Slack bot)
+
+If `MODELOPT_WORKSPACE_ROOT` is set, read `skills/common/workspace-management.md`. Before creating a new workspace, check for existing ones — especially if deploying a checkpoint from a prior PTQ run:
+
+```bash
+ls "$MODELOPT_WORKSPACE_ROOT/" 2>/dev/null
+```
+
+If the user says "deploy the model I just quantized" or references a previous PTQ, find the matching workspace and `cd` into it. The checkpoint should be in that workspace's output directory.
+
+### 1. Identify the checkpoint
 
 Determine what the user wants to deploy:
 
@@ -49,7 +59,7 @@ Check the quantization format if applicable:
 cat <checkpoint_path>/hf_quant_config.json 2>/dev/null || echo "No quant config — unquantized or legacy format"
 ```
 
-### 1. Choose the framework
+### 2. Choose the framework
 
 If the user hasn't specified a framework, recommend based on this priority:
 
@@ -62,7 +72,7 @@ If the user hasn't specified a framework, recommend based on this priority:
 
 Check the support matrix in `references/support-matrix.md` to confirm the model + format + framework combination is supported.
 
-### 2. Check the environment
+### 3. Check the environment
 
 **GPU availability:**
 
@@ -94,7 +104,7 @@ If the framework is not installed, consult `references/setup.md` for installatio
 
 If the model exceeds single GPU memory, use tensor parallelism (`-tp <num_gpus>`).
 
-### 3. Deploy
+### 4. Deploy
 
 Read the framework-specific reference for detailed instructions:
 
@@ -141,7 +151,7 @@ outputs = llm.generate(["Hello, my name is"], SamplingParams(temperature=0.8, to
 
 For AutoQuant or mixed-precision checkpoints, see `references/trtllm.md`.
 
-### 4. Verify the deployment
+### 5. Verify the deployment
 
 After the server starts, verify it's healthy:
 
@@ -164,7 +174,7 @@ curl -s http://localhost:8000/v1/completions \
 
 All checks must pass before reporting success to the user.
 
-### 5. Benchmark (optional)
+### 6. Benchmark (optional)
 
 If the user wants throughput/latency numbers, run a quick benchmark:
 
