@@ -144,6 +144,7 @@ def get_args():
     parser.add_argument("--wandb_exp_name", type=str, help="Wandb experiment name (optional)")
     # Export arguments
     parser.add_argument(
+        "--hf_export_path",
         "--hf-export-path",
         type=str,
         default=None,
@@ -153,6 +154,7 @@ def get_args():
         ),
     )
     parser.add_argument(
+        "--hf_model",
         "--hf-model",
         type=str,
         required=True,
@@ -307,6 +309,7 @@ def main(args: argparse.Namespace):
                     train_iters=args.train_iters,
                     hf_export_path=args.hf_export_path,
                     hf_model=args.hf_model,
+                    trust_remote_code=args.trust_remote_code,
                 )
             except Exception as e:
                 print(f"⚠️  Export failed: {e}")
