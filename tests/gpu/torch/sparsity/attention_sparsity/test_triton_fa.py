@@ -553,3 +553,48 @@ class TestSkipSoftmax:
             skip_softmax_threshold=1e-3,
         )
         torch.testing.assert_close(out_skip, out_dense, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not TRITON_KERNEL_AVAILABLE, reason="Need CUDA + triton")
+class TestSkipSoftmaxHFIntegration:
+    """HF integration for skip-softmax via mtsa.sparsify()."""
+
+    def test_skip_softmax_via_sparsify(self, tiny_llama_dir):
+        """mtsa.sparsify() with triton_skip_softmax produces finite logits."""
+        pytest.importorskip("transformers")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        import modelopt.torch.sparsity.attention_sparsity as mtsa
+
+        tok = AutoTokenizer.from_pretrained(tiny_llama_dir)
+        if tok.pad_token_id is None:
+            tok.pad_token_id = tok.eos_token_id
+        ids = torch.randint(1, tok.vocab_size, (1, 64), device="cuda")
+
+        # Dense baseline (triton backend, no skip)
+        model_dense = AutoModelForCausalLM.from_pretrained(
+            tiny_llama_dir,
+            attn_implementation="modelopt_triton",
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+        )
+        model_dense.eval()
+        with torch.no_grad():
+            logits_dense = model_dense(input_ids=ids).logits
+        del model_dense
+
+        # Skip-softmax via mtsa.sparsify()
+        model_skip = AutoModelForCausalLM.from_pretrained(
+            tiny_llama_dir,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+        )
+        mtsa.sparsify(model_skip, mtsa.SKIP_SOFTMAX_TRITON_DEFAULT)
+        model_skip.eval()
+        with torch.no_grad():
+            logits_skip = model_skip(input_ids=ids).logits
+
+        assert not torch.isnan(logits_skip).any(), "NaN in skip-softmax logits"
+        assert not torch.isinf(logits_skip).any(), "Inf in skip-softmax logits"
+        # On short sequences (64 tokens), no tiles are skipped — output should match dense
+        torch.testing.assert_close(logits_skip, logits_dense, rtol=1e-3, atol=1e-3)
