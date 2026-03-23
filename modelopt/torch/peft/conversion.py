@@ -41,9 +41,14 @@ def convert_to_peft_model(model: ModelLikeModule, config: PEFTConfig) -> Convert
     metadata = {}
     add_adapter(model, config)
 
-    # Freeze base weights only for layers that have LoRA adapters applied
-    if config.freeze_base_model:
+    # Freeze base weights based on config flags (mutually exclusive)
+    if config.freeze_base_layers:
         _freeze_base_weights_of_lora_layers(model)
+    elif config.freeze_base_model or (
+        config.freeze_base_model is None and config.freeze_base_layers is None
+    ):
+        # Default behavior: freeze all base model weights
+        _freeze_all_base_weights(model)
 
     # Update gradient settings for LoRA parameters only
     _update_lora_grads(model, config)
@@ -226,6 +231,21 @@ def unfreeze_lora_weights(model, *, layer_patterns=None, adapter_patterns=None):
         layer_patterns=layer_patterns,
         adapter_patterns=adapter_patterns,
     )
+
+
+def _freeze_all_base_weights(model):
+    """Freeze all non-LoRA parameters in the model."""
+    lora_param_ids = set()
+    for _, module in model.named_modules():
+        if isinstance(module, LoRAModule):
+            for adapter in module._lora_adapters.values():
+                for submodule in ("lora_a", "lora_b"):
+                    for param in adapter[submodule].parameters():
+                        lora_param_ids.add(id(param))
+
+    for param in model.parameters():
+        if id(param) not in lora_param_ids:
+            param.requires_grad = False
 
 
 def _freeze_base_weights_of_lora_layers(model):

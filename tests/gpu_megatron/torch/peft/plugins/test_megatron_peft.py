@@ -457,16 +457,9 @@ def _test_adapter_gradient_flow_freeze_base_model(lora_config, tmp_path, rank, s
 
     for name, param in model.named_parameters():
         if "lora" in name:
-            # LoRA adapter weights should be trainable and have gradients
-            assert param.grad is not None
-            assert torch.any(param.grad != 0)
-        elif "output_layer" in name:
-            # output_layer has no LoRA adapter (enable=False), so its base
-            # weights should NOT be frozen and should have gradients
             assert param.grad is not None
             assert torch.any(param.grad != 0)
         else:
-            # Base weights of layers with LoRA adapters should be frozen
             assert param.grad is None
 
 
@@ -485,7 +478,7 @@ def test_adapter_gradient_flow_freeze_base_model(dist_workers, lora_config, tmp_
 MOE_LORA_CFG_TEST = {
     "adapter_type": "lora",
     "adapter_name": "moe_lora",
-    "freeze_base_model": True,
+    "freeze_base_layers": True,
     "adapter_cfg": {
         "*": {"enable": False},
         "*local_experts*linear_fc1*": {
@@ -504,8 +497,8 @@ MOE_LORA_CFG_TEST = {
 }
 
 
-def _test_mamba_moe_freeze_base_model_only_lora_layers(lora_config, rank, size):
-    """Test that freeze_base_model only freezes base weights of layers with LoRA adapters.
+def _test_mamba_moe_freeze_base_layers_only_lora_layers(lora_config, rank, size):
+    """Test that freeze_base_layers only freezes base weights of layers with LoRA adapters.
 
     With the MOE LoRA config, only local_experts linear_fc1/fc2 get LoRA adapters.
     All other layers (Mamba, attention, shared experts, embeddings, output_layer) should
@@ -575,9 +568,9 @@ def _test_mamba_moe_freeze_base_model_only_lora_layers(lora_config, rank, size):
 
 
 @pytest.mark.skipif(not HAS_MAMBA, reason="Mamba not installed")
-def test_mamba_moe_freeze_base_model_only_lora_layers(dist_workers):
+def test_mamba_moe_freeze_base_layers_only_lora_layers(dist_workers):
     dist_workers.run(
-        partial(_test_mamba_moe_freeze_base_model_only_lora_layers, MOE_LORA_CFG_TEST)
+        partial(_test_mamba_moe_freeze_base_layers_only_lora_layers, MOE_LORA_CFG_TEST)
     )
 
 
