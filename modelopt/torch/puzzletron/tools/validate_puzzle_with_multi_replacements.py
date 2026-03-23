@@ -35,7 +35,6 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 import modelopt.torch.utils.distributed as dist
 from modelopt.torch.puzzletron.anymodel.converter import Converter
 from modelopt.torch.puzzletron.anymodel.model_descriptor import ModelDescriptorFactory
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.configuration_decilm import DeciLMConfig
 from modelopt.torch.puzzletron.replacement_library.replacement_library import ReplacementLibrary
 from modelopt.torch.puzzletron.replacement_library.replacement_utils import parse_layer_replacement
 from modelopt.torch.puzzletron.tools import validate_model
@@ -43,10 +42,7 @@ from modelopt.torch.puzzletron.tools.checkpoint_utils import (
     SAFETENSORS_SUBBLOCKS_DIR_NAME,
     copy_tokenizer,
 )
-from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import (
-    save_checkpoint,
-    save_safetensors_index,
-)
+from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import save_checkpoint
 from modelopt.torch.puzzletron.tools.sharded_checkpoint_utils import load_and_shard_model
 from modelopt.torch.puzzletron.tools.validation_utils import (
     validate_model_and_extract_hidden_states,
@@ -190,6 +186,7 @@ def validate_puzzle_solutions(args: DictConfig) -> None:
             Converter.copy_checkpoint_files(args.teacher_dir, checkpoint_dir)
             if realizable_as_symlinks:
                 if dist.is_master():
+                    # TODO: Loo into internal Puzzleron code to see how to save as symlinks
                     # save_checkpoint_as_symlinks is currently not supported
                     pass
             save_checkpoint(model, checkpoint_dir, descriptor)
@@ -228,39 +225,6 @@ def can_realize_as_symlinks(layer_replacements: list[dict]) -> bool:
         if num_parent_layers != num_child_layers or num_parent_layers != 1:
             return False
     return True
-
-
-def force_create_symlink(src: Path, dst: Path) -> None:
-    if dst.exists():
-        dst.unlink()
-    dst.symlink_to(src)
-
-
-def save_checkpoint_as_symlinks(
-    layer_replacements: list[dict],
-    model_config: DeciLMConfig,
-    checkpoint_dir: Path,
-    replace_library: ReplacementLibrary,
-) -> None:
-    model_config.save_pretrained(checkpoint_dir)
-    (checkpoint_dir / "subblocks_safetensors").mkdir(parents=True, exist_ok=True)
-    save_safetensors_index(model_config, checkpoint_dir)
-
-    for layer_replacement in layer_replacements:
-        for weight_path in layer_replacement["weight_paths"]:
-            force_create_symlink(
-                weight_path, checkpoint_dir / SAFETENSORS_SUBBLOCKS_DIR_NAME / weight_path.name
-            )
-
-    lm_head_path = replace_library.get_teacher_lm_head_path()
-    force_create_symlink(
-        lm_head_path, checkpoint_dir / SAFETENSORS_SUBBLOCKS_DIR_NAME / lm_head_path.name
-    )
-
-    embedding_path = replace_library.get_teacher_embedding_path()
-    force_create_symlink(
-        embedding_path, checkpoint_dir / SAFETENSORS_SUBBLOCKS_DIR_NAME / embedding_path.name
-    )
 
 
 def _load_tokenizer(args: DictConfig) -> PreTrainedTokenizerBase:

@@ -23,7 +23,6 @@ import concurrent.futures
 import dataclasses
 import fcntl
 import os
-import shutil
 import time
 import warnings
 from collections import defaultdict
@@ -37,10 +36,7 @@ from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from modelopt.torch.puzzletron.decilm import deci_lm_hf_code
 from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import maybe_cast_block_configs
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.configuration_decilm import DeciLMConfig
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.modeling_decilm import DeciLMForCausalLM
 from modelopt.torch.puzzletron.tools.common import infer_weights_dtype
 from modelopt.torch.puzzletron.tools.logger import mprint
 from modelopt.torch.puzzletron.tools.post_init_sparse import SparsityMethod
@@ -67,54 +63,6 @@ MODULE_WITHIN_LAYER_TO_FILE_TYPE = {
 LAYERS_MODULE_NAME = "model.layers"
 
 warnings.filterwarnings("ignore", "You are using `torch.load` with `weights_only=False`*.")
-
-
-def load_checkpoint(
-    checkpoint_dir: Path | str,
-    model_config_overrides: dict | None = None,
-    ignore_unexpected_config_keys: bool = False,
-    trust_remote_code: bool = False,
-) -> DeciLMForCausalLM:
-    """
-    Unlike AutoModelForCausalLM.from_pretrained, the models loaded by this function use your
-    local repo code, not the code inside the checkpoint.
-
-    Args:
-        checkpoint_dir: Path to checkpoint directory
-        model_config_overrides: Optional mapping of config overrides.
-        ignore_unexpected_config_keys: If True, ignore unexpected config keys.
-        trust_remote_code: If True, allows execution of custom code from the model repository.
-            This is a security risk if the model source is untrusted. Only set to True if you
-            trust the source of the model. Defaults to False for security.
-    """
-    from modelopt.torch.puzzletron.tools.checkpoint_utils import (
-        load_state_dict,  # prevent circular import
-    )
-
-    if not isinstance(checkpoint_dir, Path):
-        checkpoint_dir = Path(checkpoint_dir)
-
-    model_config = load_model_config(
-        checkpoint_dir,
-        model_config_overrides=model_config_overrides,
-        ignore_unexpected_config_keys=ignore_unexpected_config_keys,
-        trust_remote_code=trust_remote_code,
-    )
-
-    # Without sparsity we could have done:
-    # model = DeciLMForCausalLM.from_pretrained(pretrained_model_name_or_path=checkpoint_dir, config=model_config)
-    state_dict = load_state_dict(checkpoint_dir)
-    state_dict, sparsity_masks = SparsityMethod.fix_state_dict_inplace(state_dict, verbose=True)
-    dtype = infer_weights_dtype(state_dict)
-    model = DeciLMForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=None,
-        config=model_config,
-        state_dict=state_dict,
-        torch_dtype=dtype,
-    )
-    SparsityMethod().apply_masks(model, sparsity_masks)
-
-    return model
 
 
 def force_cache_dynamic_modules(
@@ -233,33 +181,6 @@ def _save_checkpoint(
     )
 
 
-def split_checkpoint_to_subblocks(
-    checkpoint_dir: Path | str, trust_remote_code: bool = False
-) -> None:
-    """Split a checkpoint into subblocks.
-
-    Args:
-        checkpoint_dir: Path to checkpoint directory
-        trust_remote_code: If True, allows execution of custom code from the model repository.
-            This is a security risk if the model source is untrusted. Only set to True if you
-            trust the source of the model. Defaults to False for security.
-    """
-    from modelopt.torch.puzzletron.tools.checkpoint_utils import (
-        load_state_dict,  # prevent circular import
-    )
-
-    if not isinstance(checkpoint_dir, Path):
-        checkpoint_dir = Path(checkpoint_dir)
-
-    model_config = load_model_config(checkpoint_dir, trust_remote_code=trust_remote_code)
-    state_dict = load_state_dict(checkpoint_dir)
-    save_subblocks(state_dict, checkpoint_dir)
-
-    if (index_path := checkpoint_dir / SAFE_WEIGHTS_INDEX_NAME).exists():
-        index_path.rename(checkpoint_dir / f"before_splitting.{SAFE_WEIGHTS_INDEX_NAME}")
-    save_safetensors_index(model_config, checkpoint_dir)
-
-
 def save_subblocks(
     state_dict: dict[str, torch.Tensor],
     checkpoint_dir: Path | str,
@@ -374,51 +295,6 @@ def save_subblocks(
     mprint(f"  Save operation was {save_time / subblocks_total_time * 100:.1f}% of total time")
 
 
-def save_safetensors_index(
-    model_config: DeciLMConfig,
-    checkpoint_dir: Path | str,
-) -> None:
-    """Save safetensors index for DeciLM models (legacy function)."""
-    mprint("=== Starting save_safetensors_index profiling ===")
-    index_start_time = time.time()
-
-    if not isinstance(checkpoint_dir, Path):
-        checkpoint_dir = Path(checkpoint_dir)
-
-    # Step 1: Create fake model on meta device
-    fake_model_start_time = time.time()
-    with torch.device("meta"):
-        fake_model = DeciLMForCausalLM(model_config)
-    fake_model_time = time.time() - fake_model_start_time
-    mprint(f"  Step 1 - Create fake model: {fake_model_time:.2f}s")
-
-    # Step 2: Build weight map
-    weight_map_start_time = time.time()
-    weight_map = _build_safetensors_weight_map(
-        state_dict=fake_model.state_dict(),
-        non_layer_module_to_file_type=NON_LAYER_MODULE_TO_FILE_TYPE,
-        module_within_layer_to_file_type=MODULE_WITHIN_LAYER_TO_FILE_TYPE,
-        layers_module_name=LAYERS_MODULE_NAME,
-    )
-    weight_map_time = time.time() - weight_map_start_time
-    mprint(f"  Step 2 - Build weight map: {weight_map_time:.2f}s ({len(weight_map)} mappings)")
-
-    # Step 3: Create and write index
-    write_start_time = time.time()
-    index = {"metadata": {"format": "pt"}, "weight_map": weight_map}
-    index_path = checkpoint_dir / SAFE_WEIGHTS_INDEX_NAME
-    index_json = json_dumps(index)
-    _write_file_process_safe(index_json, index_path)
-    write_time = time.time() - write_start_time
-    mprint(f"  Step 3 - Write index file: {write_time:.2f}s ({len(index_json)} chars)")
-
-    index_total_time = time.time() - index_start_time
-    mprint(f"=== save_safetensors_index completed in {index_total_time:.2f}s ===")
-    mprint(
-        f"  Breakdown: FakeModel {fake_model_time:.1f}s + WeightMap {weight_map_time:.1f}s + Write {write_time:.1f}s"
-    )
-
-
 def _write_text(content: str, f: BinaryIO) -> None:
     f.write(content.encode("utf-8"))
 
@@ -499,14 +375,3 @@ def save_model_config(model_config: PretrainedConfig, checkpoint_dir: Path | str
             for conf in model_config.block_configs
         ]
     model_config.save_pretrained(checkpoint_dir)
-
-
-def copy_deci_lm_hf_code(output_dir: Path | str) -> None:
-    """
-    Copy the deci_lm_hf_code directory to the output directory.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    code_dir = Path(deci_lm_hf_code.__file__).parent
-    for path in code_dir.glob("*.py"):
-        shutil.copy(path, output_dir / path.name)
