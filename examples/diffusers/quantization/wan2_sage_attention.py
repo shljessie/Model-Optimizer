@@ -88,12 +88,41 @@ _KERNEL_DESCRIPTIONS = {
 }
 
 
+# SageAttention kernel support by GPU compute capability:
+#   SM80  Ampere  (A100, RTX 3090, ...)          sage1, sage2-fp16
+#   SM89  Ada     (RTX 4090, RTX PRO 6000 Ada)   sage1, sage2-fp16, sage2-fp8
+#   SM90  Hopper  (H100)                         sage1, sage2-fp16, sage2-fp8
+#   SM100 Blackwell datacenter (B100/B200)       sage1, sage2-fp16, sage2-fp8
+#   SM120 Blackwell consumer/pro (RTX 50-series,
+#          RTX PRO 6000 Blackwell)               NOT YET SUPPORTED by SA 2.2.0
+#                                                Recompile with TORCH_CUDA_ARCH_LIST="8.9+PTX"
+#                                                to use PTX forward-compat fallback.
+_SUPPORTED_SM = {80, 86, 89, 90, 100}
+
+
+def _get_gpu_sm() -> int | None:
+    """Return the CUDA compute capability (e.g. 89 for SM8.9) of the current GPU, or None."""
+    if not torch.cuda.is_available():
+        return None
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
 def _detect_available_kernels() -> list[str]:
     """Return the list of kernels available in the installed sageattention version."""
     try:
         import sageattention as _sa
     except ImportError:
         return []
+
+    sm = _get_gpu_sm()
+    if sm is not None and sm not in _SUPPORTED_SM:
+        print(
+            f"[SageAttention] WARNING: GPU compute capability SM{sm} is not officially supported "
+            f"by SageAttention 2.2.0 (supported: SM{sorted(_SUPPORTED_SM)}). "
+            "Kernels may fail at runtime. "
+            "Try recompiling with: TORCH_CUDA_ARCH_LIST='8.9+PTX'"
+        )
 
     available = []
     if hasattr(_sa, "sageattn"):
@@ -203,7 +232,18 @@ def _sageattn_sdpa_compat(
         )
 
     _sage_calls += 1
-    return _run_sage_kernel(query, key, value, is_causal=is_causal, scale=scale)
+    try:
+        return _run_sage_kernel(query, key, value, is_causal=is_causal, scale=scale)
+    except (AssertionError, RuntimeError) as e:
+        # Kernel not available for this GPU architecture — fall back to SDPA.
+        # This typically means sageattention was compiled without support for
+        # this SM version. Recompile with TORCH_CUDA_ARCH_LIST="<sm>" set.
+        print(
+            f"[SageAttention] WARNING: kernel={_active_kernel!r} failed ({e}). "
+            "Falling back to SDPA. Recompile sageattention with "
+            "TORCH_CUDA_ARCH_LIST set to your GPU's SM version (e.g. '8.9' for Ada)."
+        )
+        return _orig_sdpa(query, key, value, is_causal=is_causal, scale=scale)
 
 
 def enable_sage_attention(kernel: str = KERNEL_SAGE2_FP8) -> None:
