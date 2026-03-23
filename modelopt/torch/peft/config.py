@@ -186,7 +186,7 @@ class PEFTConfig(ModeloptBaseConfig):
         validate_default=True,
     )
 
-    freeze_base_model: bool = ModeloptField(
+    freeze_base_layers: bool = ModeloptField(
         default=True,
         title="Freeze base weights of layers with LoRA adapters",
         description="Whether to freeze the base weights of layers that have LoRA adapters applied. "

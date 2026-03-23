@@ -430,7 +430,7 @@ def test_mcore_save_restore(dist_workers, lora_config, tmp_path):
     dist_workers.run(partial(_test_mcore_save_restore, lora_config, str(tmp_path)))
 
 
-def _test_adapter_gradient_flow_freeze_base_model(lora_config, tmp_path, rank, size):
+def _test_adapter_gradient_flow_freeze_base_layers(lora_config, tmp_path, rank, size):
     hidden_size = 512
     initialize_for_megatron(tensor_model_parallel_size=size, pipeline_model_parallel_size=1)
     model = _gpt_model_provider(tp_size=size, hidden_size=hidden_size)
@@ -476,16 +476,16 @@ def _test_adapter_gradient_flow_freeze_base_model(lora_config, tmp_path, rank, s
         LARGE_LORA_CFG_RANDOM_INIT_TEST,  # Use random init so gradients flow to both lora_a and lora_b
     ],
 )
-def test_adapter_gradient_flow_freeze_base_model(dist_workers, lora_config, tmp_path):
+def test_adapter_gradient_flow_freeze_base_layers(dist_workers, lora_config, tmp_path):
     dist_workers.run(
-        partial(_test_adapter_gradient_flow_freeze_base_model, lora_config, str(tmp_path))
+        partial(_test_adapter_gradient_flow_freeze_base_layers, lora_config, str(tmp_path))
     )
 
 
 MOE_LORA_CFG_TEST = {
     "adapter_type": "lora",
     "adapter_name": "moe_lora",
-    "freeze_base_model": True,
+    "freeze_base_layers": True,
     "adapter_cfg": {
         "*": {"enable": False},
         "*local_experts*linear_fc1*": {
@@ -504,8 +504,8 @@ MOE_LORA_CFG_TEST = {
 }
 
 
-def _test_mamba_moe_freeze_base_model_only_lora_layers(lora_config, rank, size):
-    """Test that freeze_base_model only freezes base weights of layers with LoRA adapters.
+def _test_mamba_moe_freeze_base_layers_only_lora_layers(lora_config, rank, size):
+    """Test that freeze_base_layers only freezes base weights of layers with LoRA adapters.
 
     With the MOE LoRA config, only local_experts linear_fc1/fc2 get LoRA adapters.
     All other layers (Mamba, attention, shared experts, embeddings, output_layer) should
@@ -575,9 +575,9 @@ def _test_mamba_moe_freeze_base_model_only_lora_layers(lora_config, rank, size):
 
 
 @pytest.mark.skipif(not HAS_MAMBA, reason="Mamba not installed")
-def test_mamba_moe_freeze_base_model_only_lora_layers(dist_workers):
+def test_mamba_moe_freeze_base_layers_only_lora_layers(dist_workers):
     dist_workers.run(
-        partial(_test_mamba_moe_freeze_base_model_only_lora_layers, MOE_LORA_CFG_TEST)
+        partial(_test_mamba_moe_freeze_base_layers_only_lora_layers, MOE_LORA_CFG_TEST)
     )
 
 
@@ -589,7 +589,7 @@ def _test_adapter_gradient_flow_freeze_lora_model(lora_config, tmp_path, rank, s
 
     local_cfg = copy.deepcopy(lora_config)
     local_cfg["freeze_lora_weights"] = True
-    local_cfg["freeze_base_model"] = False
+    local_cfg["freeze_base_layers"] = False
     mtpeft.update_model(model, local_cfg)
     model.train()
 
@@ -637,7 +637,7 @@ def _test_adapter_gradient_flow(lora_config, tmp_path, rank, size):
 
     lora_config = copy.deepcopy(lora_config)
     lora_config["freeze_lora_weights"] = False
-    lora_config["freeze_base_model"] = False
+    lora_config["freeze_base_layers"] = False
     mtpeft.update_model(model, lora_config)
     model.train()
 
@@ -680,7 +680,7 @@ def _test_adapter_gradient_flow_freeze_lora_with_api(lora_config, tmp_path, rank
 
     lora_config = copy.deepcopy(lora_config)
     lora_config["freeze_lora_weights"] = False
-    lora_config["freeze_base_model"] = False
+    lora_config["freeze_base_layers"] = False
     mtpeft.update_model(model, lora_config)
     # Freeze the self_attention layers only
     mtpeft.freeze_lora_weights(model, layer_patterns="*self_attention*")
