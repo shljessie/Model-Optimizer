@@ -114,6 +114,12 @@ def parse_args() -> argparse.Namespace:
         default=81,
         help="Number of frames per calibration sample",
     )
+    parser.add_argument(
+        "--calib-size",
+        type=int,
+        default=1,
+        help="Number of prompts to use for calibration (from OpenVid-1M dataset)",
+    )
     return parser.parse_args()
 
 
@@ -202,23 +208,46 @@ def build_sparse_config(args: argparse.Namespace) -> dict:
     return config
 
 
+def load_calib_prompts(calib_size: int) -> list[str]:
+    """Load calibration prompts from OpenVid-1M dataset.
+
+    Args:
+        calib_size: Number of prompts to load.
+
+    Returns:
+        List of prompt strings.
+    """
+    from datasets import load_dataset
+
+    dataset = load_dataset("nkp37/OpenVid-1M")
+    prompts = list(dataset["train"]["caption"][:calib_size])
+    print(f"Loaded {len(prompts)} calibration prompts from OpenVid-1M")
+    return prompts
+
+
 def build_calibration_forward_loop(
     pipeline: TI2VidTwoStagesPipeline,
     num_steps: int = 10,
     num_frames: int = 81,
+    calib_size: int = 1,
 ):
     """Build a forward loop for percentile calibration.
 
-    Generates a short video to collect normalized gap statistics across all
-    attention layers and timesteps.  One prompt is typically sufficient.
+    Runs inference on prompts from OpenVid-1M to collect normalized gap
+    statistics across all attention layers and timesteps.
+
+    Args:
+        pipeline: LTX-2 pipeline.
+        num_steps: Denoising steps per calibration sample.
+        num_frames: Frames per calibration sample (shorter = faster).
+        calib_size: Number of prompts to calibrate on.
     """
-    calib_prompts = [
-        "A serene lake at sunset with mountains in the background",
-    ]
+    calib_prompts = load_calib_prompts(calib_size)
     tiling_config = TilingConfig.default()
 
     def forward_loop(model):
-        for prompt in calib_prompts:
+        for i, prompt in enumerate(calib_prompts):
+            print(f"Calibration [{i + 1}/{len(calib_prompts)}]: {prompt[:60]}...")
             pipeline(
                 prompt=prompt,
                 negative_prompt=DEFAULT_NEGATIVE_PROMPT,
@@ -272,6 +301,7 @@ def main() -> None:
             pipeline,
             num_steps=args.calib_steps,
             num_frames=args.calib_frames,
+            calib_size=args.calib_size,
         )
 
     print("Applying skip-softmax sparse attention...")
