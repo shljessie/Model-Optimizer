@@ -1,15 +1,15 @@
 ---
 name: modelopt
-description: End-to-end model optimization pipeline that chains quantization with deployment or evaluation. Use when user says "optimize model end-to-end", "quantize and deploy", "quantize and evaluate", "quantize and benchmark accuracy", "full optimization loop", "find best quantization recipe", or wants to go from a pretrained model to a deployed or accuracy-verified quantized model. Do NOT use for individual tasks like only quantizing (use ptq), only deploying (use deployment), or only evaluating (use evaluation).
+description: End-to-end model optimization pipeline that chains quantization with deployment or evaluation. Use when user says "optimize model end-to-end", "quantize and deploy", "quantize and serve", "quantize and evaluate", "quantize and benchmark accuracy", "full optimization loop", "run the full pipeline", "optimize and test accuracy", "find best quantization recipe", or wants to go from a pretrained model to a deployed or accuracy-verified quantized model. Do NOT use for individual tasks like only quantizing (use ptq), only deploying (use deployment), or only evaluating (use evaluation).
+license: Apache-2.0
 ---
 
 # ModelOpt Optimizer — Pipeline Orchestrator
 
-Orchestrates optimization pipelines by chaining skills. Supports three modes:
+Orchestrates optimization pipelines by chaining skills. Supports two modes:
 
-1. **PTQ only** — quantize a model
-2. **PTQ + Deploy** — quantize then serve as an API endpoint
-3. **PTQ + Evaluate** — quantize then benchmark accuracy (evaluation handles deployment internally)
+1. **PTQ + Deploy** — quantize then serve as an API endpoint
+2. **PTQ + Evaluate** — quantize then benchmark accuracy (evaluation handles deployment internally)
 
 This skill delegates to sub-skills. **Do not duplicate their logic — invoke them.**
 
@@ -23,11 +23,12 @@ Determine which pipeline the user needs:
 
 | User says | Pipeline |
 |-----------|----------|
-| "quantize", "run PTQ" (no mention of deploy/eval) | PTQ only → invoke `ptq` skill directly |
 | "quantize and deploy", "quantize and serve" | PTQ + Deploy |
 | "quantize and evaluate", "optimize end-to-end", "find best recipe" | PTQ + Evaluate |
 
-If unclear, ask: **"After quantization, do you want to (a) deploy the model as a server, (b) evaluate accuracy, or (c) just get the checkpoint?"**
+If the user only wants quantization without deploy/eval, the `ptq` skill handles it directly — this skill should not be used.
+
+If unclear, ask: **"After quantization, do you want to (a) deploy the model as a server, (b) evaluate accuracy, or (c) just get the checkpoint?"** If they answer (c), hand off to the `ptq` skill.
 
 ## Step 1: Gather Info
 
