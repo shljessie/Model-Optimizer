@@ -1,6 +1,7 @@
 ---
 name: deployment
 description: Serve a quantized or unquantized LLM checkpoint as an OpenAI-compatible API endpoint using vLLM, SGLang, or TRT-LLM. Use when user says "deploy model", "serve model", "start vLLM server", "launch SGLang", "TRT-LLM deploy", "AutoDeploy", "benchmark throughput", "serve checkpoint", or needs an inference endpoint from a HuggingFace or ModelOpt-quantized checkpoint.
+license: Apache-2.0
 ---
 
 # Deployment Skill
@@ -190,6 +191,57 @@ python -m vllm.benchmark_serving \
 ```
 
 Report: throughput (tok/s), latency p50/p99, time to first token (TTFT).
+
+### 7. Remote deployment (SSH/SLURM)
+
+If a cluster config exists (`~/.config/modelopt/clusters.yaml` or `.claude/clusters.yaml`), or the user mentions running on a remote machine:
+
+1. **Source remote utilities:**
+
+   ```bash
+   source .claude/skills/common/remote_exec.sh
+   remote_load_cluster
+   remote_check_ssh
+   remote_detect_env
+   ```
+
+2. **Sync the checkpoint** (if it was produced locally):
+
+   ```bash
+   remote_sync_to <local_checkpoint_path> checkpoints/
+   ```
+
+3. **Deploy based on remote environment:**
+
+   - **SLURM** — write a job script that starts the server inside a container, then submit:
+
+     ```bash
+     srun --container-image="<container.sqsh>" \
+         --container-mounts="<data_root>:<data_root>" \
+         python -m vllm.entrypoints.openai.api_server \
+             --model <remote_checkpoint_path> \
+             --quantization modelopt \
+             --host 0.0.0.0 --port 8000
+     ```
+
+     Use `remote_submit_job` and `remote_poll_job` to manage the job. The server runs on the allocated node — get its hostname from `squeue -j $JOBID -o %N`.
+
+   - **Bare metal / Docker** — use `remote_run` to start the server directly:
+
+     ```bash
+     remote_run "nohup python -m vllm.entrypoints.openai.api_server --model <path> --port 8000 > deploy.log 2>&1 &"
+     ```
+
+4. **Verify remotely:**
+
+   ```bash
+   remote_run "curl -s http://localhost:8000/health"
+   remote_run "curl -s http://localhost:8000/v1/models"
+   ```
+
+5. **Report the endpoint** — include the remote hostname and port so the user can connect (e.g., `http://<node_hostname>:8000`). For SLURM, note that the port is only reachable from within the cluster network.
+
+For NEL-managed deployment (evaluation with self-deployment), use the evaluation skill instead — NEL handles SLURM container deployment, health checks, and teardown automatically.
 
 ## Error Handling
 

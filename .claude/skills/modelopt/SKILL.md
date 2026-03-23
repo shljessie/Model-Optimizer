@@ -34,11 +34,12 @@ If unclear, ask: **"After quantization, do you want to (a) deploy the model as a
 
 Collect from the user (skip what's already provided):
 
-1. **Model path** — local path or HuggingFace model ID
+1. **Model path** — local path or HuggingFace model ID (save this for baseline comparison in Step 4)
 2. **Quantization format** — e.g., fp8, nvfp4, int4_awq (or "recommend one")
-3. **GPU IDs** — which GPUs to use (default: `0`)
-4. For Deploy pipeline: **Deployment framework** — vLLM, SGLang, or TRT-LLM (default: vLLM)
-5. For Evaluate pipeline: **Evaluation tasks** — default: `mmlu`
+3. **Execution target** — local GPU or remote cluster. Check for `~/.config/modelopt/clusters.yaml` or `.claude/clusters.yaml`. If found, ask which cluster to use. Both sub-skills support remote execution via `remote_exec.sh`.
+4. **GPU IDs** — which GPUs to use (default: `0`; skip if remote — sub-skills handle GPU allocation via SLURM)
+5. For Deploy pipeline: **Deployment framework** — vLLM, SGLang, or TRT-LLM (default: vLLM)
+6. For Evaluate pipeline: **Evaluation tasks** — default: `mmlu`
 
 ## Step 2: Quantize
 
