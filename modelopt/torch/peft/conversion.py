@@ -42,7 +42,7 @@ def convert_to_peft_model(model: ModelLikeModule, config: PEFTConfig) -> Convert
     add_adapter(model, config)
 
     # Freeze base weights only for layers that have LoRA adapters applied
-    if config.freeze_base_layers:
+    if config.freeze_base_model:
         _freeze_base_weights_of_lora_layers(model)
 
     # Update gradient settings for LoRA parameters only
