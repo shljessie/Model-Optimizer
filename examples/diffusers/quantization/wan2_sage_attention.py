@@ -28,7 +28,7 @@ goes through SageAttention automatically.
 
 Requirements::
 
-    pip install sageattention diffusers transformers accelerate
+    pip install sageattention diffusers transformers accelerate ftfy
 
 Usage::
 
@@ -70,6 +70,10 @@ DEFAULT_NEGATIVE_PROMPT = "low quality, blurry, distorted, watermark, text, crop
 # when SageAttention can't handle a particular call (e.g. non-None attn_mask).
 _orig_sdpa = F.scaled_dot_product_attention
 
+# Call counters — reset by enable_sage_attention()
+_sage_calls: int = 0
+_fallback_calls: int = 0
+
 
 def _sageattn_sdpa_compat(
     query: torch.Tensor,
@@ -88,11 +92,13 @@ def _sageattn_sdpa_compat(
     - ``dropout_p > 0`` (training-time dropout)
     - Input dtype is not FP16 or BF16 (e.g. FP32 during VAE encoding/decoding)
     """
+    global _sage_calls, _fallback_calls
     if (
         attn_mask is not None
         or dropout_p > 0.0
         or query.dtype not in (torch.float16, torch.bfloat16)
     ):
+        _fallback_calls += 1
         return _orig_sdpa(
             query,
             key,
@@ -106,16 +112,28 @@ def _sageattn_sdpa_compat(
     # sageattn uses sm_scale instead of scale; tensors are (B, H, N, D) = "HND"
     from sageattention import sageattn
 
+    _sage_calls += 1
     return sageattn(query, key, value, tensor_layout="HND", is_causal=is_causal, sm_scale=scale)
+
+
+def print_sage_stats() -> None:
+    """Print how many attention calls went through sageattn vs fallback."""
+    total = _sage_calls + _fallback_calls
+    print(
+        f"[SageAttention] calls: {_sage_calls} sageattn, {_fallback_calls} fallback (total {total})"
+    )
 
 
 def enable_sage_attention() -> None:
     """Patch ``F.scaled_dot_product_attention`` globally with SageAttention."""
+    global _sage_calls, _fallback_calls
     try:
         import sageattention  # noqa: F401
     except ImportError as e:
         raise ImportError("SageAttention is not installed. Run: pip install sageattention") from e
 
+    _sage_calls = 0
+    _fallback_calls = 0
     F.scaled_dot_product_attention = _sageattn_sdpa_compat
     # Also patch the reference inside torch.nn.functional module object so
     # any code that imported SDPA directly still gets the patched version.
@@ -248,6 +266,7 @@ def main() -> None:
         # SageAttention pass
         enable_sage_attention()
         t_sage = run_inference(pipe, args, label="sage")
+        print_sage_stats()
         disable_sage_attention()
 
         print(f"\n{'=' * 50}")
@@ -262,6 +281,7 @@ def main() -> None:
     else:
         enable_sage_attention()
         run_inference(pipe, args, label="sage")
+        print_sage_stats()
         disable_sage_attention()
 
 
