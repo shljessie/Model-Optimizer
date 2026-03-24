@@ -12,15 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Forward hooks for estimating importance scores for pruning."""
 
-"""Export package for Hugging Face and Megatron-based models."""
+from modelopt.torch.utils import import_plugin
 
-from .convert_hf_config import *
-from .model_config import *
-from .model_config_export import *
-from .model_utils import *
-from .moe_utils import *
-from .plugins import *
-from .transformer_engine import *
-from .unified_export_hf import *
-from .unified_export_megatron import *
+from .base_hooks import *
+from .base_hooks_analysis import *
+
+with import_plugin("megatron_hooks"):
+    from .plugins.megatron_hooks import *
