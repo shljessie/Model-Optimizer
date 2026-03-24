@@ -35,6 +35,10 @@ NVIDIA Model Optimizer Changelog
 - Add support for block-granular RHT for non-power-of-2 dimensions.
 - Replace modelopt FP8 QDQ nodes with native ONNX QDQ nodes.
 
+**Deprecations**
+
+- Remove deprecated NeMo-2.0 Framework references.
+
 **Misc**
 
 - Migrated project metadata from ``setup.py`` to a fully declarative ``pyproject.toml``.
