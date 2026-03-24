@@ -15,6 +15,8 @@
 
 """PEFT conversion and restore utilities for LoRA modules."""
 
+import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from modelopt.torch.opt.conversion import ModelLikeModule, ModeloptStateManager
@@ -28,6 +30,7 @@ from .lora.layer import LoRAModule, LoRAModuleRegistry
 __all__ = [
     "freeze_lora_weights",
     "replace_lora_module",
+    "sync_lora_weights",
 ]
 
 
@@ -231,6 +234,30 @@ def unfreeze_lora_weights(model, *, layer_patterns=None, adapter_patterns=None):
         layer_patterns=layer_patterns,
         adapter_patterns=adapter_patterns,
     )
+
+
+def sync_lora_weights(model, group=None):
+    """Broadcast LoRA adapter weights from src rank 0 to all other ranks in the group.
+
+    This ensures LoRA weights are identical across data-parallel replicas after
+    random initialization. Should be called after LoRA adapters are added to the model.
+
+    Args:
+        model: Model containing LoRA modules to synchronize.
+        group: The process group to broadcast over (e.g., the data-parallel group).
+            If None, uses the default process group.
+    """
+    if not dist.is_initialized():
+        return
+
+    src = dist.get_global_rank(group, 0) if group is not None else 0
+
+    for _, module in model.named_modules():
+        if isinstance(module, LoRAModule):
+            for adapter in module._lora_adapters.values():
+                for submodule in ("lora_a", "lora_b"):
+                    for param in adapter[submodule].parameters():
+                        dist.broadcast(param.data, src=src, group=group)
 
 
 def _freeze_all_base_weights(model):

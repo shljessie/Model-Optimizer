@@ -126,6 +126,17 @@ class _MegatronParallelLoRABase(LoRAModule):
 
         super()._register_adapter(adapter_name, lora_a, lora_b, rank, scale, enable)
 
+        # Propagate the ``allreduce`` attribute from the base weight to LoRA parameters
+        # so that Megatron DDP uses the correct process group for gradient reduction
+        # and parameter hash checks (expert params use a different DP group).
+        # Force-set even if already present, since LoRA sub-layers (e.g. RowParallelLinear
+        # created as lora_a) default to allreduce=True and don't know they're inside an expert.
+        base_allreduce = getattr(self.weight, "allreduce", None)
+        if base_allreduce is not None:
+            for module in (lora_a, lora_b):
+                for param in module.parameters():
+                    setattr(param, "allreduce", base_allreduce)
+
 
 @LoRAModuleRegistry.register({ColumnParallelLinear: "megatron_ColumnParallelLinear"})
 class _LoRAMegatronColumnParallelLinear(_MegatronParallelLoRABase):
