@@ -44,6 +44,7 @@ class MlpInitMode(Enum):
     PruneByActivationsLog = "PruneByActivationsLog"
     ExpertRemoval = "ExpertRemoval"
     ConcatExpertsIntoDenseFFN = "ConcatExpertsIntoDenseFFN"
+    MoEChannelPruning = "MoEChannelPruning"
 
 
 class LinearInitMode(Enum):

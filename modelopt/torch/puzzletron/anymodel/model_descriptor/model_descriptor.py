@@ -161,6 +161,19 @@ class ModelDescriptor(ABC):
         raise NotImplementedError
 
     @staticmethod
+    def pruning_mixins() -> Dict[str, Any]:
+        """Return available pruning mixins for bypass distillation.
+
+        Override in subclasses to provide model-specific pruning mixins, e.g.
+        ``{"kv_heads": KVHeadsPruningMixIn(...), "experts_removal": ExpertRemovalPruningMixIn(...)}``.
+
+        Returns an empty dict by default so that descriptors that do not need
+        model-specific weight-slicing (e.g. Llama with standard FFN truncation)
+        can rely on the generic ``create_child_state_dict`` fallback path.
+        """
+        return {}
+
+    @staticmethod
     def uses_autocast() -> bool:
         """Whether this model supports torch.autocast.
 

@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 
 import modelopt.torch.puzzletron.activation_scoring.score_pruning_activations as score_pruning_activations
 import modelopt.torch.puzzletron.build_library_and_stats as build_library_and_stats
+import modelopt.torch.puzzletron.bypass_distillation as bypass_distillation
 import modelopt.torch.puzzletron.mip.mip_and_realize_models as mip_and_realize_models
 import modelopt.torch.puzzletron.pruning.pruning_ckpts as pruning_ckpts
 import modelopt.torch.puzzletron.scoring.scoring as scoring
@@ -61,6 +62,10 @@ def puzzletron(
     if dist.is_master():
         pruning_ckpts.launch_prune_ckpt(hydra_cfg)
     dist.barrier()
+
+    # Step 3: bypass distillation (optional, distributed processing)
+    if hydra_cfg.get("bypass", None) is not None:
+        bypass_distillation.launch_bypass_distillation(hydra_cfg)
 
     # Step 4: build_library_and_stats (single process)
     if dist.is_master():

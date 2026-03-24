@@ -22,7 +22,9 @@ particularly for DeciLM models.
 import concurrent.futures
 import dataclasses
 import fcntl
+import inspect
 import os
+import shutil
 import time
 import warnings
 from collections import defaultdict
@@ -368,6 +370,32 @@ def _build_safetensors_weight_map(
     return weight_map
 
 
+def _copy_auto_map_code_files(model_config: PretrainedConfig, checkpoint_dir: Path) -> None:
+    """Copy custom modeling Python files referenced in auto_map to the checkpoint directory.
+
+    PretrainedConfig.save_pretrained() only copies the config class's own source file.
+    This copies any additional files (e.g., modeling_*.py) also referenced in auto_map,
+    which are required when loading the checkpoint with trust_remote_code=True.
+    """
+    if not hasattr(model_config, "auto_map"):
+        return
+
+    # The config class's source file lives in the HF cache together with all other
+    # custom code files for this model. Walk the auto_map values to find every
+    # module file that needs to be present alongside config.json.
+    source_dir = Path(inspect.getfile(type(model_config))).parent
+
+    module_files = {
+        f"{class_ref.split('.')[0]}.py" for class_ref in model_config.auto_map.values()
+    }
+
+    for filename in module_files:
+        src = source_dir / filename
+        dst = Path(checkpoint_dir) / filename
+        if src.exists() and not dst.exists():
+            shutil.copy(src, dst)
+
+
 def save_model_config(model_config: PretrainedConfig, checkpoint_dir: Path | str) -> None:
     if hasattr(model_config, "block_configs"):
         model_config.block_configs = [
@@ -375,3 +403,4 @@ def save_model_config(model_config: PretrainedConfig, checkpoint_dir: Path | str
             for conf in model_config.block_configs
         ]
     model_config.save_pretrained(checkpoint_dir)
+    _copy_auto_map_code_files(model_config, Path(checkpoint_dir))
