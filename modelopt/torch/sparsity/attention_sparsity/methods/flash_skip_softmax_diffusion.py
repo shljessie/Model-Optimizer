@@ -141,19 +141,17 @@ class FlashSkipSoftmaxDiffusion(SparseAttentionMethod):
         total_blocks = num_block_rows * num_block_cols
 
         if self._calibration_mode:
-            # Block-level skip: a tile is skipped when ALL br rows have gap >= threshold,
-            # i.e., when min(gap across rows) >= threshold.
-            # Collect min-gap-per-block normalized by log(seq_k).
+            # Collect per-row normalized gaps for percentile calibration.
             # gap shape: [batch, heads, block_rows, br, block_cols]
-            min_gap = gap.min(dim=-2)[0]  # [batch, heads, block_rows, block_cols]
-            normalized_gap = min_gap / log_seq_k
+            # We collect ALL per-row gaps (not per-block min) because the
+            # percentile on per-row gaps produces the correct threshold for
+            # the block-level skip decision (skip block if ALL rows agree).
+            normalized_gap = gap / log_seq_k
 
-            # Exclude padded tiles
-            block_max_tile = block_max.min(dim=-2)[0]  # padded rows have dtype.min
-            valid_mask = block_max_tile > torch.finfo(attn_weights.dtype).min
+            # Exclude padded rows/tiles: padded positions have block_max = dtype.min
+            valid_mask = block_max > torch.finfo(attn_weights.dtype).min
             valid_gaps = normalized_gap[valid_mask].detach().float().cpu().numpy()
-            del gap, min_gap, normalized_gap, valid_mask, block_max, block_max_cummax
-            del block_max_tile
+            del gap, normalized_gap, valid_mask, block_max, block_max_cummax
 
             stats = {
                 "sparsity": [0.0],
