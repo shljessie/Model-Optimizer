@@ -47,10 +47,7 @@ def convert_to_peft_model(model: ModelLikeModule, config: PEFTConfig) -> Convert
     # Freeze base weights based on config flags (mutually exclusive)
     if config.freeze_base_layers:
         _freeze_base_weights_of_lora_layers(model)
-    elif config.freeze_base_model or (
-        config.freeze_base_model is None and config.freeze_base_layers is None
-    ):
-        # Default behavior: freeze all base model weights
+    elif config.freeze_base_model:
         _freeze_all_base_weights(model)
 
     # Update gradient settings for LoRA parameters only

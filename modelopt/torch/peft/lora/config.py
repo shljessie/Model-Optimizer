@@ -55,7 +55,8 @@ DENSE_LORA_CFG = {
 # Apply LoRA adapter per-layer in each local_expert
 MOE_LORA_CFG = {
     "adapter_type": "lora",
-    "freeze_base_layers": False,
+    "freeze_base_model": False,
+    "freeze_base_layers": True,
     "adapter_cfg": {
         "*": {"enable": False},
         "*local_experts*linear_fc1*": {"rank": 64, "enable": True},
@@ -64,7 +65,8 @@ MOE_LORA_CFG = {
 }
 MOE_LORA_RANDOM_INIT_CFG = {
     "adapter_type": "lora",
-    "freeze_base_layers": False,
+    "freeze_base_model": False,
+    "freeze_base_layers": True,
     "adapter_cfg": {
         "*": {"enable": False},
         "*local_experts*linear_fc1*": {
@@ -88,7 +90,8 @@ MOE_LORA_RANDOM_INIT_CFG = {
 
 MOE_PER_EXPERT_LORA_CFG = {
     "adapter_type": "lora",
-    "freeze_base_layers": False,
+    "freeze_base_model": False,
+    "freeze_base_layers": True,
     "adapter_cfg": {
         "*": {"enable": False},
         "*mlp.experts*": {"rank": 64, "enable": True},
@@ -99,7 +102,8 @@ MOE_PER_EXPERT_LORA_CFG = {
 
 MOE_PER_EXPERT_LORA_RANDOM_INIT_CFG = {
     "adapter_type": "lora",
-    "freeze_base_layers": False,
+    "freeze_base_model": False,
+    "freeze_base_layers": True,
     "adapter_cfg": {
         "*": {"enable": False},
         "*mlp.experts*": {

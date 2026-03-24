@@ -186,15 +186,14 @@ class PEFTConfig(ModeloptBaseConfig):
         validate_default=True,
     )
 
-    freeze_base_model: bool | None = ModeloptField(
-        default=None,
+    freeze_base_model: bool = ModeloptField(
+        default=True,
         title="Freeze all base model weights during training",
-        description="Whether to freeze all base model weights. Mutually exclusive with freeze_base_layers. "
-        "If neither is set, defaults to freeze_base_model=True.",
+        description="Whether to freeze all base model weights. Mutually exclusive with freeze_base_layers.",
     )
 
-    freeze_base_layers: bool | None = ModeloptField(
-        default=None,
+    freeze_base_layers: bool = ModeloptField(
+        default=False,
         title="Freeze base weights only for layers with LoRA adapters",
         description="Whether to freeze the base weights of only the layers that have LoRA adapters applied. "
         "Layers without LoRA adapters are left unchanged. Mutually exclusive with freeze_base_model.",
@@ -209,11 +208,11 @@ class PEFTConfig(ModeloptBaseConfig):
 
     @model_validator(mode="after")
     def validate_freeze_flags(self):
-        """Ensure freeze_base_model and freeze_base_layers are not both set."""
-        if self.freeze_base_model is not None and self.freeze_base_layers is not None:
+        """Ensure freeze_base_model and freeze_base_layers are not both enabled."""
+        if self.freeze_base_model and self.freeze_base_layers:
             raise ValueError(
                 "freeze_base_model and freeze_base_layers are mutually exclusive. "
-                "Set only one of them."
+                "Only one can be True."
             )
         return self
 
