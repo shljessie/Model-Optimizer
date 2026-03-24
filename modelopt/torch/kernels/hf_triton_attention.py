@@ -112,6 +112,8 @@ def triton_attention_forward(
             threshold = getattr(method, "skip_softmax_threshold", None)
             if threshold:
                 kw["skip_softmax_threshold"] = threshold
+            if getattr(method, "skip_softmax_normalize_by_seqlen", False):
+                kw["skip_softmax_normalize_by_seqlen"] = True
 
     o = attention(q, k, v, **kw)
 

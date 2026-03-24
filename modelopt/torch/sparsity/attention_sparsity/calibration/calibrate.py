@@ -28,7 +28,7 @@ from modelopt.torch.utils import get_module_device
 from ..config import CalibrationConfig
 from ..conversion import print_sparse_attention_summary
 from ..utils import get_named_sparse_attention_modules
-from .calibrator import DynamicThresholdCalibrator
+from .calibrator import DynamicThresholdCalibrator, PercentileThresholdCalibrator
 from .ruler_dataset import RulerDatasetBuilder
 
 
@@ -253,23 +253,40 @@ def calibrate_sparse_attention(
         print("No sparse attention modules found for calibration")
         return {}
 
+    # Detect method type from config to dispatch to the right calibrator
+    sparse_cfg = config.get("sparse_cfg", {})
+    method_name = None
+    for val in sparse_cfg.values():
+        if isinstance(val, dict) and "method" in val:
+            method_name = val["method"]
+            break
+    if method_name == "triton_skip_softmax_diffusion":
+        return _calibrate_diffusion(model, sparse_modules, calib_config, forward_loop)
+
     print(f"Calibrating {len(sparse_modules)} sparse attention modules together...")
 
-    # Extract tokenizer and build calibration data if needed
-    tokenizer = _extract_tokenizer_from_model(model)
+    # When a user-provided forward_loop is given, skip tokenizer extraction and
+    # RULER dataset generation entirely.
+    use_user_forward_loop = forward_loop is not None
+
+    tokenizer = None
     calibration_data = None
 
-    if calibrate_prefill or calibrate_decode:
-        builder = RulerDatasetBuilder(
-            samples=calib_config.samples,
-            max_seqlen=calib_config.max_seqlen,
-            tokenizer_name_or_path=tokenizer,
-            num_length_bins=calib_config.num_length_bins,
-            max_length_filter=int(calib_config.max_seqlen * 1.5),
-            cache_dir=calib_config.cache_dir,
-            data_dir=calib_config.data_dir,
-        )
-        calibration_data = builder.build_calibration_dataset()
+    if not use_user_forward_loop:
+        # Extract tokenizer and build calibration data
+        tokenizer = _extract_tokenizer_from_model(model)
+
+        if calibrate_prefill or calibrate_decode:
+            builder = RulerDatasetBuilder(
+                samples=calib_config.samples,
+                max_seqlen=calib_config.max_seqlen,
+                tokenizer_name_or_path=tokenizer,
+                num_length_bins=calib_config.num_length_bins,
+                max_length_filter=int(calib_config.max_seqlen * 1.5),
+                cache_dir=calib_config.cache_dir,
+                data_dir=calib_config.data_dir,
+            )
+            calibration_data = builder.build_calibration_dataset()
 
     # Initialize results
     calibration_results: dict[str, Any] = {}
@@ -280,15 +297,20 @@ def calibrate_sparse_attention(
         print("PREFILL PHASE CALIBRATION")
         print("=" * 60)
 
-        if calibration_data is None:
-            raise RuntimeError("calibration_data must be built before prefill")
-        prefill_forward_loop = forward_loop or create_calibration_forward_loop(
-            calibration_data, tokenizer, chunk_size=calib_config.chunk_size
-        )
+        if use_user_forward_loop:
+            prefill_forward_loop = forward_loop
+        else:
+            if calibration_data is None:
+                raise RuntimeError("calibration_data must be built before prefill")
+            assert tokenizer is not None
+            prefill_forward_loop = create_calibration_forward_loop(
+                calibration_data, tokenizer, chunk_size=calib_config.chunk_size
+            )
 
         prefill_calibrator = DynamicThresholdCalibrator(
             threshold_trials=calib_config.threshold_trials,
         )
+        assert prefill_forward_loop is not None
         prefill_result = prefill_calibrator.calibrate(model, prefill_forward_loop, phase="prefill")
 
         if "a" in prefill_result and "b" in prefill_result:
@@ -302,15 +324,20 @@ def calibrate_sparse_attention(
         print("DECODE PHASE CALIBRATION")
         print("=" * 60)
 
-        if calibration_data is None:
-            raise RuntimeError("calibration_data must be built before decode")
-        decode_forward_loop = create_decode_calibration_forward_loop(
-            calibration_data, tokenizer, num_decode_tokens=calib_config.num_decode_tokens
-        )
+        if use_user_forward_loop:
+            decode_forward_loop = forward_loop
+        else:
+            if calibration_data is None:
+                raise RuntimeError("calibration_data must be built before decode")
+            assert tokenizer is not None
+            decode_forward_loop = create_decode_calibration_forward_loop(
+                calibration_data, tokenizer, num_decode_tokens=calib_config.num_decode_tokens
+            )
 
         decode_calibrator = DynamicThresholdCalibrator(
             threshold_trials=calib_config.threshold_trials,
         )
+        assert decode_forward_loop is not None
         decode_result = decode_calibrator.calibrate(model, decode_forward_loop, phase="decode")
 
         if "a" in decode_result and "b" in decode_result:
@@ -362,4 +389,66 @@ def calibrate_sparse_attention(
         "calibration_params": calibration_params,
         "target_sparse_ratio": target_dict,
         "calibration_results": calibration_results,
+    }
+
+
+def _calibrate_diffusion(
+    model: nn.Module,
+    sparse_modules: list[tuple[str, Any]],
+    calib_config: CalibrationConfig,
+    forward_loop: Callable | None,
+) -> dict[str, Any]:
+    """Calibrate sparse attention for diffusion models using percentile method.
+
+    Args:
+        model: Model with sparse attention modules
+        sparse_modules: Named sparse attention modules
+        calib_config: Calibration configuration
+        forward_loop: User-provided forward loop (required for diffusion models)
+
+    Returns:
+        Dictionary with calibration results
+    """
+    if forward_loop is None:
+        raise ValueError(
+            "forward_loop is required for triton_skip_softmax_diffusion calibration. "
+            "Provide a callable that runs the diffusion model forward pass."
+        )
+
+    target_dict = calib_config.target_sparse_ratio
+    target_sparsity = target_dict.get("prefill", 0.2)
+
+    if target_sparsity <= 0.0:
+        print("Target prefill sparsity is 0.0, skipping calibration")
+        return {}
+
+    print(f"\nCalibrating {len(sparse_modules)} sparse attention modules (diffusion percentile)...")
+
+    calibrator = PercentileThresholdCalibrator()
+    result = calibrator.calibrate(
+        model, forward_loop, phase="prefill", target_sparsity=target_sparsity
+    )
+
+    if "threshold" not in result:
+        warnings.warn("Percentile calibration did not produce valid results")
+        return {}
+
+    # Apply calibration params to all modules
+    calibration_params: dict[str, dict[str, float]] = {
+        "prefill": {"threshold": result["threshold"]}
+    }
+
+    print(f"\nApplying percentile calibration to {len(sparse_modules)} modules:")
+    print(f"  prefill: threshold={result['threshold']:.6f}, target={target_sparsity:.0%}")
+
+    for _, module in sparse_modules:
+        module._sparse_method_instance.calibration_params = calibration_params
+        module._sparse_method_instance.target_sparse_ratio = target_dict
+
+    print_sparse_attention_summary(model)
+
+    return {
+        "calibration_params": calibration_params,
+        "target_sparse_ratio": target_dict,
+        "calibration_results": {"prefill": result},
     }

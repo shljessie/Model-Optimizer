@@ -106,7 +106,7 @@ def _attn_fwd(
     HEAD_DIM: tl.constexpr,  # Actual head dimension (for d_mask)
     STORE_LSE: tl.constexpr,  # Whether to save LSE for backward pass
     APPLY_SKIP_SOFTMAX: tl.constexpr = False,  # Skip KV tiles with negligible scores
-    SKIP_THRESHOLD_LOG2: tl.constexpr = 0.0,  # log2(threshold) for skip decision
+    skip_threshold_log2=0.0,  # Effective log2-space threshold (regular param, not constexpr)
 ):
     # --- Grid: (batch, num_q_heads, num_q_tiles) ---
     # Example: batch=2, num_q_heads=32, seq_len=256, BLOCK_M=128
@@ -168,7 +168,7 @@ def _attn_fwd(
             # --- Skip-softmax path: check tile, skip V load if all rows negligible ---
             # Compute tile row max once — reused for both skip check and softmax update
             tile_row_max = tl.max(scores, 1)  # [BLOCK_M]
-            can_skip = tile_row_max < (row_max + SKIP_THRESHOLD_LOG2)
+            can_skip = tile_row_max < (row_max + skip_threshold_log2)
             all_skip = tl.min(can_skip.to(tl.int32)) == 1
 
             if not all_skip:
@@ -309,7 +309,7 @@ def _attn_bwd_dq(
     IS_CAUSAL: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     APPLY_SKIP_SOFTMAX: tl.constexpr = False,
-    SKIP_THRESHOLD_LOG2: tl.constexpr = 0.0,
+    skip_threshold_log2=0.0,
 ):
     """Phase 3 of backward: compute dQ for one Q tile, looping over KV tiles.
 
@@ -380,7 +380,7 @@ def _attn_bwd_dq(
         # Re-apply skip-softmax: zero out rows that were skipped in forward
         if APPLY_SKIP_SOFTMAX:
             tile_row_max = tl.max(scores, 1)
-            can_skip = tile_row_max < (lse + SKIP_THRESHOLD_LOG2)
+            can_skip = tile_row_max < (lse + skip_threshold_log2)
             p = tl.where(can_skip[:, None], 0.0, p)
 
         # dP = dO @ V^T, dS = P * (dP - delta), dQ += dS @ K
@@ -431,7 +431,7 @@ def _attn_bwd_dkdv(
     IS_CAUSAL: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     APPLY_SKIP_SOFTMAX: tl.constexpr = False,
-    SKIP_THRESHOLD_LOG2: tl.constexpr = 0.0,
+    skip_threshold_log2=0.0,
 ):
     """Phase 2 of backward: compute dK, dV for one KV tile.
 
@@ -510,7 +510,7 @@ def _attn_bwd_dkdv(
             # Re-apply skip-softmax: zero out rows that were skipped in forward
             if APPLY_SKIP_SOFTMAX:
                 tile_row_max = tl.max(scores, 1)
-                can_skip = tile_row_max < (lse + SKIP_THRESHOLD_LOG2)
+                can_skip = tile_row_max < (lse + skip_threshold_log2)
                 p = tl.where(can_skip[:, None], 0.0, p)
 
             # dV += P^T @ dO
@@ -545,6 +545,7 @@ class _Attention(torch.autograd.Function):
         b_seq_len_k,
         max_input_len_k,
         skip_softmax_threshold,
+        skip_softmax_normalize_by_seqlen,
     ):
         HEAD_DIM = q.shape[2]
         num_q_heads = q.shape[1]
@@ -565,12 +566,20 @@ class _Attention(torch.autograd.Function):
         # Triton tiles must be powers of 2; pad head dim
         BLOCK_D = triton.next_power_of_2(HEAD_DIM)
 
-        # Skip-softmax: convert threshold to log2 space for the kernel
+        # Skip-softmax: convert threshold to log2 space for the kernel.
+        # Two modes:
+        #   LLM (default): skip_threshold_log2 = log2(threshold)
+        #     Skip if tile_row_max < row_max + log2(threshold)
+        #   Diffusion (normalize_by_seqlen=True): skip_threshold_log2 = -threshold * log2(seq_k)
+        #     Equivalent to: skip if gap >= threshold * log(seq_k)  (sequence-length-invariant)
         apply_skip = skip_softmax_threshold is not None and skip_softmax_threshold > 0.0
         if apply_skip:
             import math
 
-            skip_threshold_log2 = math.log2(skip_softmax_threshold)
+            if skip_softmax_normalize_by_seqlen:
+                skip_threshold_log2 = -skip_softmax_threshold * math.log2(max_input_len_k)
+            else:
+                skip_threshold_log2 = math.log2(skip_softmax_threshold)
         else:
             skip_threshold_log2 = 0.0
 
@@ -609,7 +618,7 @@ class _Attention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM,
             STORE_LSE=True,
             APPLY_SKIP_SOFTMAX=apply_skip,
-            SKIP_THRESHOLD_LOG2=skip_threshold_log2,
+            skip_threshold_log2=skip_threshold_log2,
             # BLOCK_M, BLOCK_N, num_warps, num_stages chosen by autotune
         )
 
@@ -701,7 +710,7 @@ class _Attention(torch.autograd.Function):
             IS_CAUSAL=ctx.is_causal,
             HEAD_DIM=HEAD_DIM,
             APPLY_SKIP_SOFTMAX=ctx.apply_skip,
-            SKIP_THRESHOLD_LOG2=ctx.skip_threshold_log2,
+            skip_threshold_log2=ctx.skip_threshold_log2,
             num_warps=num_warps,
             num_stages=1,
         )
@@ -722,12 +731,12 @@ class _Attention(torch.autograd.Function):
             IS_CAUSAL=ctx.is_causal,
             HEAD_DIM=HEAD_DIM,
             APPLY_SKIP_SOFTMAX=ctx.apply_skip,
-            SKIP_THRESHOLD_LOG2=ctx.skip_threshold_log2,
+            skip_threshold_log2=ctx.skip_threshold_log2,
             num_warps=num_warps,
             num_stages=1,
         )
 
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def attention(
@@ -744,6 +753,7 @@ def attention(
     max_input_len_k: int | None = None,
     *,
     skip_softmax_threshold: float | None = None,
+    skip_softmax_normalize_by_seqlen: bool = False,
 ) -> torch.Tensor:
     """Variable-length flash attention with GQA, autograd, and optional skip-softmax.
 
@@ -766,6 +776,12 @@ def attention(
             load or accumulation). Set to ``None`` or ``0`` to disable.
             Typical values: 1e-3 to 1e-1. The backward pass re-applies
             the same skip decision using the saved LSE for consistency.
+        skip_softmax_normalize_by_seqlen: When True (diffusion mode), the
+            threshold is interpreted as a normalized gap value and converted
+            via ``-threshold * log2(seq_k)``. This makes the skip decision
+            sequence-length-invariant: ``skip if gap >= threshold * log(seq_k)``.
+            When False (default, LLM mode), the threshold is converted via
+            ``log2(threshold)`` for a fixed-ratio comparison.
 
     Returns:
         Output tensor [total_q_tokens, num_q_heads, head_dim].
@@ -784,6 +800,7 @@ def attention(
         b_seq_len_k,
         max_input_len_k,
         skip_softmax_threshold,
+        skip_softmax_normalize_by_seqlen,
     )
 
 

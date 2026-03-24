@@ -15,6 +15,8 @@
 
 """Dynamic sparse attention registration for HuggingFace models."""
 
+import warnings
+
 import torch.nn as nn
 import transformers
 
@@ -102,7 +104,8 @@ def register_sparse_attention_on_the_fly(model: nn.Module) -> bool:
 def _is_supported_model(model: nn.Module) -> bool:
     """Check if model is supported for sparse attention.
 
-    Supports HuggingFace PreTrainedModel and any PyTorch model with attention modules.
+    Supports HuggingFace PreTrainedModel, diffusers ModelMixin,
+    and any PyTorch model with attention modules.
 
     Args:
         model: Model to check
@@ -117,9 +120,57 @@ def _is_supported_model(model: nn.Module) -> bool:
     except ImportError:
         pass
 
+    # Check for diffusers ModelMixin
+    try:
+        from diffusers.models.modeling_utils import ModelMixin
+
+        if isinstance(model, ModelMixin):
+            return True
+    except ImportError:
+        pass
+
     # Support any PyTorch model with attention modules
     return isinstance(model, nn.Module)
 
 
+def validate_eager_attention(model: nn.Module) -> None:
+    """Validate and enforce eager attention for HuggingFace models.
+
+    Sparse attention requires attn_implementation='eager' because it
+    patches torch.nn.functional.softmax, which is only called in eager mode.
+
+    Diffusers models use a backend registry instead of ``_attn_implementation``
+    and are handled by the eager backend registration in ``conversion.py``,
+    so they are skipped here.
+
+    Args:
+        model: Model to validate
+    """
+    # Skip diffusers models — they use backend registry, not _attn_implementation
+    try:
+        from diffusers.models.modeling_utils import ModelMixin
+
+        if isinstance(model, ModelMixin):
+            return
+    except ImportError:
+        pass
+
+    if not isinstance(model, transformers.PreTrainedModel):
+        return
+
+    attn_impl = getattr(model.config, "_attn_implementation", None)
+    if attn_impl and attn_impl not in ("eager", "modelopt_triton"):
+        warnings.warn(
+            f"Sparse attention requires attn_implementation='eager' or 'modelopt_triton', "
+            f"but model uses '{attn_impl}'. Forcing eager attention implementation."
+        )
+        model.config._attn_implementation = "eager"
+
+
 # Register plugins
-CUSTOM_MODEL_PLUGINS.append(register_sparse_attention_on_the_fly)
+CUSTOM_MODEL_PLUGINS.extend(
+    [
+        validate_eager_attention,
+        register_sparse_attention_on_the_fly,
+    ]
+)

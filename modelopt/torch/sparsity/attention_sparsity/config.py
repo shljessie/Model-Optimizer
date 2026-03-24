@@ -458,9 +458,32 @@ SKIP_SOFTMAX_TRITON_DEFAULT = {
 }
 
 
+# Pre-defined configuration for diffusion models with Triton kernel and percentile calibration.
+# Uses gap/log(seq_k) normalization for sequence-length-invariant thresholds.
+# Calibration uses eager attention; inference uses Triton FA kernel.
+SKIP_SOFTMAX_DIFFUSION_CALIB = {
+    "sparse_cfg": {
+        "calibration": {
+            "target_sparse_ratio": {"prefill": 0.2},
+        },
+        "*attn*": {
+            "method": "triton_skip_softmax_diffusion",
+            "br": 128,
+            "bc": 128,
+            "backend": "triton",
+            "is_causal": False,
+            "collect_stats": True,
+            "enable": True,
+        },
+        "default": {"enable": False},
+    },
+}
+
+
 __all__ = [
     "SKIP_SOFTMAX_CALIB",
     "SKIP_SOFTMAX_DEFAULT",
+    "SKIP_SOFTMAX_DIFFUSION_CALIB",
     "SKIP_SOFTMAX_TRITON_DEFAULT",
     "CalibrationConfig",
     "FlashSkipSoftmaxConfig",
