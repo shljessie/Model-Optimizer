@@ -537,7 +537,9 @@ def local_hessian_calibrate(
             if not self.is_enabled:
                 return
 
-            h_batch, num_tokens = compute_input_hessian(input_tensor, self.cin, self.block_size)
+            h_batch, num_tokens = compute_activation_hessian(
+                input_tensor, self.cin, self.block_size
+            )
             self.hessian_per_block += h_batch
             self.num_samples += num_tokens
 
@@ -568,13 +570,7 @@ def local_hessian_calibrate(
             out = self._forward_no_local_hessian(input, *args, **kwargs)
 
             if self.hessian_helper.is_enabled:
-                hessian_input = self.input_quantizer(input)
-                hessian_input = (
-                    hessian_input.to_local()
-                    if hasattr(hessian_input, "to_local")
-                    else hessian_input
-                )
-                self.hessian_helper.accumulate_hessian(hessian_input)
+                self.hessian_helper.accumulate_hessian(self.input_quantizer(input))
 
             return out
 
@@ -1601,7 +1597,7 @@ def _print_relative_mse_error(q: torch.Tensor, w: torch.Tensor, h: torch.Tensor,
     print(f"[{module_name}] Relative MSE error: {mse.item():.2e}")
 
 
-def compute_input_hessian(
+def compute_activation_hessian(
     input_tensor: torch.Tensor, in_features: int, block_size: int | None = None
 ) -> tuple[torch.Tensor, int]:
     """Compute Hessian (or block-diagonal Hessian) from input activations.
@@ -1640,7 +1636,7 @@ def update_hessian(input, hessian, n_samples):
     Returns:
         Tuple of (updated_hessian, new_sample_count)
     """
-    h_batch, num_tokens = compute_input_hessian(input, input.shape[-1])
+    h_batch, num_tokens = compute_activation_hessian(input, input.shape[-1])
 
     hessian *= n_samples / (n_samples + num_tokens)
     n_samples += num_tokens
