@@ -143,7 +143,6 @@ from pydantic import ValidationInfo, field_validator, model_validator
 
 from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
 from modelopt.torch.utils.network import ConstructorLike
-import copy
 
 _default_disabled_quantizer_cfg = {
     "nn.BatchNorm1d": {"*": {"enable": False}},
@@ -504,6 +503,7 @@ MAMBA_MOE_NVFP4_CONSERVATIVE_CFG = {
     },
     "algorithm": "max",
 }
+
 
 NVFP4_AWQ_LITE_CFG = {
     "quant_cfg": {

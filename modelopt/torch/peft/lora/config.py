@@ -86,37 +86,7 @@ MOE_LORA_RANDOM_INIT_CFG = {
     },
 }
 
-# Apply LoRA adapters per local_experts, NOT per-layer
 
-MOE_PER_EXPERT_LORA_CFG = {
-    "adapter_type": "lora",
-    "freeze_base_model": False,
-    "freeze_base_layers": True,
-    "adapter_cfg": {
-        "*": {"enable": False},
-        "*mlp.experts*": {"rank": 64, "enable": True},
-        "*linear_fc1*": {"enable": False},
-        "*linear_fc2*": {"enable": False},
-    },
-}
-
-MOE_PER_EXPERT_LORA_RANDOM_INIT_CFG = {
-    "adapter_type": "lora",
-    "freeze_base_model": False,
-    "freeze_base_layers": True,
-    "adapter_cfg": {
-        "*": {"enable": False},
-        "*mlp.experts*": {
-            "rank": 64,
-            "enable": True,
-            "scale": 1,
-            "lora_a_init": init.kaiming_uniform_,
-            "lora_b_init": init.kaiming_uniform_,
-        },
-        "*linear_fc1*": {"enable": False},
-        "*linear_fc2*": {"enable": False},
-    },
-}
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -124,6 +94,4 @@ LORA_CFG_CHOICES: dict[str, dict] = {
     "dense": DENSE_LORA_CFG,
     "moe": MOE_LORA_CFG,
     "moe_random": MOE_LORA_RANDOM_INIT_CFG,
-    "moe_per_expert": MOE_PER_EXPERT_LORA_CFG,
-    "moe_per_expert_random": MOE_PER_EXPERT_LORA_RANDOM_INIT_CFG,
 }
