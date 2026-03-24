@@ -123,16 +123,16 @@ def calculate_subblock_stats(
         synth_dataset_num_requests = calc_subblock_stats_config.get("runtime_stats", {}).get(
             "synth_dataset_num_requests", 200
         )
-        backend = calc_subblock_stats_config.get("runtime_stats", {}).get("backend", "trt_torch")
+        runtime_stats_config = calc_subblock_stats_config.get("runtime_stats", {})
         runtime_by_subblock_dict, non_block_runtime_ms = calc_runtime_for_subblocks(
             subblock_configs_nolayerindex,
+            runtime_stats_config,
             vocab_size,
             n_embd,
             n_head,
             master_puzzle_dir,
             teacher_dir,
             synth_dataset_num_requests,
-            backend,
             prefill_seq_len,
             generation_seq_len,
         )

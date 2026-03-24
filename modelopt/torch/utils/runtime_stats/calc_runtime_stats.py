@@ -1,9 +1,10 @@
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-import subprocess
 
 import torch
+from omegaconf import DictConfig
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -36,6 +37,7 @@ def create_benchmark_model(
     if block_config:
         block_configs.extend([block_config] * repeat_block_n_times)
 
+    print("|||| Creating benchmark model...")
     model_config = DeciLMConfig(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
@@ -49,24 +51,25 @@ def create_benchmark_model(
             "AutoModelForCausalLM": "modeling_decilm.DeciLMForCausalLM",
         },
     )
+    print(f"|||| Created DeciLM config with {len(block_configs)} layers")
 
     model = DeciLMForCausalLM(model_config)
     return model
 
 
-def _save_model(model: DeciLMForCausalLM,
-                tokenizer_path: Path,
-                output_path: Path) -> None:
+def _save_model(model: DeciLMForCausalLM, tokenizer_path: Path, output_path: Path) -> None:
 
     model.to(dtype=torch.bfloat16).save_pretrained(output_path)
     AutoTokenizer.from_pretrained(tokenizer_path).save_pretrained(output_path)
 
 
-def _generate_dataset(tokenizer_path: str,
-                      synth_dataset_num_requests: int,
-                      prefill_seq_len: int,
-                      generation_seq_len: int,
-                      output_dir: str) -> None:
+def _generate_dataset(
+    tokenizer_path: str,
+    synth_dataset_num_requests: int,
+    prefill_seq_len: int,
+    generation_seq_len: int,
+    output_dir: str,
+) -> None:
 
     args = [
         f"--tokenizer={tokenizer_path}",
@@ -78,7 +81,11 @@ def _generate_dataset(tokenizer_path: str,
     ]
     output_filepath = output_dir / "dataset.txt"
     with open(output_filepath, "w") as f:
-        subprocess.run(["python", "/app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py"] + args, stdout=f, check=True)
+        subprocess.run(
+            ["python", "/app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py"] + args,
+            stdout=f,
+            check=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -95,11 +102,14 @@ class RuntimeConfig:
     generation_seq_len: int = 100
 
 
-def calc_subblock_runtime(runtime_config: RuntimeConfig,
-                          subblock_config: SubblockConfig) -> float:
+def calc_subblock_runtime(
+    runtime_config: RuntimeConfig,
+    subblock_config: SubblockConfig,
+) -> float:
 
-    if not isinstance(subblock_config, AttentionConfig) and \
-       not isinstance(subblock_config, FFNConfig):
+    if not isinstance(subblock_config, AttentionConfig) and not isinstance(
+        subblock_config, FFNConfig
+    ):
         raise Exception("Runtime stats:Not supported subblock type")
 
     model = create_benchmark_model(
@@ -112,12 +122,50 @@ def calc_subblock_runtime(runtime_config: RuntimeConfig,
     model_tmpdir = Path(tempfile.mkdtemp())
     _save_model(model, Path(runtime_config.tokenizer_path), model_tmpdir)
 
-    synth_dataset_tmpdir = Path(tempfile.mkdtemp())
-    _generate_dataset(runtime_config.tokenizer_path,
-                      runtime_config.synth_dataset_num_requests,
-                      runtime_config.prefill_seq_len,
-                      runtime_config.generation_seq_len,
-                      synth_dataset_tmpdir)
+    # synth_dataset_tmpdir = Path(tempfile.mkdtemp())
+    # _generate_dataset(runtime_config.tokenizer_path,
+    #                   runtime_config.synth_dataset_num_requests,
+    #                   runtime_config.prefill_seq_len,
+    #                   runtime_config.generation_seq_len,
+    #                   synth_dataset_tmpdir)
+
+    # import argparse
+
+    # def run_vllm_latency_benchmark():
+
+    #     from vllm.benchmarks.latency import add_cli_args
+    #     from vllm.benchmarks.latency import main as vllm_main
+
+    #     parser = argparse.ArgumentParser()
+    #     add_cli_args(parser)
+    #     args = parser.parse_args(
+    #         [
+    #             "--model",
+    #             "meta-llama/Llama-3.1-8B-Instruct",
+    #             "--input-len",
+    #             "32",
+    #             "--output-len",
+    #             "128",
+    #             "--batch-size",
+    #             "8",
+    #         ]
+    #     )
+    #     vllm_main(args)
+
+    # print("|||| Running vllm latency benchmark...")
+    # run_vllm_latency_benchmark()
+    # print("|||| VLLM latency benchmark completed.")
+    # # args = argparse.Namespace(
+    # #     model=model_tmpdir,
+    # #     tokenizer=runtime_config.tokenizer_path,
+    # #     input_len=runtime_config.prefill_seq_len,
+    # #     output_len=runtime_config.generation_seq_len,
+    # #     batch_size=1,  # runtime_config.batch_size,
+    # # )
+
+    # # from vllm.benchmarks.latency import main as run_vllm_latency_benchmark
+
+    # # run_vllm_latency_benchmark(args)
 
     subblock_total_runtime_ms = 1.0
 
@@ -130,13 +178,13 @@ def calc_baseline_runtime(runtime_config: RuntimeConfig, subblock_config: Subblo
 
 def calc_runtime_for_subblocks(
     subblock_config_set: set[SubblockConfig],
+    runtime_stats_config: DictConfig,
     vocab_size: int,
     hidden_size: int,
     num_attention_heads: int,
     master_puzzle_dir: str,
     tokenizer_path: str,
     synth_dataset_num_requests: int,
-    backend: str,
     prefill_seq_len: int,
     generation_seq_len: int,
 ) -> tuple[dict[SubblockConfig, float], float]:
@@ -149,7 +197,6 @@ def calc_runtime_for_subblocks(
         master_puzzle_dir,
         tokenizer_path,
         synth_dataset_num_requests,
-        backend,
         repeat_block_n_times,
         prefill_seq_len,
         generation_seq_len,
