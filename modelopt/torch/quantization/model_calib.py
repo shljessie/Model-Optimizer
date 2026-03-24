@@ -44,6 +44,7 @@ from .utils import (
     enable_fake_quant,
     enable_quant,
     enable_weight_access_and_writeback,
+    is_quantized_bmm,
     is_quantized_column_parallel_linear,
     is_quantized_linear,
     is_quantized_row_parallel_linear,
@@ -75,6 +76,13 @@ def filter_calib_modules(
     Disabled quantizers retain their pre-existing ``_amax`` values because
     :meth:`TensorQuantizer.disable` does not clear ``_amax``.
 
+    Supported module types:
+
+    * Quantized linear modules (identified by :func:`is_quantized_linear`): all child
+      TensorQuantizers are disabled.
+    * Quantized attention modules (identified by :func:`is_quantized_bmm`): only the direct
+      bmm TensorQuantizer attributes are disabled.
+
     Args:
         model: The quantized model.
         include_modules: If provided, only modules whose names match at least one fnmatch pattern
@@ -105,9 +113,20 @@ def filter_calib_modules(
 
     disabled = []
     for name, module in model.named_modules():
-        if is_quantized_linear(module) and not _should_calibrate(name):
+        if _should_calibrate(name):
+            continue
+        if is_quantized_linear(module):
             for _, child in module.named_modules():
                 if isinstance(child, TensorQuantizer) and not child._disabled:
+                    child.disable()
+                    disabled.append(child)
+        elif is_quantized_bmm(module):
+            for attr_name, child in module._modules.items():
+                if (
+                    attr_name.endswith("_bmm_quantizer")
+                    and isinstance(child, TensorQuantizer)
+                    and not child._disabled
+                ):
                     child.disable()
                     disabled.append(child)
     try:

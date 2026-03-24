@@ -32,6 +32,23 @@ from modelopt.torch.utils import get_unwrapped_name, print_rank_0
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+__all__ = [
+    "EXPORT_MODE",
+    "convert_quantization_axis_to_reduce_axis",
+    "export_torch_mode",
+    "is_quantized",
+    "is_quantized_bmm",
+    "is_quantized_column_parallel_linear",
+    "is_quantized_linear",
+    "is_quantized_row_parallel_linear",
+    "reduce_amax",
+    "reduce_sum",
+    "replace_function",
+    "update_quant_cfg_with_kv_cache_quant",
+    "weight_attr_names",
+]
+
+
 
 def reduce_block_amax(input_tensor: torch.Tensor, block_sizes: dict):
     """Computes the amax of the input tensor using block-based reduction for each dimension.
@@ -275,6 +292,16 @@ def is_quantized_linear(module):
             # module.weight0 check is required to support TEGroupedLinear
             or (getattr(module, "weight0", None) is not None and module.weight0.dim() == 2)
         )
+    )
+
+
+def is_quantized_bmm(module):
+    """Check if a module is a quantized module with bmm quantizers."""
+    from .nn import TensorQuantizer
+
+    return any(
+        attr_name.endswith("_bmm_quantizer") and isinstance(child, TensorQuantizer)
+        for attr_name, child in module._modules.items()
     )
 
 
