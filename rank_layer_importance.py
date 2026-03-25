@@ -16,7 +16,6 @@
 """Estimate per-layer importance by comparing final hidden states with a full-model reference."""
 
 import argparse
-import pickle
 from collections import defaultdict
 
 import torch
@@ -138,6 +137,7 @@ class LastHiddenImportanceHook(torch.nn.Module):
     """Forward hook on final norm: stores reference hiddens, then MSE/logits distance vs. reference."""
 
     def __init__(self, module, name, nlast_tokens=0):
+        """Initialize hook with module and name; store reference hiddens, logits, and hook."""
         super().__init__()
 
         self.forward_hook = module.register_forward_hook(self.hook_fn, with_kwargs=False)
@@ -369,7 +369,10 @@ def estimate_layer_importance(args: argparse.Namespace):
 
     # Prepare model
     def patch_model(layer_id, block="transformer"):
-        """No-op if ``layer_id < 0``; otherwise replace local decoder block forward with identity. Returns original forward."""
+        """No-op if ``layer_id < 0``; otherwise replace local decoder block forward with identity.
+
+        Returns original forward.
+        """
         if layer_id == -1:
             return None
         patch_register = unwrapped_model.decoder.layers[layer_id].forward
@@ -453,8 +456,7 @@ def estimate_layer_importance(args: argparse.Namespace):
     if is_pipeline_last_stage() and get_data_parallel_rank() == 0:
         scores = collect_scores(unwrapped_model)
         assert scores is not None
-        with open(f"scores_{get_pipeline_model_parallel_rank()}.p", "wb") as f:
-            pickle.dump(scores, f)
+        torch.save(scores, f"scores_{get_pipeline_model_parallel_rank()}.pt")
 
 
 if __name__ == "__main__":
