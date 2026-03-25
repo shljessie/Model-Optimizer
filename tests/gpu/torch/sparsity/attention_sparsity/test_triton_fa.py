@@ -474,15 +474,20 @@ class TestSkipSoftmax:
         )
         torch.testing.assert_close(out_skip, out_dense, rtol=5e-2, atol=5e-2)
 
-    def test_large_threshold_differs_from_dense(self):
-        """A large threshold (0.5) should produce noticeably different output."""
+    def test_large_threshold_close_to_dense(self):
+        """V1 skip-softmax (no v_mean_cache) only skips at tile level.
+
+        With random data, all_skip is rare (requires all 128 rows to agree),
+        so V1 output is close to dense. The skip only drops entire tiles
+        where ALL rows agree the tile is negligible.
+        """
         q, k, v, locs, lens = self._make_inputs(seq_len=512)
         scale = 1.0 / (64**0.5)
         out_dense = attention(q, k, v, locs, lens, 512, softmax_scale=scale)
         out_skip = attention(
             q, k, v, locs, lens, 512, softmax_scale=scale, skip_softmax_threshold=0.5
         )
-        assert not torch.allclose(out_skip, out_dense, atol=1e-3)
+        torch.testing.assert_close(out_skip, out_dense, rtol=5e-2, atol=5e-2)
 
     def test_output_shape_unchanged(self):
         """Skip-softmax does not change output shape."""
@@ -598,3 +603,188 @@ class TestSkipSoftmaxHFIntegration:
         assert not torch.isinf(logits_skip).any(), "Inf in skip-softmax logits"
         # On short sequences (64 tokens), no tiles are skipped — output should match dense
         torch.testing.assert_close(logits_skip, logits_dense, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not TRITON_KERNEL_AVAILABLE, reason="Need CUDA + triton")
+class TestSkipSoftmaxV25:
+    """V2.51 pool-K approximate weight + precomputed v_mean tests."""
+
+    def _make_inputs(
+        self,
+        batch=1,
+        seq_len=2048,
+        num_heads=4,
+        num_kv_heads=4,
+        head_dim=64,
+        dtype=torch.float32,
+    ):
+        """Create diffusion-like Q/K/V with moderate clustering.
+
+        Q tokens cluster near a centroid so that most KV tiles are fully skipped
+        by all query rows, exercising the V2.51 all_skip path. A few 'hot' K
+        tiles are aligned with the centroid; the rest are random background.
+        """
+        total = batch * seq_len
+        BLOCK_N = 64
+        torch.manual_seed(42)
+        centroid = torch.randn(1, 1, head_dim, device="cuda", dtype=dtype)
+        q = centroid.expand(total, num_heads, head_dim) + torch.randn(
+            total, num_heads, head_dim, device="cuda", dtype=dtype
+        ) * 0.8
+        k = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=dtype) * 0.5
+        # Make 2 tiles aligned (but not perfectly) with Q
+        for tile_i in [0, 5]:
+            s = tile_i * BLOCK_N
+            k[s : s + BLOCK_N] = centroid.expand(
+                BLOCK_N, num_kv_heads, head_dim
+            ) + torch.randn(BLOCK_N, num_kv_heads, head_dim, device="cuda", dtype=dtype) * 0.5
+        v = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+        b_seq_len = torch.full((batch,), seq_len, device="cuda", dtype=torch.int32)
+        b_start_loc = torch.zeros(batch, device="cuda", dtype=torch.int32)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], dim=0)
+        return q, k, v, b_start_loc, b_seq_len
+
+    def _run_v25(self, q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim):
+        """Run V2.51 attention with v_mean_cache."""
+        import math
+
+        import triton
+
+        BLOCK_N = 64
+        batch = lens.shape[0]
+        n_kv_tiles = math.ceil(seq_len / BLOCK_N)
+        BLOCK_D = triton.next_power_of_2(head_dim)
+        v_mean_cache = torch.zeros(
+            batch, num_kv_heads, n_kv_tiles, BLOCK_D, device="cuda", dtype=torch.float32
+        )
+        return attention(
+            q,
+            k,
+            v,
+            locs,
+            lens,
+            seq_len,
+            is_causal=False,
+            skip_softmax_threshold=threshold,
+            skip_softmax_normalize_by_seqlen=True,
+            v_mean_cache=v_mean_cache,
+        )
+
+    def test_v25_closer_to_dense_than_v1(self):
+        """V2.51 approximation should be closer to dense than V1 (which zeros skipped tiles)."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        threshold = 0.15
+
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+        out_v1 = attention(
+            q,
+            k,
+            v,
+            locs,
+            lens,
+            seq_len,
+            is_causal=False,
+            skip_softmax_threshold=threshold,
+            skip_softmax_normalize_by_seqlen=True,
+        )
+        out_v25 = self._run_v25(q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim)
+
+        err_v1 = (out_v1 - out_dense).abs().mean().item()
+        err_v25 = (out_v25 - out_dense).abs().mean().item()
+
+        assert err_v25 < err_v1 * 0.5, (
+            f"V2.51 should be significantly closer to dense than V1: "
+            f"err_v25={err_v25:.6f}, err_v1={err_v1:.6f}, ratio={err_v25/err_v1:.3f}"
+        )
+
+    def test_v25_no_nan_inf(self):
+        """V2.51 output should be finite."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out = self._run_v25(q, k, v, locs, lens, seq_len, 0.15, num_kv_heads, head_dim)
+        assert not torch.isnan(out).any(), "NaN in V2.51 output"
+        assert not torch.isinf(out).any(), "Inf in V2.51 output"
+
+    def test_v25_high_threshold_matches_dense(self):
+        """V2.51 with very high threshold (no skipping) should closely match dense.
+
+        threshold=100 → skip_threshold_log2 = -100*log2(seq) ≈ -1100, so no tile
+        is ever skipped. The V2.5 code path still runs (precompute_vmean, fixed
+        block config), so small numerical diffs from different accumulation order
+        are expected.
+        """
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+        # threshold=100 → effectively no tiles skipped
+        out_v25 = self._run_v25(q, k, v, locs, lens, seq_len, 100.0, num_kv_heads, head_dim)
+        torch.testing.assert_close(out_v25, out_dense, rtol=5e-3, atol=5e-3)
+
+    def test_v25_differs_from_v1(self):
+        """V2.51 output should differ from V1 when tiles are fully skipped."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        threshold = 0.15
+
+        out_v1 = attention(
+            q,
+            k,
+            v,
+            locs,
+            lens,
+            seq_len,
+            is_causal=False,
+            skip_softmax_threshold=threshold,
+            skip_softmax_normalize_by_seqlen=True,
+        )
+        out_v25 = self._run_v25(q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim)
+        assert not torch.allclose(out_v25, out_v1, atol=1e-4), (
+            "V2.51 output should differ from V1 when tiles are skipped"
+        )
+
+    def test_v25_gqa(self):
+        """V2.51 works with GQA (4 q-heads, 2 kv-heads)."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 2, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+        out_v25 = self._run_v25(q, k, v, locs, lens, seq_len, 0.15, num_kv_heads, head_dim)
+        out_v1 = attention(
+            q,
+            k,
+            v,
+            locs,
+            lens,
+            seq_len,
+            is_causal=False,
+            skip_softmax_threshold=0.15,
+            skip_softmax_normalize_by_seqlen=True,
+        )
+
+        err_v1 = (out_v1 - out_dense).abs().mean().item()
+        err_v25 = (out_v25 - out_dense).abs().mean().item()
+        assert err_v25 < err_v1, f"V2.51 GQA: err_v25={err_v25:.6f} >= err_v1={err_v1:.6f}"
+
+    def test_v25_partial_last_tile(self):
+        """V2.51 handles partial last KV tile correctly (seq_len not multiple of BLOCK_N)."""
+        # seq_len=2000, BLOCK_N=64 → last tile has 2000 - 31*64 = 2000 - 1984 = 16 valid tokens
+        seq_len, num_heads, num_kv_heads, head_dim = 2000, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+        out_v25 = self._run_v25(q, k, v, locs, lens, seq_len, 0.15, num_kv_heads, head_dim)
+
+        assert not torch.isnan(out_v25).any(), "NaN with partial last tile"
+        err = (out_v25 - out_dense).abs().mean().item()
+        assert err < 0.1, f"V2.51 partial tile error too large: {err:.6f}"

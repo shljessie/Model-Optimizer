@@ -230,16 +230,19 @@ def _attn_fwd_body(
         scores = _apply_mask(scores, q_pos, kv_pos, seq_len_q, seq_len_kv, kv_start, IS_CAUSAL)
 
         if APPLY_SKIP_SOFTMAX:
-            # --- Skip-softmax: check tile, skip V load if all rows negligible ---
+            # --- Skip-softmax: tile-level skipping only ---
+            # Check if ALL rows agree this tile is negligible.
+            # No per-row zeroing — KEEP tiles do full attention for all rows.
+            # (Per-row zeroing saves nothing since V is loaded + BMM2 runs
+            # anyway, but destroys information whose aggregate matters.)
             tile_row_max = tl.max(scores, 1)  # [BLOCK_M]
             can_skip = tile_row_max < (row_max + skip_threshold_log2)
             all_skip = tl.min(can_skip.to(tl.int32)) == 1
 
             if not all_skip:
-                # Online softmax update
+                # KEEP: full attention for all rows (no per-row zeroing)
                 m_new = tl.maximum(row_max, tile_row_max)
                 p = tl.math.exp2(scores - m_new[:, None])
-                p = tl.where(can_skip[:, None], 0.0, p)
                 l_new = tl.sum(p, 1)
                 correction = tl.math.exp2(row_max - m_new)
                 row_sum = row_sum * correction + l_new
@@ -254,17 +257,25 @@ def _attn_fwd_body(
                 )
                 acc = tl.dot(p.to(v.dtype), v, acc)
                 row_max = m_new
-            # All rows negligible — skip V load, softmax update, accumulation
             elif APPLY_SKIP_V25:
-                # V2.5: pool-K approximate weight + fresh precomputed v_mean
-                # k is [BLOCK_D, BLOCK_N] (transposed K already in SRAM)
-                k_mean = tl.sum(k.to(tl.float32), 1) / BLOCK_N  # [BLOCK_D]
-                # Q @ k_mean → [BLOCK_M] per-row approximate score
-                approx_score = tl.sum(q.to(tl.float32) * k_mean[None, :], 1) * qk_scale
-                # BLOCK_M exponentials (not BLOCK_M*BLOCK_N)
-                p_approx = tl.math.exp2(approx_score - row_max)  # [BLOCK_M]
+                # Pool-K: approximate per-row weights with 128 exp2 instead of 8192.
+                # K is already in SRAM as [BLOCK_D, BLOCK_N] from BMM1.
+                # k_mean = mean(K, dim=0) in token dim → [BLOCK_D]
+                n_valid_kv = tl.minimum(seq_len_kv - kv_start, BLOCK_N).to(tl.float32)
+                n_valid_kv = tl.maximum(n_valid_kv, 1.0)
+                k_mean = tl.sum(k, 1) / n_valid_kv  # [BLOCK_D] (k is [BLOCK_D, BLOCK_N])
 
-                # Load fresh precomputed v_mean
+                # approx_score = Q @ k_mean * scale * BLOCK_N
+                # The * BLOCK_N approximates sum_j(exp(q·k_j)) ≈ N * exp(q·mean(k))
+                approx_score = tl.sum(q * k_mean[None, :], 1) * qk_scale  # [BLOCK_M]
+
+                m_new = tl.maximum(row_max, approx_score)
+                p_approx = tl.math.exp2(approx_score - m_new) * n_valid_kv  # [BLOCK_M], 128 exp2
+                correction = tl.math.exp2(row_max - m_new)
+                row_sum = row_sum * correction + p_approx
+                acc = acc * correction[:, None]
+
+                # Load fresh precomputed v_mean from L2 cache
                 kv_tile_idx = kv_start // BLOCK_N
                 vm_ptr = (
                     Vmean_cache
@@ -275,9 +286,8 @@ def _attn_fwd_body(
                 )
                 fresh_v_mean = tl.load(vm_ptr, mask=d_mask, other=0.0)  # [BLOCK_D]
 
-                # Update denominator and accumulator
-                row_sum += p_approx
                 acc += p_approx[:, None] * fresh_v_mean[None, :]
+                row_max = m_new
         else:
             # --- Standard path: no skip check ---
             m_new = tl.maximum(row_max, tl.max(scores, 1))
@@ -531,11 +541,8 @@ def _attn_bwd_dq(
         scores = _apply_mask(scores, q_pos, kv_pos, seq_len_q, seq_len_kv, kv_start, IS_CAUSAL)
         p = tl.math.exp2(scores - lse[:, None])
 
-        # Re-apply skip-softmax: zero out rows that were skipped in forward
-        if APPLY_SKIP_SOFTMAX:
-            tile_row_max = tl.max(scores, 1)
-            can_skip = tile_row_max < (lse + skip_threshold_log2)
-            p = tl.where(can_skip[:, None], 0.0, p)
+        # Note: no per-row zeroing in backward — forward no longer zeros
+        # individual rows, so backward must match (full p for all rows).
 
         # dP = dO @ V^T, dS = P * (dP - delta), dQ += dS @ K
         dp = tl.dot(do, tl.trans(v))
@@ -661,11 +668,7 @@ def _attn_bwd_dkdv(
             scores = _apply_mask(scores, q_pos, kv_pos, seq_len_q, seq_len_kv, kv_start, IS_CAUSAL)
             p = tl.math.exp2(scores - lse[:, None])
 
-            # Re-apply skip-softmax: zero out rows that were skipped in forward
-            if APPLY_SKIP_SOFTMAX:
-                tile_row_max = tl.max(scores, 1)
-                can_skip = tile_row_max < (lse + skip_threshold_log2)
-                p = tl.where(can_skip[:, None], 0.0, p)
+            # Note: no per-row zeroing in backward — matches forward.
 
             # dV += P^T @ dO
             dv += tl.dot(tl.trans(p.to(do_tile.dtype)), do_tile)
