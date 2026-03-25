@@ -13,29 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Wan2.2 Text-to-Video inference with SageAttention.
+"""Wan2.2 Text-to-Video inference with SageAttention and FP8 attention quantization.
 
-SageAttention (https://arxiv.org/pdf/2410.02367) replaces
-``F.scaled_dot_product_attention`` with a faster INT8/FP8 kernel:
-
-- Q and K are quantized to INT8 (K is smoothed via mean-subtraction first)
-- V stays in FP16 or FP8 depending on the kernel variant
-- ~2× faster attention than FlashAttention2 with negligible accuracy loss
-
-Three kernel variants are supported via ``--kernel``:
+Four attention kernel variants are supported via ``--kernel``:
 
 ``sage1``
-    ``sageattn`` — SageAttention v1 auto-selector. INT8 QK, FP16 PV.
-    Works on Ampere, Ada, Hopper.
+    ``sageattn`` — SageAttention v1. INT8 QK, FP16 PV. Ampere/Ada/Hopper.
 
 ``sage2-fp16``
-    ``sageattn_qk_int8_pv_fp16_cuda`` — SageAttention2, INT8 QK, FP16 PV.
-    Per-thread quantization granularity. Faster than sage1 on Ada/Hopper.
+    ``sageattn_qk_int8_pv_fp16_cuda`` — SageAttention2. INT8 QK, FP16 PV, per-thread.
 
-``sage2-fp8`` (default on Ada/Hopper)
-    ``sageattn_qk_int8_pv_fp8_cuda`` — SageAttention2++. INT8 QK, FP8 PV
-    with two-stage FP32+FP16 accumulator. Fastest option on Ada (SM89) and
-    Hopper (SM90).
+``sage2-fp8`` (default SageAttention kernel)
+    ``sageattn_qk_int8_pv_fp8_cuda`` — SageAttention2++. INT8 QK, FP8 PV.
+    Fastest on Ada (SM89) / Hopper (SM90).
+
+``fp8`` (default for accuracy testing, always available)
+    Python-level FP8 E4M3 attention. Inspired by SageAttention2:
+    - Q, K, V are channel-smoothed (per-channel mean subtraction) before quantization
+    - Per-token FP8 E4M3 quantization with max-based scales
+    - Dequantize back to BF16, then run standard SDPA
+    - No CUDA kernel required. Use for accuracy verification on any GPU.
 
 Requirements::
 
@@ -43,16 +40,19 @@ Requirements::
 
 Usage::
 
-    # SageAttention2++ (default, fastest on Ada)
-    python wan2_sage_attention.py --prompt "Two cats boxing on a stage"
+    # FP8 accuracy check vs baseline
+    python wan2_sage_attention.py --prompt "..." --compare
 
-    # Explicit kernel selection
-    python wan2_sage_attention.py --prompt "..." --kernel sage2-fp16
+    # Single run with FP8 attention
+    python wan2_sage_attention.py --prompt "..." --kernel fp8
 
-    # Baseline — standard SDPA (uses flash_attn if installed)
+    # Compare a specific kernel vs baseline with accuracy metrics
+    python wan2_sage_attention.py --prompt "..." --kernel sage2-fp16 --compare
+
+    # Baseline — standard SDPA
     python wan2_sage_attention.py --prompt "..." --baseline
 
-    # Benchmark all kernels back-to-back
+    # Benchmark all kernels (timing only)
     python wan2_sage_attention.py --prompt "..." --benchmark
 
     # Smaller 5B model (fits on a single 24 GB GPU)
@@ -65,6 +65,7 @@ import argparse
 import time
 from contextlib import contextmanager
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -76,55 +77,75 @@ DEFAULT_MODEL = MODEL_T2V_14B
 DEFAULT_NEGATIVE_PROMPT = "low quality, blurry, distorted, watermark, text, cropped, overexposed"
 
 # Kernel choices
+KERNEL_FP8 = "fp8"
 KERNEL_SAGE1 = "sage1"
 KERNEL_SAGE2_FP16 = "sage2-fp16"
 KERNEL_SAGE2_FP8 = "sage2-fp8"
-KERNEL_CHOICES = [KERNEL_SAGE1, KERNEL_SAGE2_FP16, KERNEL_SAGE2_FP8]
+KERNEL_CHOICES = [KERNEL_FP8, KERNEL_SAGE1, KERNEL_SAGE2_FP16, KERNEL_SAGE2_FP8]
 
 _KERNEL_DESCRIPTIONS = {
+    KERNEL_FP8: "FP8 E4M3 QKV (Python-level, SA2-inspired smoothing, no CUDA kernel required)",
     KERNEL_SAGE1: "sageattn (SA1, INT8 QK + FP16 PV, auto-select)",
     KERNEL_SAGE2_FP16: "sageattn_qk_int8_pv_fp16_cuda (SA2, INT8 QK + FP16 PV, per-thread)",
     KERNEL_SAGE2_FP8: "sageattn_qk_int8_pv_fp8_cuda (SA2++, INT8 QK + FP8 PV, fp32+fp16 accum)",
 }
 
-
-# SageAttention kernel support by GPU compute capability:
-#   SM80  Ampere  (A100, RTX 3090, ...)          sage1, sage2-fp16
-#   SM89  Ada     (RTX 4090, RTX PRO 6000 Ada)   sage1, sage2-fp16, sage2-fp8
-#   SM90  Hopper  (H100)                         sage1, sage2-fp16, sage2-fp8
-#   SM100 Blackwell datacenter (B100/B200)       sage1, sage2-fp16, sage2-fp8
-#   SM120 Blackwell consumer/pro (RTX 50-series,
-#          RTX PRO 6000 Blackwell)               NOT YET SUPPORTED by SA 2.2.0
-#                                                Recompile with TORCH_CUDA_ARCH_LIST="8.9+PTX"
-#                                                to use PTX forward-compat fallback.
+# SageAttention CUDA kernel support by GPU compute capability:
+#   SM80  Ampere  (A100, RTX 3090)              sage1, sage2-fp16
+#   SM89  Ada     (RTX 4090, RTX PRO 6000 Ada)  sage1, sage2-fp16, sage2-fp8
+#   SM90  Hopper  (H100)                        sage1, sage2-fp16, sage2-fp8
+#   SM100 Blackwell datacenter (B100/B200)      sage1, sage2-fp16, sage2-fp8
+#   SM120 Blackwell consumer (RTX 50-series,
+#          RTX PRO 6000 Blackwell)              NOT supported by SA 2.2.0
+#                                               fp8 kernel always works (pure Python)
 _SUPPORTED_SM = {80, 86, 89, 90, 100}
+
+# FP8 max value for float8_e4m3fn
+_FP8_MAX = 448.0
+
+
+# ---------------------------------------------------------------------------
+# GPU detection
+# ---------------------------------------------------------------------------
 
 
 def _get_gpu_sm() -> int | None:
-    """Return the CUDA compute capability (e.g. 89 for SM8.9) of the current GPU, or None."""
     if not torch.cuda.is_available():
         return None
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
 
 
+def _fp8_available() -> bool:
+    return hasattr(torch, "float8_e4m3fn")
+
+
 def _detect_available_kernels() -> list[str]:
-    """Return the list of kernels available in the installed sageattention version."""
+    """Return kernels available given the installed packages and GPU."""
+    available = []
+
+    # fp8 is pure Python — available on any GPU as long as PyTorch >= 2.1
+    if _fp8_available():
+        available.append(KERNEL_FP8)
+    else:
+        print(
+            "[FP8] WARNING: torch.float8_e4m3fn not found. "
+            "Upgrade to PyTorch >= 2.1 to use the fp8 kernel."
+        )
+
     try:
         import sageattention as _sa
     except ImportError:
-        return []
+        return available
 
     sm = _get_gpu_sm()
     if sm is not None and sm not in _SUPPORTED_SM:
         print(
-            f"[SageAttention] WARNING: GPU compute capability SM{sm} is not officially supported "
-            f"by SageAttention 2.2.0 (supported: SM{sorted(_SUPPORTED_SM)}). "
-            "Kernels may fail at runtime. "
-            "Try recompiling with: TORCH_CUDA_ARCH_LIST='8.9+PTX'"
+            f"[SageAttention] WARNING: GPU SM{sm} not officially supported by SA 2.2.0 "
+            f"(supported: SM{sorted(_SUPPORTED_SM)}). CUDA kernels may fail. "
+            "Try: TORCH_CUDA_ARCH_LIST='8.9+PTX' pip install --no-cache-dir sageattention"
         )
 
-    available = []
     if hasattr(_sa, "sageattn"):
         available.append(KERNEL_SAGE1)
     if hasattr(_sa, "sageattn_qk_int8_pv_fp16_cuda"):
@@ -134,40 +155,96 @@ def _detect_available_kernels() -> list[str]:
     return available
 
 
-# Populated once at startup; used to warn and skip unavailable kernels.
 AVAILABLE_KERNELS: list[str] = _detect_available_kernels()
 
 
 # ---------------------------------------------------------------------------
-# SageAttention patching
+# FP8 attention — Python-level, SA2-inspired
 # ---------------------------------------------------------------------------
 
-# Keep a reference to the original SDPA so we can restore it and fall back
-# when SageAttention cannot handle a particular call.
-_orig_sdpa = F.scaled_dot_product_attention
 
-# Active kernel name — set by enable_sage_attention()
-_active_kernel: str = KERNEL_SAGE2_FP8
+def _smooth_quantize_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Smooth + FP8-quantize + dequantize a Q, K, or V tensor.
 
-# Call counters — reset by enable_sage_attention()
-_sage_calls: int = 0
-_fallback_calls: int = 0
+    Implements the channel-wise mean-subtraction smoothing from SageAttention2
+    (arXiv 2411.10958):
+
+    1. Subtract per-channel mean across the token dimension (removes systematic
+       outliers in each head-dim channel, compressing the dynamic range).
+    2. Quantize the zero-centred tensor to FP8 E4M3 with a per-token max scale.
+    3. Dequantize back to the original dtype.
+    4. Add the channel mean back so the result is mathematically equivalent
+       to the original, up to FP8 rounding error.
+
+    Args:
+        x: Attention tensor with layout ``(B, H, N, D)`` — batch, heads,
+           tokens, head-dim.
+
+    Returns:
+        Tensor of the same shape and dtype as ``x``, simulating FP8 precision.
+    """
+    orig_dtype = x.dtype
+
+    # Step 1 — channel smoothing: mean over token dimension → (B, H, 1, D)
+    mean = x.mean(dim=-2, keepdim=True)
+    x_smooth = x - mean
+
+    # Step 2 — per-token scale: max over head-dim → (B, H, N, 1)
+    scale = x_smooth.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-12) / _FP8_MAX
+
+    # Step 3 — quantize to FP8 E4M3, then immediately dequantize
+    x_fp8 = (x_smooth.float() / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+    x_dq = x_fp8.to(orig_dtype) * scale.to(orig_dtype)
+
+    # Step 4 — restore mean
+    return x_dq + mean
 
 
-def _run_sage_kernel(
+def _fp8_sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     is_causal: bool,
     scale: float | None,
 ) -> torch.Tensor:
-    """Dispatch to the selected SageAttention kernel."""
+    """FP8 E4M3 attention with SA2-inspired Q/K/V smoothing.
+
+    All three matrices are independently smoothed and FP8-quantized before
+    being passed to standard SDPA. This simulates the precision loss of a
+    true FP8 attention kernel without requiring any compiled CUDA code.
+    """
+    q_dq = _smooth_quantize_fp8(query)
+    k_dq = _smooth_quantize_fp8(key)
+    v_dq = _smooth_quantize_fp8(value)
+    return _orig_sdpa(q_dq, k_dq, v_dq, is_causal=is_causal, scale=scale)
+
+
+# ---------------------------------------------------------------------------
+# SDPA patching
+# ---------------------------------------------------------------------------
+
+_orig_sdpa = F.scaled_dot_product_attention
+_active_kernel: str = KERNEL_FP8
+_sage_calls: int = 0
+_fallback_calls: int = 0
+
+
+def _run_kernel(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+) -> torch.Tensor:
+    if _active_kernel == KERNEL_FP8:
+        return _fp8_sdpa(query, key, value, is_causal=is_causal, scale=scale)
+
     if _active_kernel == KERNEL_SAGE1:
         from sageattention import sageattn
 
         return sageattn(query, key, value, tensor_layout="HND", is_causal=is_causal, sm_scale=scale)
 
-    elif _active_kernel == KERNEL_SAGE2_FP16:
+    if _active_kernel == KERNEL_SAGE2_FP16:
         from sageattention import sageattn_qk_int8_pv_fp16_cuda
 
         return sageattn_qk_int8_pv_fp16_cuda(
@@ -181,23 +258,23 @@ def _run_sage_kernel(
             smooth_k=True,
         )
 
-    else:  # KERNEL_SAGE2_FP8
-        from sageattention import sageattn_qk_int8_pv_fp8_cuda
+    # KERNEL_SAGE2_FP8
+    from sageattention import sageattn_qk_int8_pv_fp8_cuda
 
-        return sageattn_qk_int8_pv_fp8_cuda(
-            query,
-            key,
-            value,
-            tensor_layout="HND",
-            is_causal=is_causal,
-            qk_quant_gran="per_thread",
-            sm_scale=scale,
-            pv_accum_dtype="fp32+fp16",  # SA2++ two-stage accumulator, fastest on Ada
-            smooth_k=True,
-        )
+    return sageattn_qk_int8_pv_fp8_cuda(
+        query,
+        key,
+        value,
+        tensor_layout="HND",
+        is_causal=is_causal,
+        qk_quant_gran="per_thread",
+        sm_scale=scale,
+        pv_accum_dtype="fp32+fp16",
+        smooth_k=True,
+    )
 
 
-def _sageattn_sdpa_compat(
+def _patched_sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -207,14 +284,8 @@ def _sageattn_sdpa_compat(
     scale: float | None = None,
     **kwargs,
 ) -> torch.Tensor:
-    """Drop-in replacement for ``F.scaled_dot_product_attention`` using SageAttention.
-
-    Falls back to standard SDPA when SageAttention cannot be applied:
-    - ``attn_mask`` is not None (SageAttention does not support arbitrary masks)
-    - ``dropout_p > 0`` (training-time dropout)
-    - Input dtype is not FP16 or BF16 (e.g. FP32 during VAE encode/decode)
-    """
     global _sage_calls, _fallback_calls
+    # Fall back to standard SDPA for unsupported cases
     if (
         attn_mask is not None
         or dropout_p > 0.0
@@ -233,54 +304,34 @@ def _sageattn_sdpa_compat(
 
     _sage_calls += 1
     try:
-        return _run_sage_kernel(query, key, value, is_causal=is_causal, scale=scale)
+        return _run_kernel(query, key, value, is_causal=is_causal, scale=scale)
     except (AssertionError, RuntimeError) as e:
-        # Kernel not available for this GPU architecture — fall back to SDPA.
-        # This typically means sageattention was compiled without support for
-        # this SM version. Recompile with TORCH_CUDA_ARCH_LIST="<sm>" set.
-        print(
-            f"[SageAttention] WARNING: kernel={_active_kernel!r} failed ({e}). "
-            "Falling back to SDPA. Recompile sageattention with "
-            "TORCH_CUDA_ARCH_LIST set to your GPU's SM version (e.g. '8.9' for Ada)."
-        )
+        print(f"[Attention] WARNING: kernel={_active_kernel!r} failed ({e}). Falling back to SDPA.")
         return _orig_sdpa(query, key, value, is_causal=is_causal, scale=scale)
 
 
-def enable_sage_attention(kernel: str = KERNEL_SAGE2_FP8) -> None:
-    """Patch ``F.scaled_dot_product_attention`` globally with SageAttention.
-
-    Args:
-        kernel: One of ``"sage1"``, ``"sage2-fp16"``, ``"sage2-fp8"``.
-            If the requested kernel is not available in the installed
-            sageattention version, falls back to ``"sage1"``.
-    """
+def enable_attention_kernel(kernel: str = KERNEL_FP8) -> None:
+    """Patch ``F.scaled_dot_product_attention`` with the selected kernel."""
     global _active_kernel, _sage_calls, _fallback_calls
-    if not AVAILABLE_KERNELS:
-        raise ImportError("SageAttention is not installed. Run: pip install sageattention")
 
     if kernel not in KERNEL_CHOICES:
         raise ValueError(f"Unknown kernel {kernel!r}. Choose from {KERNEL_CHOICES}")
-
     if kernel not in AVAILABLE_KERNELS:
-        print(
-            f"[SageAttention] WARNING: kernel={kernel!r} not available in installed "
-            f"sageattention version (available: {AVAILABLE_KERNELS}). Falling back to sage1."
-        )
-        kernel = KERNEL_SAGE1
+        raise RuntimeError(f"Kernel {kernel!r} is not available. Available: {AVAILABLE_KERNELS}")
 
     _active_kernel = kernel
     _sage_calls = 0
     _fallback_calls = 0
 
-    F.scaled_dot_product_attention = _sageattn_sdpa_compat
+    F.scaled_dot_product_attention = _patched_sdpa
     import torch.nn.functional as _F
 
-    _F.scaled_dot_product_attention = _sageattn_sdpa_compat
-    print(f"[SageAttention] kernel={kernel}  {_KERNEL_DESCRIPTIONS[kernel]}")
+    _F.scaled_dot_product_attention = _patched_sdpa
+
+    print(f"[Attention] kernel={kernel}  {_KERNEL_DESCRIPTIONS[kernel]}")
 
 
-def disable_sage_attention() -> None:
-    """Restore the original ``F.scaled_dot_product_attention``."""
+def disable_attention_kernel() -> None:
     F.scaled_dot_product_attention = _orig_sdpa
     import torch.nn.functional as _F
 
@@ -288,21 +339,92 @@ def disable_sage_attention() -> None:
 
 
 @contextmanager
-def sage_attention_ctx(kernel: str = KERNEL_SAGE2_FP8):
-    """Context manager that enables SageAttention for the duration of the block."""
-    enable_sage_attention(kernel)
+def attention_kernel_ctx(kernel: str = KERNEL_FP8):
+    enable_attention_kernel(kernel)
     try:
         yield
     finally:
-        disable_sage_attention()
+        disable_attention_kernel()
 
 
-def print_sage_stats() -> None:
-    """Print how many attention calls went through sageattn vs fallback."""
+def print_kernel_stats() -> None:
     total = _sage_calls + _fallback_calls
-    print(
-        f"[SageAttention] calls: {_sage_calls} sageattn, {_fallback_calls} fallback (total {total})"
+    print(f"[Attention] calls: {_sage_calls} quantized, {_fallback_calls} fallback (total {total})")
+
+
+# ---------------------------------------------------------------------------
+# Accuracy metrics
+# ---------------------------------------------------------------------------
+
+
+def _frames_to_uint8(frames: list) -> np.ndarray:
+    """Convert a list of PIL images to a uint8 numpy array of shape (N, H, W, 3)."""
+    import numpy as np
+
+    arrays = []
+    for f in frames:
+        if isinstance(f, np.ndarray):
+            arr = f if f.dtype == np.uint8 else (f * 255).clip(0, 255).astype(np.uint8)
+        else:
+            arr = np.array(f.convert("RGB"), dtype=np.uint8)
+        arrays.append(arr)
+    return np.stack(arrays, axis=0)
+
+
+def compute_video_metrics(
+    frames_ref: list,
+    frames_quant: list,
+) -> dict[str, float]:
+    """Compute frame-level accuracy metrics between two video frame sequences.
+
+    Metrics:
+        psnr      Peak Signal-to-Noise Ratio (dB). Higher = better.
+                  >40 dB: excellent (barely noticeable).
+                  30-40 dB: good.
+                  20-30 dB: noticeable but acceptable.
+        mae_pct   Mean Absolute Error as % of max pixel value (255). Lower = better.
+        cos_sim   Mean cosine similarity of flattened frames. Closer to 1 = better.
+
+    Args:
+        frames_ref:   List of PIL images from the baseline run.
+        frames_quant: List of PIL images from the quantized run.
+
+    Returns:
+        Dict with keys ``"psnr"``, ``"mae_pct"``, ``"cos_sim"``.
+    """
+    ref = _frames_to_uint8(frames_ref).astype(np.float32)  # (N, H, W, 3)
+    quant = _frames_to_uint8(frames_quant).astype(np.float32)
+
+    # PSNR
+    mse_per_frame = ((ref - quant) ** 2).mean(axis=(1, 2, 3))  # (N,)
+    # Avoid log(0) for identical frames
+    psnr_per_frame = np.where(
+        mse_per_frame < 1e-10,
+        100.0,
+        10.0 * np.log10(255.0**2 / mse_per_frame),
     )
+    psnr = float(psnr_per_frame.mean())
+
+    # MAE as % of 255
+    mae_pct = float(np.abs(ref - quant).mean() / 255.0 * 100.0)
+
+    # Cosine similarity: flatten each frame to a vector
+    ref_flat = ref.reshape(ref.shape[0], -1)
+    quant_flat = quant.reshape(quant.shape[0], -1)
+    dot = (ref_flat * quant_flat).sum(axis=1)
+    norm_ref = np.linalg.norm(ref_flat, axis=1)
+    norm_quant = np.linalg.norm(quant_flat, axis=1)
+    cos_sim = float((dot / (norm_ref * norm_quant + 1e-12)).mean())
+
+    return {"psnr": psnr, "mae_pct": mae_pct, "cos_sim": cos_sim}
+
+
+def print_metrics(metrics: dict[str, float], label: str = "") -> None:
+    prefix = f"[{label}] " if label else ""
+    print(f"\n{prefix}Accuracy vs baseline:")
+    print(f"  PSNR:         {metrics['psnr']:.2f} dB  (>40 excellent, 30-40 good, <30 noticeable)")
+    print(f"  MAE:          {metrics['mae_pct']:.4f}%  of max pixel value")
+    print(f"  Cosine sim:   {metrics['cos_sim']:.6f}  (1.0 = identical)")
 
 
 # ---------------------------------------------------------------------------
@@ -311,24 +433,23 @@ def print_sage_stats() -> None:
 
 
 def load_pipeline(model_id: str):
-    """Load the Wan2.2 pipeline.
-
-    The VAE must be loaded in FP32 to avoid numerical issues; the transformer
-    and text encoder use BF16.
-    """
+    """Load the Wan2.2 pipeline (VAE in FP32, transformer + text encoder in BF16)."""
     from diffusers import AutoencoderKLWan, WanPipeline
 
     print(f"[Pipeline] Loading VAE (fp32) from {model_id}...")
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
-
     print("[Pipeline] Loading transformer + text encoder (bf16)...")
     pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
     pipe.to("cuda")
     return pipe
 
 
-def run_inference(pipe, args, label: str = "") -> float:
-    """Run one generation pass and return wall-clock time in seconds."""
+def run_inference(pipe, args, label: str = "") -> tuple[float, list]:
+    """Run one generation pass.
+
+    Returns:
+        (elapsed_seconds, frames) where frames is the list of PIL images.
+    """
     generator = torch.Generator("cuda").manual_seed(args.seed)
 
     if label:
@@ -337,7 +458,7 @@ def run_inference(pipe, args, label: str = "") -> float:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    output = pipe(
+    frames = pipe(
         prompt=args.prompt,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
         height=args.height,
@@ -354,9 +475,9 @@ def run_inference(pipe, args, label: str = "") -> float:
     from diffusers.utils import export_to_video
 
     out_path = args.output if not label else args.output.replace(".mp4", f"_{label}.mp4")
-    export_to_video(output, out_path, fps=16)
+    export_to_video(frames, out_path, fps=16)
     print(f"[{label or 'result'}] Saved to {out_path}  ({elapsed:.1f}s)")
-    return elapsed
+    return elapsed, frames
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +487,7 @@ def run_inference(pipe, args, label: str = "") -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Wan2.2 T2V inference with SageAttention",
+        description="Wan2.2 T2V with quantized attention (FP8, SageAttention)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
@@ -378,68 +499,87 @@ def parse_args() -> argparse.Namespace:
         help="HuggingFace model ID",
     )
     parser.add_argument("--output", type=str, default="output.mp4", help="Output video path")
-    parser.add_argument("--height", type=int, default=480, help="Video height")
-    parser.add_argument("--width", type=int, default=832, help="Video width")
-    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames")
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--num-frames", type=int, default=81)
     parser.add_argument("--num-steps", type=int, default=40, help="Denoising steps")
     parser.add_argument("--guidance-scale", type=float, default=4.0)
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--kernel",
         type=str,
-        default=KERNEL_SAGE2_FP8,
+        default=KERNEL_FP8,
         choices=KERNEL_CHOICES,
         help=(
-            "SageAttention kernel variant. "
-            "sage1: SA1 auto-select; "
+            "fp8: Python-level FP8 E4M3 (SA2 smoothing, no CUDA kernel, accuracy testing); "
+            "sage1: SA1 INT8+FP16; "
             "sage2-fp16: SA2 INT8+FP16; "
-            "sage2-fp8: SA2++ INT8+FP8 (fastest on Ada/Hopper)"
+            "sage2-fp8: SA2++ INT8+FP8"
         ),
     )
     parser.add_argument(
         "--baseline",
         action="store_true",
-        help="Run with standard SDPA instead of SageAttention",
+        help="Run with standard SDPA, no quantization",
+    )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help=(
+            "Run baseline + selected kernel, then report accuracy metrics "
+            "(PSNR, MAE, cosine similarity). Default kernel is fp8."
+        ),
     )
     parser.add_argument(
         "--benchmark",
         action="store_true",
-        help="Run baseline + all three SageAttention kernels back-to-back",
+        help="Run baseline + all available kernels, report timing table",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
     pipe = load_pipeline(args.model)
 
-    if args.benchmark:
-        results: dict[str, float] = {}
+    if args.compare:
+        # --- Baseline ---
+        _, frames_base = run_inference(pipe, args, label="baseline")
 
-        # Baseline
-        results["baseline"] = run_inference(pipe, args, label="baseline")
+        # --- Quantized ---
+        enable_attention_kernel(args.kernel)
+        _, frames_quant = run_inference(pipe, args, label=args.kernel)
+        print_kernel_stats()
+        disable_attention_kernel()
 
-        # Available sage kernels
+        # --- Metrics ---
+        metrics = compute_video_metrics(frames_base, frames_quant)
+        print_metrics(metrics, label=args.kernel)
+
+    elif args.benchmark:
+        timing: dict[str, float] = {}
+
+        timing["baseline"], _ = run_inference(pipe, args, label="baseline")
+
         for kernel in KERNEL_CHOICES:
             if kernel not in AVAILABLE_KERNELS:
-                print(f"\n[{kernel}] Skipped — not available in installed sageattention version")
+                print(f"\n[{kernel}] Skipped — not available")
                 continue
-            enable_sage_attention(kernel)
-            results[kernel] = run_inference(pipe, args, label=kernel)
-            print_sage_stats()
-            disable_sage_attention()
+            enable_attention_kernel(kernel)
+            timing[kernel], _ = run_inference(pipe, args, label=kernel)
+            print_kernel_stats()
+            disable_attention_kernel()
 
-        t_base = results["baseline"]
+        t_base = timing["baseline"]
         print(f"\n{'=' * 55}")
         print(f"  {'Kernel':<20} {'Time':>8}   {'Speedup':>8}")
         print(f"  {'-' * 40}")
         print(f"  {'baseline (SDPA)':<20} {t_base:>7.1f}s   {'1.00x':>8}")
         for kernel in KERNEL_CHOICES:
-            if kernel not in results:
+            if kernel not in timing:
                 print(f"  {kernel:<20} {'N/A':>8}   {'N/A':>8}  (not available)")
                 continue
-            t = results[kernel]
+            t = timing[kernel]
             print(f"  {kernel:<20} {t:>7.1f}s   {t_base / t:>7.2f}x")
         print(f"{'=' * 55}")
 
@@ -447,10 +587,10 @@ def main() -> None:
         run_inference(pipe, args, label="baseline")
 
     else:
-        enable_sage_attention(args.kernel)
+        enable_attention_kernel(args.kernel)
         run_inference(pipe, args, label=args.kernel)
-        print_sage_stats()
-        disable_sage_attention()
+        print_kernel_stats()
+        disable_attention_kernel()
 
 
 if __name__ == "__main__":
