@@ -59,6 +59,8 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
         self.backend = config.get("backend", "triton")
         self.is_causal = config.get("is_causal", False)
         self.enable_v25 = config.get("enable_v25", False)
+        self.enable_lite_attention = config.get("enable_lite_attention", False)
+        self.lite_threshold = config.get("lite_threshold", -5.0)
 
         # These are set by the Triton kernel integration and read by HF/diffusers backends
         self.skip_softmax_threshold: float | None = None
@@ -258,9 +260,10 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
     def _triton_inference_context(self, module: "SparseAttentionModule"):
         """Context manager for Triton inference (fused kernel tile skipping)."""
         threshold = self._effective_threshold
+        use_lite = self.enable_lite_attention
 
         with ExitStack() as stack:
-            if threshold is not None and threshold > 0.0:
+            if use_lite or (threshold is not None and threshold > 0.0):
                 # Set skip-softmax config for the diffusers Triton backend
                 try:
                     from ..kernels.diffusers_triton_attention import (
@@ -269,7 +272,7 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
                     )
 
                     set_triton_skip_softmax_config(
-                        threshold=threshold,
+                        threshold=threshold if not use_lite else None,
                         normalize_by_seqlen=True,
                         enable_v25=self.enable_v25,
                     )
@@ -277,7 +280,7 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
                 except ImportError:
                     pass
 
-                # Set skip-softmax config for the LTX-2 Triton backend
+                # Set config for the LTX-2 Triton backend
                 try:
                     from ..kernels.ltx_triton_attention import (
                         clear_ltx_triton_context,
@@ -286,19 +289,21 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
 
                     set_ltx_triton_context(
                         active=True,
-                        threshold=threshold,
+                        threshold=threshold if not use_lite else None,
                         normalize_by_seqlen=True,
                         enable_v25=self.enable_v25,
+                        lite_threshold=self.lite_threshold if use_lite else None,
                     )
                     stack.callback(clear_ltx_triton_context)
                 except ImportError:
                     pass
 
-                # Also set module flags for HF Triton backend (hf_triton_attention.py)
-                module._apply_skip_softmax = True
-                self.skip_softmax_threshold = threshold
-                self.skip_softmax_normalize_by_seqlen = True
-                stack.callback(setattr, module, "_apply_skip_softmax", False)
+                if not use_lite:
+                    # Also set module flags for HF Triton backend (hf_triton_attention.py)
+                    module._apply_skip_softmax = True
+                    self.skip_softmax_threshold = threshold
+                    self.skip_softmax_normalize_by_seqlen = True
+                    stack.callback(setattr, module, "_apply_skip_softmax", False)
 
             # Activate the diffusers Triton backend
             try:

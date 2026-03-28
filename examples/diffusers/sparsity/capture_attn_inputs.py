@@ -44,7 +44,7 @@ _capture_state = {
     "data": [],
 }
 
-SAVE_DIR = os.path.join(os.path.dirname(__file__), "experiments", "attn_input")
+SAVE_DIR = os.path.join(os.path.dirname(__file__), "experiments", "attn_input")  # overridden by --save-dir
 
 # Controlled by CLI args
 _save_steps = None  # set of step indices to save (None = all)
@@ -128,7 +128,7 @@ def _patch_ltx_attention_for_capture():
 
 
 def main():
-    global _save_steps, _save_layers
+    global _save_steps, _save_layers, SAVE_DIR
 
     parser = argparse.ArgumentParser(description="Capture attention inputs from LTX-2 baseline")
     parser.add_argument("--num-steps", type=int, default=40, help="Denoising steps")
@@ -148,12 +148,20 @@ def main():
         default=None,
         help="Which layer indices to save (default: all). LTX-2 has 44 enabled attn1 layers.",
     )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Override save directory (default: experiments/attn_input)",
+    )
     args = parser.parse_args()
 
     _save_steps = set(args.save_steps)
     _save_layers = set(args.save_layers) if args.save_layers else None
+    if args.save_dir is not None:
+        SAVE_DIR = args.save_dir
 
-    from run_experiments import DEFAULT_HEIGHT, DEFAULT_WIDTH, build_pipeline
+    from run_exps import DEFAULT_HEIGHT, DEFAULT_WIDTH, build_pipeline
     from ltx_core.model.video_vae import TilingConfig
     from ltx_pipelines.utils.constants import (
         DEFAULT_FRAME_RATE,

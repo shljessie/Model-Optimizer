@@ -66,6 +66,66 @@ def clear_triton_skip_softmax_config() -> None:
     _thread_local.v_mean_cache = None
 
 
+def set_lite_attention_config(
+    threshold: float | None = None,
+) -> None:
+    """Set thread-local LiteAttention config.
+
+    Each attention layer gets its own double-buffered skip mask pair.
+    Masks are lazy-allocated per layer on first attention call.
+
+    Temporal propagation across denoising steps:
+      - Step 0 (warmup): dense attention for ALL layers, writes skip mask
+      - Step 1+: each layer reads its own mask from step T-1, writes for step T+1
+      - Call ``lite_attention_step_boundary()`` at the START of each denoising step
+    """
+    _thread_local.lite_threshold = threshold
+    # Per-layer masks: dict[layer_idx] → (mask_a, mask_b)
+    _thread_local._lite_layer_masks = {}
+    # Call index within a denoising step (maps to layer index)
+    _thread_local._lite_call_idx = 0
+    # Denoising step counter: -1 = not started, 0 = warmup, 1+ = inference
+    _thread_local._lite_step = -1
+
+
+def lite_attention_step_boundary() -> None:
+    """Call at the START of each transformer forward (= denoising step).
+
+    Resets the per-step call counter and advances the step index.
+    Step 0 = warmup (dense + write mask), step 1+ = inference (read + write).
+    """
+    _thread_local._lite_call_idx = 0
+    _thread_local._lite_step = getattr(_thread_local, "_lite_step", -1) + 1
+
+
+def lite_attention_get_sparsity() -> float | None:
+    """Return average sparsity (fraction of tiles skipped) across all layers.
+
+    Returns None if no masks have been written yet.
+    """
+    masks = getattr(_thread_local, "_lite_layer_masks", {})
+    if not masks:
+        return None
+    step = getattr(_thread_local, "_lite_step", -1)
+    total_skip = 0
+    total_tiles = 0
+    for _layer_idx, (mask_a, mask_b) in masks.items():
+        # Read from the mask that was most recently WRITTEN
+        # Step 0 writes to mask_a; step 1 writes to mask_b; step 2 writes to mask_a; ...
+        mask = mask_a if step % 2 == 0 else mask_b
+        total_skip += (mask == 1).sum().item()
+        total_tiles += mask.numel()
+    return total_skip / total_tiles if total_tiles > 0 else 0.0
+
+
+def clear_lite_attention_config() -> None:
+    """Clear thread-local LiteAttention config."""
+    _thread_local.lite_threshold = None
+    _thread_local._lite_layer_masks = {}
+    _thread_local._lite_call_idx = 0
+    _thread_local._lite_step = -1
+
+
 # ---------------------------------------------------------------------------
 # Triton attention implementation for diffusers layout
 # ---------------------------------------------------------------------------
@@ -124,7 +184,46 @@ def _diffusers_triton_attention(
 
     # Read skip-softmax config from thread-local storage
     threshold = getattr(_thread_local, "skip_threshold", None)
-    if threshold is not None and threshold > 0.0:
+    lite_threshold = getattr(_thread_local, "lite_threshold", None)
+
+    if lite_threshold is not None:
+        BLOCK_M, BLOCK_N = 128, 64
+        n_qt = math.ceil(seq_q / BLOCK_M)
+        n_kt = math.ceil(seq_k / BLOCK_N)
+        mask_shape = (batch, num_heads_q, n_qt, n_kt)
+
+        layer_idx = getattr(_thread_local, "_lite_call_idx", 0)
+        _thread_local._lite_call_idx = layer_idx + 1
+        step = getattr(_thread_local, "_lite_step", 0)
+        layer_masks = getattr(_thread_local, "_lite_layer_masks", {})
+
+        # Lazy-allocate mask pair for this layer
+        if layer_idx not in layer_masks:
+            layer_masks[layer_idx] = (
+                torch.zeros(mask_shape, device=device, dtype=torch.int8),
+                torch.zeros(mask_shape, device=device, dtype=torch.int8),
+            )
+            _thread_local._lite_layer_masks = layer_masks
+
+        mask_a, mask_b = layer_masks[layer_idx]
+
+        kw["lite_attention_threshold"] = lite_threshold
+        if step == 0:
+            # Warmup: dense attention + write skip mask to mask_a
+            kw["lite_attention_skip_write"] = mask_a
+            # skip_read omitted → warmup mode (kernel sees None → dense)
+        else:
+            # Inference: read from previous step's write, write to other buffer
+            # Step 0 wrote to mask_a → step 1 reads mask_a, writes mask_b
+            # Step 1 wrote to mask_b → step 2 reads mask_b, writes mask_a
+            if step % 2 == 1:
+                kw["lite_attention_skip_read"] = mask_a
+                kw["lite_attention_skip_write"] = mask_b
+            else:
+                kw["lite_attention_skip_read"] = mask_b
+                kw["lite_attention_skip_write"] = mask_a
+
+    elif threshold is not None and threshold > 0.0:
         kw["skip_softmax_threshold"] = threshold
         kw["skip_softmax_normalize_by_seqlen"] = getattr(
             _thread_local, "normalize_by_seqlen", False

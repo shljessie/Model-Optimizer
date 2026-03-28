@@ -117,6 +117,27 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         ),
     )
 
+    enable_lite_attention: bool = ModeloptField(
+        default=False,
+        title="Enable LiteAttention simulation.",
+        description=(
+            "When True, uses LiteAttention-style temporal skip-mask propagation. "
+            "Step 0 is warmup (dense + write mask), subsequent steps read the "
+            "mask from the previous step and skip tiles completely (zero contribution). "
+            "Mutually exclusive with skip-softmax and V2.5."
+        ),
+    )
+
+    lite_threshold: float = ModeloptField(
+        default=-5.0,
+        title="LiteAttention log2-space gap threshold.",
+        description=(
+            "Gap threshold in log2 space for LiteAttention tile skipping. "
+            "More negative = more conservative (fewer skips). "
+            "Typical range: -1.0 to -15.0. Only used when enable_lite_attention=True."
+        ),
+    )
+
     @field_validator("method")
     @classmethod
     def validate_method(cls, v):

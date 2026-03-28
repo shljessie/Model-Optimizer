@@ -177,6 +177,18 @@ def _attn_fwd_body(
     stride_vm_b=0,  # Vmean_cache strides
     stride_vm_h=0,
     stride_vm_t=0,
+    # --- LiteAttention simulation parameters (optional) ---
+    APPLY_LITE_ATTENTION: tl.constexpr = False,  # LiteAttention-style skip with mask
+    LITE_MODE_WARMUP: tl.constexpr = False,  # True=dense+write mask, False=read mask+sparse
+    lite_threshold=0.0,  # Raw log2-space gap threshold (e.g. -10.0)
+    Skip_read=None,  # [batch, num_q_heads, num_q_tiles, num_kv_tiles] int8
+    Skip_write=None,  # [batch, num_q_heads, num_q_tiles, num_kv_tiles] int8
+    stride_sr_b=0,
+    stride_sr_h=0,
+    stride_sr_qt=0,
+    stride_sw_b=0,
+    stride_sw_h=0,
+    stride_sw_qt=0,
 ):
     # --- Grid: (batch, num_q_heads, num_q_tiles) ---
     batch_idx = tl.program_id(0)
@@ -217,38 +229,157 @@ def _attn_fwd_body(
     for kv_start in range(0, kv_bound, BLOCK_N):
         kv_start = tl.multiple_of(kv_start, BLOCK_N)
 
-        # Load K^T [BLOCK_D, BLOCK_N]
-        k_offs = (kv_offset + kv_start + kv_pos[None, :]) * stride_kbs + dim_pos[:, None]
-        k = tl.load(
-            k_base + k_offs,
-            mask=((kv_start + kv_pos[None, :]) < seq_len_kv) & d_mask[:, None],
-            other=0.0,
-        )
+        if APPLY_LITE_ATTENTION:
+            # --- LiteAttention simulation ---
+            # In inference mode, check skip mask BEFORE loading K.
+            # Skipped tiles are completely bypassed (zero contribution).
+            kv_tile_idx = kv_start // BLOCK_N
+            should_skip = False
+            if not LITE_MODE_WARMUP:
+                sr_ptr = (
+                    Skip_read
+                    + batch_idx * stride_sr_b
+                    + head_idx * stride_sr_h
+                    + tile_q * stride_sr_qt
+                    + kv_tile_idx
+                )
+                should_skip = tl.load(sr_ptr) != 0
 
-        # scores = Q @ K^T * scale  [BLOCK_M, BLOCK_N]
-        scores = tl.dot(q, k) * qk_scale
-        scores = _apply_mask(scores, q_pos, kv_pos, seq_len_q, seq_len_kv, kv_start, IS_CAUSAL)
+            if not should_skip:
+                # Load K^T [BLOCK_D, BLOCK_N]
+                k_offs = (kv_offset + kv_start + kv_pos[None, :]) * stride_kbs + dim_pos[:, None]
+                k_lite = tl.load(
+                    k_base + k_offs,
+                    mask=((kv_start + kv_pos[None, :]) < seq_len_kv) & d_mask[:, None],
+                    other=0.0,
+                )
+                scores = tl.dot(q, k_lite) * qk_scale
+                scores = _apply_mask(
+                    scores, q_pos, kv_pos, seq_len_q, seq_len_kv, kv_start, IS_CAUSAL
+                )
 
-        if APPLY_SKIP_SOFTMAX:
-            # --- Skip-softmax: tile-level skipping only ---
-            # Check if ALL rows agree this tile is negligible.
-            # No per-row zeroing — KEEP tiles do full attention for all rows.
-            # (Per-row zeroing saves nothing since V is loaded + BMM2 runs
-            # anyway, but destroys information whose aggregate matters.)
-            tile_row_max = tl.max(scores, 1)  # [BLOCK_M]
-            can_skip = tile_row_max < (row_max + skip_threshold_log2)
-            all_skip = tl.min(can_skip.to(tl.int32)) == 1
+                # Evaluate skip criterion and write to skip_write mask
+                tile_row_max = tl.max(scores, 1)  # [BLOCK_M]
+                gap = tile_row_max - row_max  # per-row gap in log2 space
+                do_keep = gap > lite_threshold  # per-row decision
+                any_keep = tl.max(do_keep.to(tl.int32)) == 1
+                sw_ptr = (
+                    Skip_write
+                    + batch_idx * stride_sw_b
+                    + head_idx * stride_sw_h
+                    + tile_q * stride_sw_qt
+                    + kv_tile_idx
+                )
+                # 0 = keep, 1 = skip for next pass
+                tl.store(sw_ptr, (1 - any_keep.to(tl.int8)))
 
-            if not all_skip:
-                # KEEP: full attention for all rows (no per-row zeroing)
+                # Full softmax + V accumulation (always for visited tiles)
                 m_new = tl.maximum(row_max, tile_row_max)
                 p = tl.math.exp2(scores - m_new[:, None])
                 l_new = tl.sum(p, 1)
                 correction = tl.math.exp2(row_max - m_new)
                 row_sum = row_sum * correction + l_new
                 acc = acc * correction[:, None]
+                v_offs = (kv_offset + kv_start + kv_pos[:, None]) * stride_vbs + dim_pos[None, :]
+                v_lite = tl.load(
+                    v_base + v_offs,
+                    mask=((kv_start + kv_pos[:, None]) < seq_len_kv) & d_mask[None, :],
+                    other=0.0,
+                )
+                acc = tl.dot(p.to(v_lite.dtype), v_lite, acc)
+                row_max = m_new
+            else:
+                # Skipped: propagate skip to write mask (once skipped, stays skipped)
+                sw_ptr = (
+                    Skip_write
+                    + batch_idx * stride_sw_b
+                    + head_idx * stride_sw_h
+                    + tile_q * stride_sw_qt
+                    + kv_tile_idx
+                )
+                tl.store(sw_ptr, tl.cast(1, tl.int8))
+        else:
+            # --- Original path: shared K load for skip-softmax and standard ---
+            # Load K^T [BLOCK_D, BLOCK_N]
+            k_offs = (kv_offset + kv_start + kv_pos[None, :]) * stride_kbs + dim_pos[:, None]
+            k = tl.load(
+                k_base + k_offs,
+                mask=((kv_start + kv_pos[None, :]) < seq_len_kv) & d_mask[:, None],
+                other=0.0,
+            )
 
-                # Load V and accumulate
+            # scores = Q @ K^T * scale  [BLOCK_M, BLOCK_N]
+            scores = tl.dot(q, k) * qk_scale
+            scores = _apply_mask(scores, q_pos, kv_pos, seq_len_q, seq_len_kv, kv_start, IS_CAUSAL)
+
+            if APPLY_SKIP_SOFTMAX:
+                # --- Skip-softmax: tile-level skipping only ---
+                # Check if ALL rows agree this tile is negligible.
+                # No per-row zeroing — KEEP tiles do full attention for all rows.
+                # (Per-row zeroing saves nothing since V is loaded + BMM2 runs
+                # anyway, but destroys information whose aggregate matters.)
+                tile_row_max = tl.max(scores, 1)  # [BLOCK_M]
+                can_skip = tile_row_max < (row_max + skip_threshold_log2)
+                all_skip = tl.min(can_skip.to(tl.int32)) == 1
+
+                if not all_skip:
+                    # KEEP: full attention for all rows (no per-row zeroing)
+                    m_new = tl.maximum(row_max, tile_row_max)
+                    p = tl.math.exp2(scores - m_new[:, None])
+                    l_new = tl.sum(p, 1)
+                    correction = tl.math.exp2(row_max - m_new)
+                    row_sum = row_sum * correction + l_new
+                    acc = acc * correction[:, None]
+
+                    # Load V and accumulate
+                    v_offs = (kv_offset + kv_start + kv_pos[:, None]) * stride_vbs + dim_pos[None, :]
+                    v = tl.load(
+                        v_base + v_offs,
+                        mask=((kv_start + kv_pos[:, None]) < seq_len_kv) & d_mask[None, :],
+                        other=0.0,
+                    )
+                    acc = tl.dot(p.to(v.dtype), v, acc)
+                    row_max = m_new
+                elif APPLY_SKIP_V25:
+                    # Pool-K: approximate per-row weights with 128 exp2 instead of 8192.
+                    # K is already in SRAM as [BLOCK_D, BLOCK_N] from BMM1.
+                    # k_mean = mean(K, dim=0) in token dim → [BLOCK_D]
+                    n_valid_kv = tl.minimum(seq_len_kv - kv_start, BLOCK_N).to(tl.float32)
+                    n_valid_kv = tl.maximum(n_valid_kv, 1.0)
+                    k_mean = tl.sum(k, 1) / n_valid_kv  # [BLOCK_D] (k is [BLOCK_D, BLOCK_N])
+
+                    # approx_score = Q @ k_mean * scale * BLOCK_N
+                    # The * BLOCK_N approximates sum_j(exp(q·k_j)) ≈ N * exp(q·mean(k))
+                    approx_score = tl.sum(q * k_mean[None, :], 1) * qk_scale  # [BLOCK_M]
+
+                    m_new = tl.maximum(row_max, approx_score)
+                    p_approx = tl.math.exp2(approx_score - m_new) * n_valid_kv  # [BLOCK_M], 128 exp2
+                    correction = tl.math.exp2(row_max - m_new)
+                    row_sum = row_sum * correction + p_approx
+                    acc = acc * correction[:, None]
+
+                    # Load fresh precomputed v_mean from L2 cache
+                    kv_tile_idx = kv_start // BLOCK_N
+                    vm_ptr = (
+                        Vmean_cache
+                        + batch_idx * stride_vm_b
+                        + kv_head_idx * stride_vm_h
+                        + kv_tile_idx * stride_vm_t
+                        + dim_pos
+                    )
+                    fresh_v_mean = tl.load(vm_ptr, mask=d_mask, other=0.0)  # [BLOCK_D]
+
+                    acc += p_approx[:, None] * fresh_v_mean[None, :]
+                    row_max = m_new
+            else:
+                # --- Standard path: no skip check ---
+                m_new = tl.maximum(row_max, tl.max(scores, 1))
+                p = tl.math.exp2(scores - m_new[:, None])
+                l_new = tl.sum(p, 1)
+                correction = tl.math.exp2(row_max - m_new)
+                row_sum = row_sum * correction + l_new
+                acc = acc * correction[:, None]
+
                 v_offs = (kv_offset + kv_start + kv_pos[:, None]) * stride_vbs + dim_pos[None, :]
                 v = tl.load(
                     v_base + v_offs,
@@ -257,54 +388,6 @@ def _attn_fwd_body(
                 )
                 acc = tl.dot(p.to(v.dtype), v, acc)
                 row_max = m_new
-            elif APPLY_SKIP_V25:
-                # Pool-K: approximate per-row weights with 128 exp2 instead of 8192.
-                # K is already in SRAM as [BLOCK_D, BLOCK_N] from BMM1.
-                # k_mean = mean(K, dim=0) in token dim → [BLOCK_D]
-                n_valid_kv = tl.minimum(seq_len_kv - kv_start, BLOCK_N).to(tl.float32)
-                n_valid_kv = tl.maximum(n_valid_kv, 1.0)
-                k_mean = tl.sum(k, 1) / n_valid_kv  # [BLOCK_D] (k is [BLOCK_D, BLOCK_N])
-
-                # approx_score = Q @ k_mean * scale * BLOCK_N
-                # The * BLOCK_N approximates sum_j(exp(q·k_j)) ≈ N * exp(q·mean(k))
-                approx_score = tl.sum(q * k_mean[None, :], 1) * qk_scale  # [BLOCK_M]
-
-                m_new = tl.maximum(row_max, approx_score)
-                p_approx = tl.math.exp2(approx_score - m_new) * n_valid_kv  # [BLOCK_M], 128 exp2
-                correction = tl.math.exp2(row_max - m_new)
-                row_sum = row_sum * correction + p_approx
-                acc = acc * correction[:, None]
-
-                # Load fresh precomputed v_mean from L2 cache
-                kv_tile_idx = kv_start // BLOCK_N
-                vm_ptr = (
-                    Vmean_cache
-                    + batch_idx * stride_vm_b
-                    + kv_head_idx * stride_vm_h
-                    + kv_tile_idx * stride_vm_t
-                    + dim_pos
-                )
-                fresh_v_mean = tl.load(vm_ptr, mask=d_mask, other=0.0)  # [BLOCK_D]
-
-                acc += p_approx[:, None] * fresh_v_mean[None, :]
-                row_max = m_new
-        else:
-            # --- Standard path: no skip check ---
-            m_new = tl.maximum(row_max, tl.max(scores, 1))
-            p = tl.math.exp2(scores - m_new[:, None])
-            l_new = tl.sum(p, 1)
-            correction = tl.math.exp2(row_max - m_new)
-            row_sum = row_sum * correction + l_new
-            acc = acc * correction[:, None]
-
-            v_offs = (kv_offset + kv_start + kv_pos[:, None]) * stride_vbs + dim_pos[None, :]
-            v = tl.load(
-                v_base + v_offs,
-                mask=((kv_start + kv_pos[:, None]) < seq_len_kv) & d_mask[None, :],
-                other=0.0,
-            )
-            acc = tl.dot(p.to(v.dtype), v, acc)
-            row_max = m_new
 
     # --- Final normalization: output = acc / row_sum ---
     acc = acc / row_sum[:, None]
@@ -989,6 +1072,95 @@ def _attention_v25_forward(
     return o
 
 
+def _attention_lite_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    max_input_len: int,
+    is_causal: bool,
+    sm_scale: float,
+    b_start_loc_k: torch.Tensor,
+    b_seq_len_k: torch.Tensor,
+    max_input_len_k: int,
+    lite_threshold: float,
+    skip_read: torch.Tensor | None,
+    skip_write: torch.Tensor,
+) -> torch.Tensor:
+    """LiteAttention simulation forward.
+
+    Warmup mode (skip_read is None): dense attention + write skip mask.
+    Inference mode (skip_read provided): read mask, skip marked tiles, write updated mask.
+
+    No autograd — simulation-only forward pass.
+    """
+    HEAD_DIM = q.shape[2]
+    num_q_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    kv_group_num = num_q_heads // num_kv_heads
+    batch = b_seq_len.shape[0]
+    qk_scale = sm_scale * LOG2E
+    BLOCK_D = triton.next_power_of_2(HEAD_DIM)
+    BLOCK_M = 128
+    BLOCK_N = 64
+
+    warmup = skip_read is None
+
+    o = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], num_q_heads, device=q.device, dtype=torch.float32)
+
+    grid = (batch, num_q_heads, triton.cdiv(max_input_len, BLOCK_M))
+
+    _attn_fwd_body[grid](
+        q,
+        k,
+        v,
+        qk_scale,
+        b_start_loc,
+        b_seq_len,
+        b_start_loc_k,
+        b_seq_len_k,
+        o,
+        lse,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o.stride(0),
+        o.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        N_CTX=max_input_len,
+        kv_group_num=kv_group_num,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+        BLOCK_N=BLOCK_N,
+        IS_CAUSAL=is_causal,
+        HEAD_DIM=HEAD_DIM,
+        STORE_LSE=False,
+        APPLY_SKIP_SOFTMAX=False,
+        skip_threshold_log2=0.0,
+        APPLY_SKIP_V25=False,
+        APPLY_LITE_ATTENTION=True,
+        LITE_MODE_WARMUP=warmup,
+        lite_threshold=lite_threshold,
+        Skip_read=skip_read,
+        Skip_write=skip_write,
+        stride_sr_b=skip_read.stride(0) if skip_read is not None else 0,
+        stride_sr_h=skip_read.stride(1) if skip_read is not None else 0,
+        stride_sr_qt=skip_read.stride(2) if skip_read is not None else 0,
+        stride_sw_b=skip_write.stride(0),
+        stride_sw_h=skip_write.stride(1),
+        stride_sw_qt=skip_write.stride(2),
+        num_warps=4,
+        num_stages=1,
+    )
+    return o
+
+
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1005,6 +1177,9 @@ def attention(
     skip_softmax_threshold: float | None = None,
     skip_softmax_normalize_by_seqlen: bool = False,
     v_mean_cache: torch.Tensor | None = None,
+    lite_attention_threshold: float | None = None,
+    lite_attention_skip_read: torch.Tensor | None = None,
+    lite_attention_skip_write: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Variable-length flash attention with GQA, autograd, and optional skip-softmax.
 
@@ -1029,6 +1204,12 @@ def attention(
             ``[batch, num_kv_heads, num_kv_tiles, head_dim_padded]``.
             Populated by a precompute kernel before attention. Skipped tiles
             use pool-K approximate weight + this fresh v_mean.
+        lite_attention_threshold: LiteAttention-style log2-space gap threshold
+            (e.g. -10.0). When set, enables LiteAttention simulation mode.
+        lite_attention_skip_read: ``[batch, num_q_heads, q_tiles, k_tiles]``
+            int8 mask from previous pass. None = warmup (dense + write mask).
+        lite_attention_skip_write: ``[batch, num_q_heads, q_tiles, k_tiles]``
+            int8 output mask. Required when ``lite_attention_threshold`` is set.
 
     Returns:
         Output tensor [total_q_tokens, num_q_heads, head_dim].
@@ -1037,6 +1218,34 @@ def attention(
 
     sm_scale = 1.0 / (q.shape[2] ** 0.5) if softmax_scale is None else softmax_scale
 
+    # --- LiteAttention simulation path ---
+    use_lite = lite_attention_threshold is not None and lite_attention_skip_write is not None
+    if use_lite:
+        if b_seq_len_k is None:
+            b_seq_len_k = b_seq_len
+            b_start_loc_k = b_start_loc
+            max_input_len_k = max_input_len
+        assert b_start_loc_k is not None
+        assert max_input_len_k is not None
+
+        return _attention_lite_forward(
+            q,
+            k,
+            v,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            is_causal,
+            sm_scale,
+            b_start_loc_k,
+            b_seq_len_k,
+            max_input_len_k,
+            lite_attention_threshold,
+            lite_attention_skip_read,
+            lite_attention_skip_write,
+        )
+
+    # --- V2.5 path ---
     apply_skip = skip_softmax_threshold is not None and skip_softmax_threshold > 0.0
     use_v25 = apply_skip and v_mean_cache is not None
 

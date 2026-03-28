@@ -89,43 +89,15 @@ def parse_args():
             "sparse_25",
             "sparse_50",
             "sparse_75",
-            "sparse_v25_25",
-            "sparse_v25_50",
-            "sparse_v25_75",
-            "sparse_v252_25",
-            "sparse_v252_50",
-            "sparse_v252_75",
-            "sparse_v252dbg_25",
-            "sparse_v252dbg_50",
-            "sparse_v252dbg_75",
-            "sparse_v252dbg2_25",
-            "sparse_v252dbg2_50",
-            "sparse_v252dbg2_75",
-            "sparse_v252dbg4_25",
-            "sparse_v252dbg4_50",
-            "sparse_v252dbg4_75",
-            "sparse_v252dbg5_25",
-            "sparse_v252dbg5_50",
-            "sparse_v252dbg5_75",
-            "sparse_v252dbg6_25",
-            "sparse_v252dbg6_50",
-            "sparse_v252dbg6_75",
-            "sparse_v252dbg7_25",
-            "sparse_v252dbg7_50",
-            "sparse_v252dbg7_75",
-            "sparse_v252dbg8_25",
-            "sparse_v252dbg8_50",
-            "sparse_v252dbg8_75",
-            "sparse_v252dbg3_25",
-            "sparse_v252dbg3_50",
-            "sparse_v252dbg3_75",
-            "sparse_v252dbg9_75",
-            "sparse_v252dbg10_75",
-            "sparse_v252dbg11_75",
-            "sparse_v252dbg12_75",
-            "sparse_v252dbg13_75",
+            "lite",
         ],
         help="Which experiment to run",
+    )
+    parser.add_argument(
+        "--lite-threshold",
+        type=float,
+        default=-10.0,
+        help="LiteAttention log2-space gap threshold (negative, e.g. -3.0, -5.0, -10.0)",
     )
     parser.add_argument(
         "--skip-first-last",
@@ -352,33 +324,108 @@ def run_sparse(pipeline, args, output_dir, target_sparsity):
     return elapsed
 
 
-FIXED_THRESHOLDS = {
-    75: 0.054199,  # p25 from calibration at 75% sparsity
-    50: 0.234375,  # p50 from calibration at 50% sparsity
-    25: 0.535156,  # p75 from calibration at 25% sparsity
-}
+## Fixed-threshold V2.5 experiments (commented out — use calibration-based instead)
+# FIXED_THRESHOLDS = {
+#     75: 0.054199,  # p25 from calibration at 75% sparsity
+#     50: 0.234375,  # p50 from calibration at 50% sparsity
+#     25: 0.535156,  # p75 from calibration at 25% sparsity
+# }
+#
+# def run_sparse_v25(
+#     pipeline, args, output_dir, target_sparsity, version="v25", fixed_threshold=None
+# ):
+#     """Sparse V2.5+: Triton FA kernel + skip-softmax + pool-K + precomputed v_mean."""
+#     import modelopt.torch.sparsity.attention_sparsity as mtsa
+#     from modelopt.torch.sparsity.attention_sparsity.sparse_attention import SparseAttentionModule
+#
+#     pct = int(target_sparsity * 100)
+#     label = version.upper().replace("V", "V.")
+#     print("=" * 60)
+#     print(f"EXPERIMENT: {pct}% sparsity {label} (Triton + pool-K + fresh v_mean)")
+#     print("=" * 60)
+#
+#     transformer = pipeline.stage_1_model_ledger.transformer()
+#     pipeline.stage_1_model_ledger.transformer = lambda: transformer
+#
+#     # Use fixed threshold if available, otherwise calibrate
+#     use_fixed = fixed_threshold is not None or pct in FIXED_THRESHOLDS
+#     threshold = fixed_threshold if fixed_threshold is not None else FIXED_THRESHOLDS.get(pct)
+#
+#     sparse_cfg = {
+#         "*.attn1": {
+#             "method": "triton_skip_softmax_diffusion",
+#             "br": 128,
+#             "bc": 128,
+#             "backend": "triton",
+#             "is_causal": False,
+#             "collect_stats": True,
+#             "enable": True,
+#             "enable_v25": True,
+#         },
+#         "*.attn2": {"enable": False},
+#         "*audio_attn1*": {"enable": False},
+#         "*audio_attn2*": {"enable": False},
+#         "*audio_to_video_attn*": {"enable": False},
+#         "*video_to_audio_attn*": {"enable": False},
+#         "default": {"enable": False},
+#     }
+#
+#     # Exclude first/last layers
+#     for i in range(args.skip_first_last):
+#         sparse_cfg[f"*transformer_blocks.{i}.attn*"] = {"enable": False}
+#         sparse_cfg[f"*transformer_blocks.{47 - i}.attn*"] = {"enable": False}
+#
+#     if use_fixed and threshold is not None:
+#         # Bypass calibration: sparsify without forward_loop, then set threshold manually
+#         print(f"Using fixed threshold={threshold} (skipping calibration)")
+#         mtsa.sparsify(transformer, {"sparse_cfg": sparse_cfg})
+#         for module in transformer.modules():
+#             if isinstance(module, SparseAttentionModule) and module.is_enabled:
+#                 module._sparse_method_instance.skip_softmax_threshold = threshold
+#     else:
+#         sparse_cfg["calibration"] = {"target_sparse_ratio": {"prefill": target_sparsity}}
+#         forward_loop = build_calibration_forward_loop(
+#             pipeline, num_steps=args.calib_steps, num_frames=args.calib_frames
+#         )
+#         mtsa.sparsify(transformer, {"sparse_cfg": sparse_cfg}, forward_loop=forward_loop)
+#
+#     output_path = os.path.join(output_dir, f"sparse_{version}_{pct}pct.mp4")
+#     elapsed = generate_video(pipeline, args, output_path)
+#     print(f"{pct}% sparsity {label}: {elapsed:.1f}s → {output_path}")
+#     return elapsed
 
 
-def run_sparse_v25(
-    pipeline, args, output_dir, target_sparsity, version="v25", fixed_threshold=None
-):
-    """Sparse V2.5+: Triton FA kernel + skip-softmax + pool-K + precomputed v_mean."""
+def run_lite_attention(pipeline, args, output_dir, lite_threshold):
+    """LiteAttention simulation: temporal skip-mask propagation (zero contribution for skips).
+
+    Uses mtsa.sparsify() with triton_skip_softmax_diffusion to activate the Triton
+    backend on all attn1 modules (same as V2.5 path). Then sets the thread-local
+    lite_attention config so the dispatcher uses LiteAttention skip masks instead
+    of skip-softmax.
+
+    Each layer gets its own double-buffered skip mask pair.
+    Step 0 (warmup): dense attention for all layers, writes skip mask.
+    Step 1+: each layer reads its own mask from step T-1, writes for step T+1.
+    The skip mask from denoising step T is reused at step T+1 (temporal coherence).
+    """
     import modelopt.torch.sparsity.attention_sparsity as mtsa
     from modelopt.torch.sparsity.attention_sparsity.sparse_attention import SparseAttentionModule
 
-    pct = int(target_sparsity * 100)
-    label = version.upper().replace("V", "V.")
+    from modelopt.torch.sparsity.attention_sparsity.kernels.ltx_triton_attention import (
+        lite_attention_get_sparsity,
+        lite_attention_set_num_layers,
+        lite_attention_step_boundary,
+    )
+
     print("=" * 60)
-    print(f"EXPERIMENT: {pct}% sparsity {label} (Triton + pool-K + fresh v_mean)")
+    print(f"EXPERIMENT: LiteAttention simulation (threshold={lite_threshold})")
     print("=" * 60)
 
     transformer = pipeline.stage_1_model_ledger.transformer()
     pipeline.stage_1_model_ledger.transformer = lambda: transformer
 
-    # Use fixed threshold if available, otherwise calibrate
-    use_fixed = fixed_threshold is not None or pct in FIXED_THRESHOLDS
-    threshold = fixed_threshold if fixed_threshold is not None else FIXED_THRESHOLDS.get(pct)
-
+    # Use mtsa.sparsify with enable_lite_attention — this activates the Triton
+    # dispatch path and passes lite_threshold through the existing context manager.
     sparse_cfg = {
         "*.attn1": {
             "method": "triton_skip_softmax_diffusion",
@@ -386,9 +433,10 @@ def run_sparse_v25(
             "bc": 128,
             "backend": "triton",
             "is_causal": False,
-            "collect_stats": True,
+            "collect_stats": False,
             "enable": True,
-            "enable_v25": True,
+            "enable_lite_attention": True,
+            "lite_threshold": lite_threshold,
         },
         "*.attn2": {"enable": False},
         "*audio_attn1*": {"enable": False},
@@ -398,28 +446,52 @@ def run_sparse_v25(
         "default": {"enable": False},
     }
 
-    # Exclude first/last layers
+    # Exclude first/last layers (same as skip-softmax experiments)
     for i in range(args.skip_first_last):
         sparse_cfg[f"*transformer_blocks.{i}.attn*"] = {"enable": False}
         sparse_cfg[f"*transformer_blocks.{47 - i}.attn*"] = {"enable": False}
 
-    if use_fixed and threshold is not None:
-        # Bypass calibration: sparsify without forward_loop, then set threshold manually
-        print(f"Using fixed threshold={threshold} (skipping calibration)")
-        mtsa.sparsify(transformer, {"sparse_cfg": sparse_cfg})
-        for module in transformer.modules():
-            if isinstance(module, SparseAttentionModule) and module.is_enabled:
-                module._sparse_method_instance.skip_softmax_threshold = threshold
-    else:
-        sparse_cfg["calibration"] = {"target_sparse_ratio": {"prefill": target_sparsity}}
-        forward_loop = build_calibration_forward_loop(
-            pipeline, num_steps=args.calib_steps, num_frames=args.calib_frames
-        )
-        mtsa.sparsify(transformer, {"sparse_cfg": sparse_cfg}, forward_loop=forward_loop)
+    mtsa.sparsify(transformer, {"sparse_cfg": sparse_cfg})
 
-    output_path = os.path.join(output_dir, f"sparse_{version}_{pct}pct.mp4")
-    elapsed = generate_video(pipeline, args, output_path)
-    print(f"{pct}% sparsity {label}: {elapsed:.1f}s → {output_path}")
+    # Count enabled attention layers and tell the lite dispatch code
+    num_enabled = sum(
+        1 for m in transformer.modules()
+        if isinstance(m, SparseAttentionModule) and m.is_enabled
+    )
+    lite_attention_set_num_layers(num_enabled)
+    print(f"  LiteAttention: {num_enabled} enabled layers, threshold={lite_threshold}")
+
+    # Hook step_boundary for logging (step advancement is handled by call_idx cycling)
+    _step_count = [0]
+
+    def _step_hook(module, args):
+        lite_attention_step_boundary()
+
+    def _post_step_hook(module, args, output):
+        step = _step_count[0]
+        if step < 5 or step % 10 == 0:
+            sparsity = lite_attention_get_sparsity()
+            if sparsity is not None:
+                print(f"  [step {step}] LiteAttention sparsity: {sparsity:.1%}", flush=True)
+        _step_count[0] += 1
+
+    pre_handle = transformer.register_forward_pre_hook(_step_hook)
+    post_handle = transformer.register_forward_hook(_post_step_hook)
+
+    try:
+        tag = f"lite_t{abs(lite_threshold):.1f}"
+        output_path = os.path.join(output_dir, f"{tag}.mp4")
+        elapsed = generate_video(pipeline, args, output_path)
+        final_sparsity = lite_attention_get_sparsity()
+        sp_str = f"{final_sparsity:.1%}" if final_sparsity is not None else "N/A"
+        print(
+            f"LiteAttention (threshold={lite_threshold}): {elapsed:.1f}s, "
+            f"final sparsity={sp_str} → {output_path}"
+        )
+    finally:
+        pre_handle.remove()
+        post_handle.remove()
+
     return elapsed
 
 
@@ -436,56 +508,8 @@ def main():
         run_baseline(pipeline, args, args.output_dir)
     elif experiment == "triton_baseline":
         run_triton_baseline(pipeline, args, args.output_dir)
-    elif experiment == "sparse_v252dbg9_75":
-        run_sparse_v25(
-            pipeline, args, args.output_dir, 0.75, version="v252dbg9", fixed_threshold=0.054199
-        )
-    elif experiment == "sparse_v252dbg10_75":
-        run_sparse_v25(
-            pipeline, args, args.output_dir, 0.75, version="v252dbg10", fixed_threshold=0.054199
-        )
-    elif experiment == "sparse_v252dbg11_75":
-        run_sparse_v25(
-            pipeline, args, args.output_dir, 0.75, version="v252dbg11", fixed_threshold=0.054199
-        )
-    elif experiment == "sparse_v252dbg12_75":
-        run_sparse_v25(
-            pipeline, args, args.output_dir, 0.75, version="v252dbg12", fixed_threshold=0.054199
-        )
-    elif experiment == "sparse_v252dbg13_75":
-        run_sparse_v25(
-            pipeline, args, args.output_dir, 0.75, version="v252dbg13", fixed_threshold=0.054199
-        )
-    elif experiment.startswith("sparse_v252dbg8_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg8")
-    elif experiment.startswith("sparse_v252dbg7_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg7")
-    elif experiment.startswith("sparse_v252dbg6_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg6")
-    elif experiment.startswith("sparse_v252dbg5_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg5")
-    elif experiment.startswith("sparse_v252dbg4_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg4")
-    elif experiment.startswith("sparse_v252dbg3_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg3")
-    elif experiment.startswith("sparse_v252dbg2_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg2")
-    elif experiment.startswith("sparse_v252dbg_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252dbg")
-    elif experiment.startswith("sparse_v252_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0, version="v252")
-    elif experiment.startswith("sparse_v25_"):
-        pct = int(experiment.split("_")[2])
-        run_sparse_v25(pipeline, args, args.output_dir, pct / 100.0)
+    elif experiment == "lite":
+        run_lite_attention(pipeline, args, args.output_dir, lite_threshold=args.lite_threshold)
     elif experiment.startswith("sparse_"):
         pct = int(experiment.split("_")[1])
         run_sparse(pipeline, args, args.output_dir, pct / 100.0)

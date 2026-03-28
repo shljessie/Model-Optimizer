@@ -788,3 +788,199 @@ class TestSkipSoftmaxV25:
         assert not torch.isnan(out_v25).any(), "NaN with partial last tile"
         err = (out_v25 - out_dense).abs().mean().item()
         assert err < 0.1, f"V2.51 partial tile error too large: {err:.6f}"
+
+
+@pytest.mark.skipif(not TRITON_KERNEL_AVAILABLE, reason="Need CUDA + triton")
+class TestLiteAttentionSimulation:
+    """LiteAttention-style skip mask simulation tests."""
+
+    def _make_inputs(
+        self,
+        batch=1,
+        seq_len=2048,
+        num_heads=4,
+        num_kv_heads=4,
+        head_dim=64,
+        dtype=torch.float32,
+    ):
+        """Create diffusion-like Q/K/V with moderate clustering (same as V2.51 tests)."""
+        total = batch * seq_len
+        BLOCK_N = 64
+        torch.manual_seed(42)
+        centroid = torch.randn(1, 1, head_dim, device="cuda", dtype=dtype)
+        q = centroid.expand(total, num_heads, head_dim) + torch.randn(
+            total, num_heads, head_dim, device="cuda", dtype=dtype
+        ) * 0.8
+        k = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=dtype) * 0.5
+        for tile_i in [0, 5]:
+            s = tile_i * BLOCK_N
+            k[s : s + BLOCK_N] = centroid.expand(
+                BLOCK_N, num_kv_heads, head_dim
+            ) + torch.randn(BLOCK_N, num_kv_heads, head_dim, device="cuda", dtype=dtype) * 0.5
+        v = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+        b_seq_len = torch.full((batch,), seq_len, device="cuda", dtype=torch.int32)
+        b_start_loc = torch.zeros(batch, device="cuda", dtype=torch.int32)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], dim=0)
+        return q, k, v, b_start_loc, b_seq_len
+
+    def _alloc_skip_masks(self, batch, num_heads, seq_len):
+        """Allocate skip_read and skip_write masks."""
+        import math
+
+        BLOCK_M, BLOCK_N = 128, 64
+        num_q_tiles = math.ceil(seq_len / BLOCK_M)
+        num_kv_tiles = math.ceil(seq_len / BLOCK_N)
+        shape = (batch, num_heads, num_q_tiles, num_kv_tiles)
+        skip_write = torch.zeros(shape, device="cuda", dtype=torch.int8)
+        return skip_write
+
+    def _run_warmup(self, q, k, v, locs, lens, seq_len, threshold, num_heads):
+        """Run LiteAttention warmup: dense attention + write skip mask."""
+        skip_write = self._alloc_skip_masks(lens.shape[0], num_heads, seq_len)
+        out = attention(
+            q, k, v, locs, lens, seq_len,
+            is_causal=False,
+            lite_attention_threshold=threshold,
+            lite_attention_skip_write=skip_write,
+        )
+        return out, skip_write
+
+    def _run_infer(self, q, k, v, locs, lens, seq_len, threshold, num_heads, skip_read):
+        """Run LiteAttention inference: read mask + sparse + write new mask."""
+        skip_write = self._alloc_skip_masks(lens.shape[0], num_heads, seq_len)
+        out = attention(
+            q, k, v, locs, lens, seq_len,
+            is_causal=False,
+            lite_attention_threshold=threshold,
+            lite_attention_skip_read=skip_read,
+            lite_attention_skip_write=skip_write,
+        )
+        return out, skip_write
+
+    def test_warmup_matches_dense(self):
+        """Warmup mode (no read mask) should produce output identical to dense."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+        out_warmup, _ = self._run_warmup(q, k, v, locs, lens, seq_len, -10.0, num_heads)
+        torch.testing.assert_close(out_warmup, out_dense, rtol=1e-4, atol=1e-4)
+
+    def test_skip_mask_generated(self):
+        """Warmup should generate a non-trivial skip mask for clustered data."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        # Use a moderate threshold so some tiles are marked for skipping
+        _, skip_write = self._run_warmup(q, k, v, locs, lens, seq_len, -5.0, num_heads)
+        n_skip = (skip_write == 1).sum().item()
+        n_total = skip_write.numel()
+        assert n_skip > 0, "Expected some tiles to be marked for skipping"
+        assert n_skip < n_total, "Expected some tiles to be kept"
+
+    def test_inference_no_nan_inf(self):
+        """Inference with skip mask should produce finite output."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        _, skip_mask = self._run_warmup(q, k, v, locs, lens, seq_len, -5.0, num_heads)
+        out_infer, _ = self._run_infer(
+            q, k, v, locs, lens, seq_len, -5.0, num_heads, skip_mask
+        )
+        assert not torch.isnan(out_infer).any(), "NaN in LiteAttention inference output"
+        assert not torch.isinf(out_infer).any(), "Inf in LiteAttention inference output"
+
+    def test_inference_with_skip_mask(self):
+        """Inference with skip mask should differ from dense when tiles are skipped."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+        _, skip_mask = self._run_warmup(q, k, v, locs, lens, seq_len, -5.0, num_heads)
+        n_skip = (skip_mask == 1).sum().item()
+        if n_skip == 0:
+            pytest.skip("No tiles skipped with this threshold")
+        out_infer, _ = self._run_infer(
+            q, k, v, locs, lens, seq_len, -5.0, num_heads, skip_mask
+        )
+        # Output should differ since some tiles are completely zeroed
+        assert not torch.allclose(out_infer, out_dense, atol=1e-4), (
+            "Inference output should differ from dense when tiles are skipped"
+        )
+        # But error should be bounded
+        err = (out_infer - out_dense).abs().mean().item()
+        assert err < 0.5, f"LiteAttention inference error too large: {err:.6f}"
+
+    def test_lite_vs_v25_comparison(self):
+        """Compare LiteAttention (zero skip) vs V2.51 (approximate skip) error vs dense."""
+        import math
+
+        import triton
+
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+
+        # LiteAttention: warmup -> inference (zero contribution for skipped tiles)
+        _, skip_mask = self._run_warmup(q, k, v, locs, lens, seq_len, -5.0, num_heads)
+        out_lite, _ = self._run_infer(
+            q, k, v, locs, lens, seq_len, -5.0, num_heads, skip_mask
+        )
+
+        # V2.51: pool-K + v_mean approximation
+        BLOCK_N = 64
+        batch = lens.shape[0]
+        n_kv_tiles = math.ceil(seq_len / BLOCK_N)
+        BLOCK_D = triton.next_power_of_2(head_dim)
+        v_mean_cache = torch.zeros(
+            batch, num_kv_heads, n_kv_tiles, BLOCK_D, device="cuda", dtype=torch.float32
+        )
+        out_v25 = attention(
+            q, k, v, locs, lens, seq_len,
+            is_causal=False,
+            skip_softmax_threshold=0.15,
+            skip_softmax_normalize_by_seqlen=True,
+            v_mean_cache=v_mean_cache,
+        )
+
+        err_lite = (out_lite - out_dense).abs().mean().item()
+        err_v25 = (out_v25 - out_dense).abs().mean().item()
+
+        # V2.51 should be closer to dense than LiteAttention (which zeros skipped tiles)
+        assert err_v25 < err_lite, (
+            f"V2.51 should have lower error than LiteAttention zero-skip: "
+            f"err_v25={err_v25:.6f}, err_lite={err_lite:.6f}"
+        )
+
+    def test_skip_propagation_monotonic(self):
+        """Consecutive inference passes: skip count should be monotonically non-decreasing."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        # Warmup
+        _, mask0 = self._run_warmup(q, k, v, locs, lens, seq_len, -5.0, num_heads)
+        n_skip_0 = (mask0 == 1).sum().item()
+
+        # Inference pass 1
+        _, mask1 = self._run_infer(q, k, v, locs, lens, seq_len, -5.0, num_heads, mask0)
+        n_skip_1 = (mask1 == 1).sum().item()
+
+        # Inference pass 2
+        _, mask2 = self._run_infer(q, k, v, locs, lens, seq_len, -5.0, num_heads, mask1)
+        n_skip_2 = (mask2 == 1).sum().item()
+
+        assert n_skip_1 >= n_skip_0, (
+            f"Skip count should be monotonically non-decreasing: "
+            f"pass0={n_skip_0}, pass1={n_skip_1}"
+        )
+        assert n_skip_2 >= n_skip_1, (
+            f"Skip count should be monotonically non-decreasing: "
+            f"pass1={n_skip_1}, pass2={n_skip_2}"
+        )

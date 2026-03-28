@@ -39,23 +39,42 @@ def set_ltx_triton_context(
     threshold: float | None = None,
     normalize_by_seqlen: bool = False,
     enable_v25: bool = False,
+    lite_threshold: float | None = None,
 ) -> None:
-    """Set thread-local Triton skip-softmax config for LTX-2 attention."""
+    """Set thread-local Triton config for LTX-2 attention.
+
+    Called per-module per-forward. Lite attention state (_lite_layer_masks,
+    _lite_step, _lite_call_idx) is initialized only once and preserved
+    across calls — step_boundary() manages the step counter.
+    """
     _thread_local.active = active
     _thread_local.threshold = threshold
     _thread_local.normalize_by_seqlen = normalize_by_seqlen
     _thread_local.enable_v25 = enable_v25
+    _thread_local.lite_threshold = lite_threshold
     if not enable_v25:
         _thread_local.v_mean_cache = None
+    # Initialize lite state only if not already set
+    if lite_threshold is not None and not hasattr(_thread_local, "_lite_layer_masks"):
+        _thread_local._lite_layer_masks = {}
+        _thread_local._lite_call_idx = 0
+        _thread_local._lite_step = -1
 
 
 def clear_ltx_triton_context() -> None:
-    """Clear thread-local Triton skip-softmax config."""
+    """Clear thread-local Triton config.
+
+    Note: lite attention state (_lite_layer_masks, _lite_step, _lite_call_idx)
+    is NOT reset here because this is called after each module's forward.
+    Lite state persists across modules and denoising steps by design.
+    """
     _thread_local.active = False
     _thread_local.threshold = None
     _thread_local.normalize_by_seqlen = False
     _thread_local.enable_v25 = False
     _thread_local.v_mean_cache = None
+    # lite_threshold is preserved — set/cleared by set_ltx_triton_context only
+    # _lite_layer_masks, _lite_step, _lite_call_idx persist across calls
 
 
 def _get_ltx_triton_context() -> tuple[bool, float | None, bool, bool]:
@@ -66,6 +85,41 @@ def _get_ltx_triton_context() -> tuple[bool, float | None, bool, bool]:
         getattr(_thread_local, "normalize_by_seqlen", False),
         getattr(_thread_local, "enable_v25", False),
     )
+
+
+# ---------------------------------------------------------------------------
+# LiteAttention simulation config (LTX-2 path)
+# ---------------------------------------------------------------------------
+def lite_attention_set_num_layers(num_layers: int) -> None:
+    """Set number of enabled attention layers per transformer forward.
+
+    Call once after mtsa.sparsify() so the dispatch code can compute
+    layer_idx = call_idx % num_layers (sharing masks across CFG passes).
+    """
+    _thread_local._lite_num_layers = num_layers
+
+
+def lite_attention_step_boundary() -> None:
+    """Notify a transformer forward is about to start.
+
+    Increments the forward counter used for denoising step detection.
+    """
+    _thread_local._lite_fwd_count = getattr(_thread_local, "_lite_fwd_count", 0) + 1
+
+
+def lite_attention_get_sparsity() -> float | None:
+    """Return average sparsity (fraction of tiles skipped) across all layers."""
+    masks = getattr(_thread_local, "_lite_layer_masks", {})
+    if not masks:
+        return None
+    step = getattr(_thread_local, "_lite_step", -1)
+    total_skip = 0
+    total_tiles = 0
+    for _layer_idx, (mask_a, mask_b) in masks.items():
+        mask = mask_a if step % 2 == 0 else mask_b
+        total_skip += (mask == 1).sum().item()
+        total_tiles += mask.numel()
+    return total_skip / total_tiles if total_tiles > 0 else 0.0
 
 
 def _ltx_triton_attention(
@@ -114,8 +168,65 @@ def _ltx_triton_attention(
         kw["b_seq_len_k"] = b_seq_len_k
         kw["max_input_len_k"] = seq_k
 
-    # Skip-softmax threshold
-    if threshold is not None and threshold > 0.0:
+    # LiteAttention simulation (takes priority over skip-softmax)
+    lite_threshold = getattr(_thread_local, "lite_threshold", None)
+    if lite_threshold is not None:
+        BLOCK_M, BLOCK_N = 128, 64
+        n_qt = math.ceil(seq_q / BLOCK_M)
+        n_kt = math.ceil(seq_k / BLOCK_N)
+        mask_shape = (b, heads, n_qt, n_kt)
+
+        # With CFG, transformer.forward() is called N times per denoising step.
+        # Each forward runs L enabled layers. All CFG passes at the same layer
+        # share the same mask: layer_idx = call_idx % L. The last CFG pass's
+        # write overwrites earlier ones — this is fine for simulation.
+        # Step advances every L calls (each CFG pass is treated as a step for
+        # mask write, but reads from the previous step's write).
+        call_idx = getattr(_thread_local, "_lite_call_idx", 0)
+        step = getattr(_thread_local, "_lite_step", -1)
+        num_layers = getattr(_thread_local, "_lite_num_layers", 0)
+
+        if step == -1:
+            step = 0
+            call_idx = 0
+            _thread_local._lite_step = 0
+
+        # Layer index wraps within num_layers
+        if num_layers > 0:
+            layer_idx = call_idx % num_layers
+            # Advance step when a full layer cycle completes
+            if call_idx > 0 and layer_idx == 0:
+                step += 1
+                _thread_local._lite_step = step
+        else:
+            layer_idx = call_idx
+
+        _thread_local._lite_call_idx = call_idx + 1
+
+        layer_masks = getattr(_thread_local, "_lite_layer_masks", {})
+
+        if layer_idx not in layer_masks:
+            layer_masks[layer_idx] = (
+                torch.zeros(mask_shape, device=device, dtype=torch.int8),
+                torch.zeros(mask_shape, device=device, dtype=torch.int8),
+            )
+            _thread_local._lite_layer_masks = layer_masks
+
+        mask_a, mask_b = layer_masks[layer_idx]
+
+        kw["lite_attention_threshold"] = lite_threshold
+        if step == 0:
+            kw["lite_attention_skip_write"] = mask_a
+        else:
+            if step % 2 == 1:
+                kw["lite_attention_skip_read"] = mask_a
+                kw["lite_attention_skip_write"] = mask_b
+            else:
+                kw["lite_attention_skip_read"] = mask_b
+                kw["lite_attention_skip_write"] = mask_a
+
+    elif threshold is not None and threshold > 0.0:
+        # Skip-softmax threshold
         kw["skip_softmax_threshold"] = threshold
         kw["skip_softmax_normalize_by_seqlen"] = normalize_by_seqlen
 
