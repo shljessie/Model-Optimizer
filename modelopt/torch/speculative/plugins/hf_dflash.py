@@ -15,27 +15,19 @@
 
 """DFlash speculative decoding plugin for HuggingFace models.
 
-DFlash (Block Diffusion for Flash Speculative Decoding) uses three key mechanisms:
+Matches the reference SpecForge implementation (github.com/sgl-project/SpecForge PR #415).
 
-1. Feature Fusion: Extract hidden states from uniformly sampled target model layers,
-   concatenate and project via a lightweight FC layer.
-
-2. KV Injection: The fused features are injected as Key/Value entries into EVERY
-   draft model layer's attention. Unlike EAGLE-3 which only feeds features to the
-   first layer, DFlash ensures every layer has full target model context.
-
-3. Parallel Drafting: All tokens in a block are predicted in a single forward pass.
-   The draft model uses mask tokens for unknown positions and predicts them all
-   simultaneously via cross-entropy against target model logits.
+Architecture:
+- Feature Fusion: multi-layer target hidden states → FC + RMSNorm
+- KV Injection: fused features as K/V in every draft layer with QK-norm
+- Parallel Drafting: mask_token_id for unknown positions, causal within blocks
+- Loss: hard CE on input_ids[i] (position i predicts token i)
 
 Reference: "DFlash: Block Diffusion for Flash Speculative Decoding" (arXiv:2602.06036)
 """
 
-import contextlib
-import math
-import random
-
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.models.llama.modeling_llama import (
@@ -52,115 +44,92 @@ from ..dflash.dflash_model import DFlashModel
 __all__ = ["HFDFlashModel"]
 
 
-def build_target_layer_ids(num_target_layers, num_sample_layers):
+def build_target_layer_ids(num_target_layers, num_draft_layers):
     """Select layers uniformly from the target model for feature extraction."""
-    if num_sample_layers == 1:
+    if num_draft_layers == 1:
         return [num_target_layers // 2]
     start = 1
     end = num_target_layers - 3
     span = end - start
-    return [round(start + (i * span) / (num_sample_layers - 1)) for i in range(num_sample_layers)]
+    return [
+        int(round(start + (i * span) / (num_draft_layers - 1))) for i in range(num_draft_layers)
+    ]
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Apply RoPE. Q uses last q_len positions, K uses all positions."""
+    cos = cos.unsqueeze(1)  # [B, 1, seq, dim]
+    sin = sin.unsqueeze(1)
+    q_len = q.size(2)
+    q_embed = (q * cos[:, :, -q_len:, :]) + (rotate_half(q) * sin[:, :, -q_len:, :])
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 class DFlashAttention(nn.Module):
-    """Attention with KV injection from target model features.
-
-    Key difference from standard attention: K and V are computed from BOTH
-    the target model's fused features (context) AND the draft tokens (noise).
-    Q is computed only from draft tokens.
-
-    Attention pattern: [k_ctx | k_noise] where draft queries attend to
-    both context KV and draft KV with appropriate masking.
-    """
+    """Attention with KV injection, matching SpecForge Qwen3DFlashAttention."""
 
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.hidden_size = config.hidden_size
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.layer_idx = layer_idx
+        self.scaling = self.head_dim**-0.5
+        self.is_causal = False
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
-    def forward(
-        self,
-        hidden_states,
-        target_hidden,
-        position_embeddings,
-        attention_mask=None,
-    ):
+        # QK norm (matches Qwen3DFlashAttention)
+        self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+    def forward(self, hidden_states, target_hidden, position_embeddings, attention_mask=None):
         bsz, q_len, _ = hidden_states.shape
         ctx_len = target_hidden.shape[1]
 
-        # Q from draft tokens only
-        q = (
-            self.q_proj(hidden_states)
-            .view(bsz, q_len, self.num_heads, self.head_dim)
+        # Q from noise only, with QK-norm
+        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
+        q = self.q_norm(q).transpose(1, 2)
+
+        # K from context + noise, with QK-norm
+        k_ctx = self.k_proj(target_hidden)
+        k_noise = self.k_proj(hidden_states)
+        k = torch.cat([k_ctx, k_noise], dim=1).view(
+            bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim
+        )
+        k = self.k_norm(k).transpose(1, 2)
+
+        # V from context + noise (no norm)
+        v_ctx = self.v_proj(target_hidden)
+        v_noise = self.v_proj(hidden_states)
+        v = (
+            torch.cat([v_ctx, v_noise], dim=1)
+            .view(bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
         )
 
-        # K, V from both context (target features) and noise (draft tokens)
-        k_ctx = (
-            self.k_proj(target_hidden)
-            .view(bsz, ctx_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        v_ctx = (
-            self.v_proj(target_hidden)
-            .view(bsz, ctx_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        k_noise = (
-            self.k_proj(hidden_states)
-            .view(bsz, q_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        v_noise = (
-            self.v_proj(hidden_states)
-            .view(bsz, q_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
+        # RoPE: applied to full 2L positions, Q gets last q_len, K gets all
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Apply rotary embeddings
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            # Rotary for noise Q and K
-            q = self._apply_rotary(
-                q, cos[:, ctx_len : ctx_len + q_len], sin[:, ctx_len : ctx_len + q_len]
-            )
-            k_noise = self._apply_rotary(
-                k_noise, cos[:, ctx_len : ctx_len + q_len], sin[:, ctx_len : ctx_len + q_len]
-            )
-            k_ctx = self._apply_rotary(k_ctx, cos[:, :ctx_len], sin[:, :ctx_len])
-
-        # Concatenate context and noise KV
-        k = torch.cat([k_ctx, k_noise], dim=2)  # [B, num_kv_heads, ctx+q, head_dim]
-        v = torch.cat([v_ctx, v_noise], dim=2)
-
-        # GQA: expand KV heads to match Q heads
+        # GQA expand
         if self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        # Scaled dot product attention
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, is_causal=False
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attention_mask, is_causal=False, scale=self.scaling
         )
-
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         return self.o_proj(attn_output)
-
-    @staticmethod
-    def _apply_rotary(x, cos, sin):
-        """Apply rotary positional embeddings (HF Llama convention)."""
-        cos = cos.unsqueeze(1)  # [B, 1, seq, dim]
-        sin = sin.unsqueeze(1)
-        return (x * cos) + (rotate_half(x) * sin)
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -185,55 +154,33 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
         return hidden_states
 
 
 class DFlashModule(nn.Module):
-    """DFlash draft module with feature fusion + KV injection.
-
-    Architecture:
-    - FC layer fuses multi-layer target hidden states → hidden_size
-    - N decoder layers, each with KV injection from fused target features
-    - Shares embeddings and lm_head with the target model
-    """
+    """DFlash draft module matching SpecForge DFlashDraftModel."""
 
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.block_size = config.block_size
 
-        # Feature fusion: project concatenated multi-layer hidden states
+        # Feature fusion
         num_fused_layers = len(config.target_layer_ids)
         self.fc = nn.Linear(num_fused_layers * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Learnable mask embedding for unknown positions in blocks
-        self.mask_embedding = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
-
-        # Draft decoder layers with KV injection
+        # Decoder layers
         self.layers = nn.ModuleList(
             [DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
-    def fuse_target_features(self, target_hidden_states, target_layer_ids):
-        """Extract and fuse hidden states from sampled target layers."""
-        selected = [target_hidden_states[lid + 1] for lid in target_layer_ids]
-        concatenated = torch.cat(selected, dim=-1)  # [B, seq, num_layers * H]
-        fused = self.hidden_norm(self.fc(concatenated))  # [B, seq, H]
-        return fused
-
-    def forward(self, hidden_states, target_hidden, attention_mask=None):
-        """Forward pass with KV injection.
-
-        Args:
-            hidden_states: Draft token embeddings [B, noise_len, H].
-            target_hidden: Fused target features [B, ctx_len, H].
-            attention_mask: Attention mask for [ctx + noise] positions.
-        """
-        total_len = target_hidden.shape[1] + hidden_states.shape[1]
-        position_ids = torch.arange(total_len, device=hidden_states.device).unsqueeze(0)
+    def forward(self, noise_embedding, target_hidden, position_ids, attention_mask=None):
+        """Forward matching SpecForge DFlashDraftModel.forward."""
+        hidden_states = noise_embedding
+        target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for layer in self.layers:
@@ -242,50 +189,43 @@ class DFlashModule(nn.Module):
         return self.norm(hidden_states)
 
 
-def build_dflash_attention_mask(ctx_len, block_anchors, block_size, seq_len, device, dtype):
-    """Build DFlash attention mask for training.
+def create_dflash_attention_mask(seq_len, block_size, device, dtype):
+    """Create [L, 2L] attention mask matching SpecForge.
 
-    Each draft query can attend to:
-    1. Context positions strictly before its block's anchor position
-    2. All positions within the same block (bidirectional)
-    3. Nothing from other blocks
-
-    Args:
-        ctx_len: Number of context tokens (= seq_len of the input).
-        block_anchors: List of anchor positions (indices into the original sequence).
-        block_size: Number of tokens per block.
-        seq_len: Original sequence length.
-        device: Target device.
-        dtype: Target dtype.
-
-    Returns:
-        Attention mask [1, 1, noise_len, ctx_len + noise_len].
+    Context (cols 0..L-1): Block B sees blocks 0..B-1 (strictly previous).
+    Noise (cols L..2L-1): causal within same block only.
     """
-    num_blocks = len(block_anchors)
-    noise_len = num_blocks * block_size
+    indices = torch.arange(seq_len, device=device)
+    block_ids = indices // block_size
 
-    # Mask shape: [noise_len, ctx_len + noise_len]
-    # Q dimension = noise tokens, KV dimension = context + noise tokens
-    mask = torch.full((noise_len, ctx_len + noise_len), float("-inf"), device=device, dtype=dtype)
+    q_block_ids = block_ids.unsqueeze(1)  # [L, 1]
+    k_block_ids = block_ids.unsqueeze(0)  # [1, L]
 
-    for block_idx, anchor in enumerate(block_anchors):
-        block_start = block_idx * block_size
-        block_end = block_start + block_size
+    ctx_mask = k_block_ids < q_block_ids
+    same_block = q_block_ids == k_block_ids
+    causal = indices.unsqueeze(0) >= indices.unsqueeze(1)
+    noise_mask = same_block & causal
 
-        # 1. Context: each block sees all context up to its anchor position
-        mask[block_start:block_end, : min(anchor, ctx_len)] = 0.0
+    full_mask_bool = torch.cat([ctx_mask, noise_mask], dim=1)
 
-        # 2. Within-block: BIDIRECTIONAL attention (all positions see each other)
-        # This is key to DFlash's parallel drafting — all positions in a block
-        # have the same information and predict independently.
-        mask[block_start:block_end, ctx_len + block_start : ctx_len + block_end] = 0.0
+    full_mask = torch.zeros(seq_len, 2 * seq_len, device=device, dtype=dtype)
+    full_mask.masked_fill_(~full_mask_bool, torch.finfo(dtype).min)
 
-    return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, noise, ctx+noise]
+    return full_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L, 2L]
+
+
+def create_dflash_loss_mask(seq_len, block_size, device):
+    """Create loss mask: exclude Block 0 and block starts."""
+    positions = torch.arange(seq_len, device=device)
+    block_ids = positions // block_size
+    is_block_0 = block_ids == 0
+    is_block_start = (positions % block_size) == 0
+    return (~is_block_0 & ~is_block_start).float()
 
 
 @DFlashDMRegistry.register({PreTrainedModel: "hf.PreTrainedModel"})
 class HFDFlashModel(DFlashModel):
-    """DFlash Model for HuggingFace models with KV injection + parallel drafting."""
+    """DFlash Model matching SpecForge OnlineDFlashModel."""
 
     @property
     def _base_model(self):
@@ -329,7 +269,7 @@ class HFDFlashModel(DFlashModel):
                 raise ValueError(f"Part {name} not found in model")
 
     def modify(self, config):
-        """Initialize DFlash with feature fusion + KV injection."""
+        """Initialize DFlash draft module."""
         super().modify(config)
 
         base_config = self._base_llm_config
@@ -340,17 +280,21 @@ class HFDFlashModel(DFlashModel):
         self.dflash_config.intermediate_size = getattr(
             self.dflash_config, "intermediate_size", base_config.intermediate_size
         )
-        # head_dim for rotary embeddings: match base model
-        actual_head_dim = base_config.hidden_size // base_config.num_attention_heads
-        self.dflash_config.head_dim = actual_head_dim
+        self.dflash_config.head_dim = base_config.hidden_size // base_config.num_attention_heads
+        self.dflash_config.block_size = self.dflash_block_size
         if self.dflash_config._attn_implementation is None:
-            self.dflash_config._attn_implementation = "sdpa"
+            self.dflash_config._attn_implementation = "eager"
 
-        # Determine target layer IDs for feature extraction
+        # Target layer IDs
         num_target_layers = base_config.num_hidden_layers
-        num_sample_layers = self.dflash_config.num_hidden_layers  # sample as many as draft layers
-        self.target_layer_ids = build_target_layer_ids(num_target_layers, num_sample_layers)
+        num_draft_layers = self.dflash_config.num_hidden_layers
+        self.target_layer_ids = build_target_layer_ids(num_target_layers, num_draft_layers)
         self.dflash_config.target_layer_ids = self.target_layer_ids
+
+        # mask_token_id: prefer pad_token_id, fallback to eos
+        self.mask_token_id = getattr(base_config, "pad_token_id", None) or getattr(
+            base_config, "eos_token_id", 0
+        )
 
         # Freeze base model
         if self.dflash_freeze_base_model:
@@ -359,53 +303,12 @@ class HFDFlashModel(DFlashModel):
 
         self._find_base_model_parts()
 
-        # Build DFlash module
         self.dflash_module = DFlashModule(self.dflash_config)
         self.dflash_module.to(self._base_model.dtype).to(
             next(self._base_model.layers[-1].parameters()).device
         )
 
-        # Register hooks to collect hidden states from target layers
-        self._target_hidden_states = []
-        for layer_idx, layer in enumerate(self._base_model.layers):
-            if layer_idx in self.target_layer_ids:
-                layer.register_forward_hook(self._collect_hidden_hook)
-
-        self._cached_masks = {}
         self.is_quantized = False
-
-    def _collect_hidden_hook(self, module, input, output):
-        hidden = (
-            output.clone().detach()
-            if isinstance(output, torch.Tensor)
-            else output[0].clone().detach()
-        )
-        self._target_hidden_states.append(hidden)
-
-    def _run_base_model(self, input_ids, attention_mask, labels=None, **kwargs):
-        """Run base model, collect hidden states from target layers."""
-        self._target_hidden_states = []
-        with torch.no_grad() if self.dflash_freeze_base_model else contextlib.nullcontext():
-            outputs = super().forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                **kwargs,
-            )
-        logits = outputs.logits
-
-        # Fuse collected hidden states
-        target_hidden = self.dflash_module.fuse_target_features(
-            outputs.hidden_states, self.target_layer_ids
-        )
-        self._target_hidden_states = []
-
-        base_loss = None
-        if labels is not None and not self.dflash_freeze_base_model:
-            loss_fct = nn.CrossEntropyLoss()
-            base_loss = loss_fct(logits.view(-1, logits.shape[-1]), labels.view(-1))
-
-        return target_hidden, logits, base_loss
 
     def forward(
         self,
@@ -421,15 +324,7 @@ class HFDFlashModel(DFlashModel):
         cache_position=None,
         **kwargs,
     ):
-        """DFlash training forward pass.
-
-        1. Run base model → get hidden states from sampled layers + logits
-        2. Fuse multi-layer hidden states via FC projection
-        3. Sample random anchors from the sequence → form blocks
-        4. Create noise input (mask tokens + anchor tokens at block starts)
-        5. Run draft model with KV injection (fused features as K/V in every layer)
-        6. Compute CE loss with exponential position decay
-        """
+        """Training forward matching SpecForge OnlineDFlashModel.forward."""
         if not self.training:
             return super().forward(
                 input_ids=input_ids,
@@ -445,128 +340,88 @@ class HFDFlashModel(DFlashModel):
                 **kwargs,
             )
 
-        batch_size, seq_len = input_ids.shape
+        bsz, seq_len = input_ids.shape
         block_size = self.dflash_block_size
         device = input_ids.device
 
-        # 1. Run base model → fused target features + logits
-        target_hidden, base_logits, base_loss = self._run_base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            **kwargs,
-        )
+        # 1. Run base model → raw multi-layer hidden states
+        with torch.no_grad():
+            base_outputs = super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                **kwargs,
+            )
 
-        # 2. Sample anchor positions (start of each block)
-        # Anchors are random positions in the valid (non-padding) region
+        # Extract and concatenate target layer hidden states
+        offset = 1
+        selected = [base_outputs.hidden_states[lid + offset] for lid in self.target_layer_ids]
+        target_hidden = torch.cat(selected, dim=-1)  # [B, seq, num_layers * H]
+
+        # 2. Truncate to multiple of block_size
+        n_blocks = seq_len // block_size
+        effective_len = n_blocks * block_size
+        input_ids_trunc = input_ids[:, :effective_len]
+        target_hidden = target_hidden[:, :effective_len, :]
         if attention_mask is not None:
-            actual_len = attention_mask.sum(dim=1).min().int().item()
+            loss_mask_input = attention_mask[:, :effective_len].float()
         else:
-            actual_len = seq_len
+            loss_mask_input = torch.ones(bsz, effective_len, device=device)
 
-        # Number of blocks we can fit: leave room for block_size predictions after each anchor
-        max_anchor = actual_len - block_size
-        max_anchor = max(max_anchor, 1)
-        num_blocks = max(1, max_anchor // block_size)
-        # Sample anchor positions uniformly
-        anchors = sorted(
-            random.sample(range(1, max(2, max_anchor)), min(num_blocks, max(1, max_anchor - 1)))
-        )
+        # 3. Prepare noise: mask_token_id everywhere, real token at block starts
+        positions = torch.arange(effective_len, device=device)
+        is_block_start = (positions % block_size) == 0
+        noise_input_ids = torch.full_like(input_ids_trunc, self.mask_token_id)
+        noise_input_ids[:, is_block_start] = input_ids_trunc[:, is_block_start]
+        noise_embedding = self._base_model_embeddings(noise_input_ids)
 
-        noise_len = len(anchors) * block_size
+        # 4. Position IDs: [0..L-1, 0..L-1]
+        pos_seq = torch.arange(effective_len, device=device)
+        position_ids_2l = torch.cat([pos_seq, pos_seq]).unsqueeze(0).expand(bsz, -1)
 
-        # 3. Create noise embeddings: anchor token at position 0, MASK for positions 1..B-1
-        # This matches inference where only the anchor token is known.
-        # The draft model must predict all other positions from context KV alone.
-        noise_embeds = (
-            self.dflash_module.mask_embedding.unsqueeze(0)
-            .unsqueeze(0)
-            .expand(batch_size, noise_len, -1)
-            .clone()
-        )
-        for b, anchor in enumerate(anchors):
-            # Only position 0 of each block gets the real anchor token embedding
-            anchor_embed = self._base_model_embeddings(input_ids[:, anchor : anchor + 1])
-            noise_embeds[:, b * block_size : b * block_size + 1] = anchor_embed
-
-        # 4. Build attention mask
+        # 5. Attention mask: [1, 1, L, 2L]
         dtype = target_hidden.dtype
-        attn_mask = build_dflash_attention_mask(
-            seq_len, anchors, block_size, seq_len, device, dtype
-        )
+        dflash_attn_mask = create_dflash_attention_mask(effective_len, block_size, device, dtype)
 
-        # 5. Run DFlash draft model with KV injection
-        draft_hidden = self.dflash_module(
-            hidden_states=noise_embeds,
+        # 6. Draft forward
+        hidden = self.dflash_module(
+            noise_embedding=noise_embedding,
             target_hidden=target_hidden,
-            attention_mask=attn_mask,
+            position_ids=position_ids_2l,
+            attention_mask=dflash_attn_mask,
         )
-        draft_logits = self._base_model_lm_head(draft_hidden)  # [B, noise_len, V]
 
-        # 6. Compute loss with exponential position decay
-        # For block b, position k: target is token at anchors[b] + k
-        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
-        total_correct = 0
-        total_valid = 0
-        decay_gamma = block_size  # decay rate
+        # 7. Loss: hard CE, position i predicts token i
+        logits = self._base_model_lm_head(hidden)
+        dflash_loss_mask = create_dflash_loss_mask(effective_len, block_size, device)
+        combined_mask = loss_mask_input * dflash_loss_mask.unsqueeze(0)
 
-        for b, anchor in enumerate(anchors):
-            for k in range(1, block_size):  # skip position 0 (anchor itself)
-                target_pos = anchor + k
-                if target_pos >= seq_len:
-                    break
+        logits_flat = logits.reshape(-1, logits.size(-1))
+        labels_flat = input_ids_trunc.reshape(-1)
+        mask_flat = combined_mask.reshape(-1)
 
-                draft_idx = b * block_size + k
-                logit = draft_logits[:, draft_idx, :]  # [B, V]
+        active_indices = mask_flat > 0.5
+        active_logits = logits_flat[active_indices]
+        active_labels = labels_flat[active_indices]
 
-                # Target: base_logits[anchor + k - 1] predicts token at position anchor + k
-                # This is the base model's autoregressive prediction for this position
-                target = base_logits[:, target_pos - 1, :].detach()
-
-                # Logit distillation loss
-                target_soft = torch.softmax(target, dim=-1)
-                draft_logsoft = torch.log_softmax(logit, dim=-1)
-                kd_loss = -torch.sum(target_soft * draft_logsoft, dim=-1).mean()
-
-                # Position decay weight
-                weight = math.exp(-(k - 1) / decay_gamma)
-                total_loss = total_loss + weight * kd_loss
-
-                # Accuracy: does draft predict the same token as the base model?
-                target_tok = input_ids[:, target_pos]
-                draft_tok = logit.detach().argmax(dim=-1)
-                total_correct += (target_tok == draft_tok).sum().item()
-                total_valid += batch_size
-
-        # Normalize by number of predictions
-        num_predictions = sum(min(block_size - 1, seq_len - a - 1) for a in anchors)
-        if num_predictions > 0:
-            total_loss = total_loss / num_predictions
-
-        accuracy = total_correct / max(total_valid, 1)
-        final_loss = (base_loss or 0) + total_loss
+        if active_logits.numel() > 0:
+            loss = F.cross_entropy(active_logits, active_labels)
+            with torch.no_grad():
+                preds = active_logits.argmax(dim=-1)
+                accuracy = (preds == active_labels).float().mean().item()
+        else:
+            loss = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+            accuracy = 0.0
 
         return ModelOutput(
-            loss=final_loss,
-            logits=base_logits,
-            hidden_states=target_hidden,
+            loss=loss,
+            logits=base_outputs.logits,
             train_acc=[[accuracy]],
         )
 
     @torch.no_grad()
     def pseudo_speculative_generate(self, input_ids, steps=1):
-        """Generate draft tokens using DFlash parallel block prediction.
-
-        Args:
-            input_ids: Prompt token IDs [B, seq_len].
-            steps: Number of blocks to generate.
-
-        Returns:
-            base_token: Next token from base model [B, 1].
-            draft_tokens: Draft tokens [B, steps * block_size] or None.
-        """
-        # Run base model
-        self._target_hidden_states = []
+        """Generate draft tokens matching SpecForge spec_generate logic."""
         base_outputs = super().forward(input_ids=input_ids, output_hidden_states=True)
         base_logits = base_outputs.logits
         base_token = base_logits[:, -1:, :].argmax(dim=-1).to(input_ids.device)
@@ -574,48 +429,57 @@ class HFDFlashModel(DFlashModel):
         if steps < 1:
             return base_token, None
 
-        # Fuse target features
-        target_hidden = self.dflash_module.fuse_target_features(
-            base_outputs.hidden_states, self.target_layer_ids
-        )
+        # Extract target hidden states
+        offset = 1
+        selected = [base_outputs.hidden_states[lid + offset] for lid in self.target_layer_ids]
+        target_hidden = torch.cat(selected, dim=-1)
 
         block_size = self.dflash_block_size
-        batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
+        bsz = input_ids.shape[0]
         device = input_ids.device
         dtype = target_hidden.dtype
 
         all_draft_tokens = []
-        current_token = base_token  # [B, 1]
+        current_token = base_token
 
-        for step in range(steps):
-            # Build noise: anchor token at position 0, mask embedding for rest
-            noise_embeds = (
-                self.dflash_module.mask_embedding.unsqueeze(0)
-                .unsqueeze(0)
-                .expand(batch_size, block_size, -1)
-                .clone()
+        for _ in range(steps):
+            # Block: first token real, rest mask
+            block_ids = torch.full(
+                (bsz, block_size), self.mask_token_id, dtype=torch.long, device=device
             )
-            anchor_embed = self._base_model_embeddings(current_token)  # [B, 1, H]
-            noise_embeds[:, :1] = anchor_embed
+            block_ids[:, 0] = current_token.squeeze(-1)
+            noise_embedding = self._base_model_embeddings(block_ids)
 
-            # Attention mask: block sees all context, bidirectional within block
-            anchor = seq_len + step * block_size
-            attn_mask = build_dflash_attention_mask(
-                seq_len, [anchor], block_size, seq_len + (step + 1) * block_size, device, dtype
+            # Position IDs: context 0..ctx_len-1, block ctx_len..ctx_len+block_size-1
+            ctx_len = target_hidden.shape[1]
+            ctx_positions = torch.arange(ctx_len, device=device)
+            block_positions = torch.arange(ctx_len, ctx_len + block_size, device=device)
+            pos_ids = torch.cat([ctx_positions, block_positions]).unsqueeze(0).expand(bsz, -1)
+
+            # Mask: block sees all context + causal within block
+            attn_mask = torch.zeros(
+                1, 1, block_size, ctx_len + block_size, device=device, dtype=dtype
             )
+            block_causal = torch.triu(
+                torch.full(
+                    (block_size, block_size), torch.finfo(dtype).min, device=device, dtype=dtype
+                ),
+                diagonal=1,
+            )
+            attn_mask[:, :, :, ctx_len:] = block_causal
 
-            # Run draft with KV injection
+            # Draft forward
             draft_hidden = self.dflash_module(
-                hidden_states=noise_embeds,
+                noise_embedding=noise_embedding,
                 target_hidden=target_hidden,
+                position_ids=pos_ids,
                 attention_mask=attn_mask,
             )
-            draft_logits = self._base_model_lm_head(draft_hidden)
-            block_tokens = draft_logits.argmax(dim=-1)  # [B, block_size]
-            all_draft_tokens.append(block_tokens[:, 1:])  # skip anchor position
 
-            # Next block starts with last predicted token
+            # Logits on positions 1..block_size-1 (skip known anchor)
+            draft_logits = self._base_model_lm_head(draft_hidden[:, 1:, :])
+            block_tokens = draft_logits.argmax(dim=-1)  # [B, block_size-1]
+            all_draft_tokens.append(block_tokens)
             current_token = block_tokens[:, -1:]
 
         draft_tokens = torch.cat(all_draft_tokens, dim=-1)
