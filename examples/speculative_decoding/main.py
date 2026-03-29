@@ -157,6 +157,10 @@ class DFlashArguments:
         default=False,
         metadata={"help": "Disable torch.compile on DFlash forward/loss methods."},
     )
+    dflash_mask_token_id: int = field(
+        default=None,
+        metadata={"help": "Mask token ID for DFlash. If not set, uses pad_token_id."},
+    )
 
 
 def train():
@@ -257,6 +261,8 @@ def train():
                 json.load(open(dflash_args.dflash_config)) if dflash_args.dflash_config else {}
             )
             custom_config.setdefault("num_hidden_layers", dflash_args.dflash_num_layers)
+            if dflash_args.dflash_mask_token_id is not None:
+                custom_config["mask_token_id"] = dflash_args.dflash_mask_token_id
 
             config = {
                 "dflash_block_size": dflash_args.dflash_block_size,

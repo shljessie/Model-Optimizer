@@ -274,13 +274,41 @@ class HFDFlashModel(DFlashModel):
 
         base_config = self._base_llm_config
         self.dflash_config = PretrainedConfig.from_dict(config.dflash_architecture_config)
+
+        # Inherit settings from base model, but only those NOT already in the user config.
+        # hidden_size and vocab_size MUST match. Others (heads, intermediate_size) can differ.
+        # This allows the draft model to have a different architecture than the base model.
         self.dflash_config.hidden_size = base_config.hidden_size
         self.dflash_config.vocab_size = base_config.vocab_size
-        self.dflash_config.max_position_embeddings = base_config.max_position_embeddings
-        self.dflash_config.intermediate_size = getattr(
-            self.dflash_config, "intermediate_size", base_config.intermediate_size
+
+        # These use base model defaults if not specified in dflash_architecture_config
+        for attr, default_from_base in [
+            ("max_position_embeddings", True),
+            ("intermediate_size", True),
+            ("num_attention_heads", True),
+            ("num_key_value_heads", True),
+            ("hidden_act", True),
+            ("rope_theta", True),
+            ("rope_scaling", True),
+            ("rope_type", False),
+            ("position_embedding_type", False),
+            ("rope_interleaved", False),
+            ("rms_norm_eps", True),
+            ("attention_bias", False),
+            ("tie_word_embeddings", False),
+        ]:
+            if not hasattr(self.dflash_config, attr) or getattr(self.dflash_config, attr) is None:
+                if default_from_base and hasattr(base_config, attr):
+                    setattr(self.dflash_config, attr, getattr(base_config, attr))
+
+        # Ensure required attrs have defaults
+        if not hasattr(self.dflash_config, "mlp_bias") or self.dflash_config.mlp_bias is None:
+            self.dflash_config.mlp_bias = False
+
+        self.dflash_config.head_dim = getattr(
+            self.dflash_config, "head_dim",
+            self.dflash_config.hidden_size // self.dflash_config.num_attention_heads,
         )
-        self.dflash_config.head_dim = base_config.hidden_size // base_config.num_attention_heads
         self.dflash_config.block_size = self.dflash_block_size
         if self.dflash_config._attn_implementation is None:
             self.dflash_config._attn_implementation = "eager"
@@ -292,9 +320,12 @@ class HFDFlashModel(DFlashModel):
         self.dflash_config.target_layer_ids = self.target_layer_ids
 
         # mask_token_id: prefer pad_token_id, fallback to eos
-        self.mask_token_id = getattr(base_config, "pad_token_id", None) or getattr(
-            base_config, "eos_token_id", 0
+        # mask_token_id: prefer from dflash_architecture_config, fallback to pad/eos
+        mask_id = config.dflash_architecture_config.get(
+            "mask_token_id",
+            getattr(base_config, "pad_token_id", None) or getattr(base_config, "eos_token_id", 0),
         )
+        self.mask_token_id = mask_id[0] if isinstance(mask_id, list) else mask_id
 
         # Freeze base model
         if self.dflash_freeze_base_model:
@@ -309,6 +340,32 @@ class HFDFlashModel(DFlashModel):
         )
 
         self.is_quantized = False
+
+        # Store bound reference to the original model class's forward.
+        # DynamicModule changes type(self) but the original class is in _original_cls.
+        # Find the original HF model class (e.g., Qwen3_5ForConditionalGeneration)
+        # by walking MRO and skipping DFlash/DynamicModule classes
+        skip_names = {"HFDFlashModel", "DFlashModel", "DynamicModule", "DFlashPreTrainedModel", "DFlashDraftModel"}
+        original_cls = None
+        for cls in type(self).__mro__:
+            if (
+                hasattr(cls, "forward")
+                and cls.__name__ not in skip_names
+                and cls is not type(self)
+                and issubclass(cls, PreTrainedModel)
+                and cls is not PreTrainedModel
+            ):
+                original_cls = cls
+                break
+        if original_cls is None:
+            # Last resort: use the class two levels up (skip DFlash wrapper + DynamicModule)
+            original_cls = type(self).__mro__[2]
+        self._original_forward_cls = original_cls
+        print(f"DFlash: using {original_cls.__name__}.forward as base forward")
+
+    def _base_forward(self, **kwargs):
+        """Call the original model's forward, bypassing DFlash wrapper."""
+        return self._original_forward_cls.forward(self, **kwargs)
 
     def forward(
         self,
@@ -350,7 +407,6 @@ class HFDFlashModel(DFlashModel):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
-                **kwargs,
             )
 
         # Extract and concatenate target layer hidden states
@@ -421,66 +477,94 @@ class HFDFlashModel(DFlashModel):
 
     @torch.no_grad()
     def pseudo_speculative_generate(self, input_ids, steps=1):
-        """Generate draft tokens matching SpecForge spec_generate logic."""
-        base_outputs = super().forward(input_ids=input_ids, output_hidden_states=True)
+        """Generate draft tokens using one DFlash block.
+
+        DFlash generates block_size-1 draft tokens in a single forward pass.
+        The `steps` parameter is used as the number of tokens to return
+        (capped at block_size-1).
+
+        Returns:
+            base_token: Next token from base model [B, 1].
+            draft_tokens: Draft tokens [B, min(steps, block_size-1)] or None.
+        """
+        # Call the base model's inner model directly (avoids DynamicModule dispatch)
+        model_output = self._base_model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+        )
+        # Compute logits via lm_head
+        base_logits = self._base_model_lm_head(model_output.last_hidden_state)
+        # Build output with hidden_states
+        base_outputs = ModelOutput(
+            logits=base_logits,
+            hidden_states=model_output.hidden_states,
+        )
         base_logits = base_outputs.logits
         base_token = base_logits[:, -1:, :].argmax(dim=-1).to(input_ids.device)
 
         if steps < 1:
             return base_token, None
 
-        # Extract target hidden states
-        offset = 1
-        selected = [base_outputs.hidden_states[lid + offset] for lid in self.target_layer_ids]
+        # Extract target hidden states (raw, before FC projection)
+        hid_offset = 1
+        if not hasattr(self, '_psg_debug'):
+            self._psg_debug = True
+            sel = [base_outputs.hidden_states[lid + hid_offset] for lid in self.target_layer_ids]
+            th = torch.cat(sel, dim=-1)
+            print(f"[psg] hidden_states layers: {len(base_outputs.hidden_states)}, target_hidden norm: {th.norm().item():.2f}, shape: {th.shape}")
+            print(f"[psg] base_token: {base_token.item()}, mask_token_id: {self.mask_token_id}")
+            print(f"[psg] block_ids: {[self.mask_token_id]*self.dflash_block_size}")
+            bi = torch.full((1, self.dflash_block_size), self.mask_token_id, dtype=torch.long, device=input_ids.device)
+            bi[0, 0] = base_token[0, 0]
+            ne = self._base_model_embeddings(bi)
+            print(f"[psg] noise_emb norm: {ne.norm().item():.2f}, shape: {ne.shape}")
+            print(f"[psg] pos_ids will be: ctx=[0..{input_ids.shape[1]-1}], blk=[{input_ids.shape[1]}..{input_ids.shape[1]+self.dflash_block_size-1}]")
+        selected = [base_outputs.hidden_states[lid + hid_offset] for lid in self.target_layer_ids]
         target_hidden = torch.cat(selected, dim=-1)
 
         block_size = self.dflash_block_size
         bsz = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
         device = input_ids.device
         dtype = target_hidden.dtype
 
-        all_draft_tokens = []
-        current_token = base_token
+        # Block: first token is base_token (anchor), rest are mask
+        block_ids = torch.full(
+            (bsz, block_size), self.mask_token_id, dtype=torch.long, device=device
+        )
+        block_ids[:, 0] = base_token.squeeze(-1)
+        noise_embedding = self._base_model_embeddings(block_ids)
 
-        for _ in range(steps):
-            # Block: first token real, rest mask
-            block_ids = torch.full(
-                (bsz, block_size), self.mask_token_id, dtype=torch.long, device=device
-            )
-            block_ids[:, 0] = current_token.squeeze(-1)
-            noise_embedding = self._base_model_embeddings(block_ids)
+        # Position IDs: context 0..ctx_len-1, block seq_len..seq_len+block_size-1
+        ctx_len = target_hidden.shape[1]
+        ctx_positions = torch.arange(ctx_len, device=device)
+        block_positions = torch.arange(seq_len, seq_len + block_size, device=device)
+        pos_ids = torch.cat([ctx_positions, block_positions]).unsqueeze(0).expand(bsz, -1)
 
-            # Position IDs: context 0..ctx_len-1, block ctx_len..ctx_len+block_size-1
-            ctx_len = target_hidden.shape[1]
-            ctx_positions = torch.arange(ctx_len, device=device)
-            block_positions = torch.arange(ctx_len, ctx_len + block_size, device=device)
-            pos_ids = torch.cat([ctx_positions, block_positions]).unsqueeze(0).expand(bsz, -1)
+        # Attention mask: block sees ALL context + causal within block
+        attn_mask = torch.zeros(
+            1, 1, block_size, ctx_len + block_size, device=device, dtype=dtype
+        )
+        block_causal = torch.triu(
+            torch.full(
+                (block_size, block_size), torch.finfo(dtype).min, device=device, dtype=dtype
+            ),
+            diagonal=1,
+        )
+        attn_mask[:, :, :, ctx_len:] = block_causal
 
-            # Mask: block sees all context + causal within block
-            attn_mask = torch.zeros(
-                1, 1, block_size, ctx_len + block_size, device=device, dtype=dtype
-            )
-            block_causal = torch.triu(
-                torch.full(
-                    (block_size, block_size), torch.finfo(dtype).min, device=device, dtype=dtype
-                ),
-                diagonal=1,
-            )
-            attn_mask[:, :, :, ctx_len:] = block_causal
+        # Draft forward
+        draft_hidden = self.dflash_module(
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            position_ids=pos_ids,
+            attention_mask=attn_mask,
+        )
 
-            # Draft forward
-            draft_hidden = self.dflash_module(
-                noise_embedding=noise_embedding,
-                target_hidden=target_hidden,
-                position_ids=pos_ids,
-                attention_mask=attn_mask,
-            )
+        # Logits on positions 1..block_size-1 (skip anchor at position 0)
+        draft_logits = self._base_model_lm_head(draft_hidden[:, 1:, :])
+        draft_tokens = draft_logits.argmax(dim=-1)  # [B, block_size-1]
 
-            # Logits on positions 1..block_size-1 (skip known anchor)
-            draft_logits = self._base_model_lm_head(draft_hidden[:, 1:, :])
-            block_tokens = draft_logits.argmax(dim=-1)  # [B, block_size-1]
-            all_draft_tokens.append(block_tokens)
-            current_token = block_tokens[:, -1:]
-
-        draft_tokens = torch.cat(all_draft_tokens, dim=-1)
-        return base_token, draft_tokens
+        # Return up to `steps` tokens
+        num_tokens = min(steps, block_size - 1)
+        return base_token, draft_tokens[:, :num_tokens]
