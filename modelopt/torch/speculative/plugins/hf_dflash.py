@@ -247,6 +247,56 @@ class HFDFlashModel(DFlashModel):
             or self.config
         )
 
+    @staticmethod
+    def _auto_detect_mask_token_id(base_config):
+        """Auto-detect an appropriate mask token ID for DFlash.
+
+        Different model families use different strategies:
+        - Qwen3/3.5: built-in [MASK] token in vocabulary
+        - Llama3: reserved special tokens (128002 = reserved_special_token_0)
+        - Others: try tokenizer.mask_token_id, then fall back to pad/eos
+        """
+        model_type = getattr(base_config, "model_type", "")
+        vocab_size = getattr(base_config, "vocab_size", 0)
+
+        # Qwen3/3.5: known mask token positions
+        if "qwen3" in model_type.lower() or "qwen" in model_type.lower():
+            # Qwen3 vocab has dedicated mask tokens
+            # Qwen3.5-4B: 248070, Qwen3-8B: similar range
+            # Heuristic: eos_token_id + some offset, or check known values
+            eos = getattr(base_config, "eos_token_id", None)
+            if isinstance(eos, list):
+                eos = eos[0]
+            if eos and vocab_size > 200000:
+                # Large Qwen vocab — mask token is typically near end of special tokens
+                # Known: Qwen3.5 eos=248044, mask=248070 (offset ~26)
+                # Try common offsets
+                for offset in [26, 25, 24]:
+                    candidate = eos + offset
+                    if candidate < vocab_size:
+                        return candidate
+            # Fallback for smaller Qwen models
+            if vocab_size > 150000:
+                return vocab_size - 250  # heuristic for Qwen special token region
+
+        # Llama3: use reserved_special_token_0 (128002)
+        if "llama" in model_type.lower():
+            if vocab_size >= 128256:  # Llama3 vocab size
+                return 128002  # <|reserved_special_token_0|>
+
+        # Generic: try pad_token_id, then eos
+        pad_id = getattr(base_config, "pad_token_id", None)
+        eos_id = getattr(base_config, "eos_token_id", None)
+        if isinstance(eos_id, list):
+            eos_id = eos_id[0]
+
+        # Prefer pad over eos (pad is less likely to interfere)
+        if pad_id is not None and pad_id != eos_id:
+            return pad_id
+
+        # Last resort
+        return eos_id or 0
+
     def _find_base_model_parts(self):
         for name, paths in {
             "base_model_path": ["model.language_model", "model", "backbone"],
@@ -319,13 +369,18 @@ class HFDFlashModel(DFlashModel):
         self.target_layer_ids = build_target_layer_ids(num_target_layers, num_draft_layers)
         self.dflash_config.target_layer_ids = self.target_layer_ids
 
-        # mask_token_id: prefer pad_token_id, fallback to eos
-        # mask_token_id: prefer from dflash_architecture_config, fallback to pad/eos
-        mask_id = config.dflash_architecture_config.get(
-            "mask_token_id",
-            getattr(base_config, "pad_token_id", None) or getattr(base_config, "eos_token_id", 0),
-        )
+        # mask_token_id resolution order:
+        # 1. Explicit in dflash_architecture_config (user override)
+        # 2. Auto-detect from model vocabulary:
+        #    - Qwen3/3.5: built-in [MASK] token
+        #    - Llama3: reserved_special_token_0 (128002)
+        #    - Others: tokenizer.mask_token_id
+        # 3. Fallback to pad_token_id or eos_token_id (suboptimal)
+        mask_id = config.dflash_architecture_config.get("mask_token_id", None)
+        if mask_id is None:
+            mask_id = self._auto_detect_mask_token_id(base_config)
         self.mask_token_id = mask_id[0] if isinstance(mask_id, list) else mask_id
+        print(f"DFlash mask_token_id: {self.mask_token_id}")
 
         # Freeze base model
         if self.dflash_freeze_base_model:
