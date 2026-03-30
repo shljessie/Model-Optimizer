@@ -40,7 +40,7 @@ Requirements::
 
 Usage::
 
-    # FP8 accuracy check vs baseline
+    # FP8 accuracy check vs baseline (CLIP score + pixel metrics)
     python wan2_sage_attention.py --prompt "..." --compare
 
     # Single run with FP8 attention
@@ -419,6 +419,59 @@ def compute_video_metrics(
     return {"psnr": psnr, "mae_pct": mae_pct, "cos_sim": cos_sim}
 
 
+def compute_clip_score(
+    frames: list,
+    prompt: str,
+    device: str = "cuda",
+    max_frames: int = 16,
+) -> float:
+    """Compute mean CLIP score (text–image cosine similarity) over video frames.
+
+    Samples up to ``max_frames`` evenly from the sequence and returns the
+    average cosine similarity between the CLIP text embedding of ``prompt``
+    and the CLIP image embedding of each frame.  Higher = more semantically
+    aligned with the prompt.
+
+    Args:
+        frames:     List of PIL images (the generated video).
+        prompt:     The text prompt used to generate the video.
+        device:     Device for the CLIP model (``"cuda"`` or ``"cpu"``).
+        max_frames: Maximum number of frames to score (evenly sampled).
+
+    Returns:
+        Mean CLIP cosine similarity score in ``[-1, 1]``.
+        Typical values for good text-video alignment: ~0.25–0.35.
+    """
+    from transformers import CLIPModel, CLIPProcessor
+
+    clip_model_id = "openai/clip-vit-large-patch14"
+    processor = CLIPProcessor.from_pretrained(clip_model_id)
+    clip_model = CLIPModel.from_pretrained(clip_model_id).to(device)
+    clip_model.eval()
+
+    # Evenly sample frames
+    indices = np.linspace(0, len(frames) - 1, min(max_frames, len(frames)), dtype=int)
+    sampled = [frames[int(i)] for i in indices]
+
+    with torch.no_grad():
+        text_inputs = processor(text=[prompt], return_tensors="pt", padding=True).to(device)
+        text_feat = clip_model.get_text_features(**text_inputs)
+        text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+
+        scores = []
+        for frame in sampled:
+            img_inputs = processor(images=frame, return_tensors="pt").to(device)
+            img_feat = clip_model.get_image_features(**img_inputs)
+            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+            scores.append((text_feat * img_feat).sum().item())
+
+    # Free CLIP model from GPU memory
+    del clip_model
+    torch.cuda.empty_cache()
+
+    return float(np.mean(scores))
+
+
 def print_metrics(metrics: dict[str, float], label: str = "") -> None:
     prefix = f"[{label}] " if label else ""
     print(f"\n{prefix}Accuracy vs baseline:")
@@ -552,7 +605,16 @@ def main() -> None:
         print_kernel_stats()
         disable_attention_kernel()
 
-        # --- Metrics ---
+        # --- CLIP scores (per-video semantic alignment with prompt) ---
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print("\nComputing CLIP scores (prompt-video semantic alignment)...")
+        clip_base = compute_clip_score(frames_base, args.prompt, device=device)
+        clip_quant = compute_clip_score(frames_quant, args.prompt, device=device)
+        print(f"  baseline CLIP:  {clip_base:.4f}")
+        print(f"  {args.kernel} CLIP:  {clip_quant:.4f}  (Δ {clip_quant - clip_base:+.4f})")
+        print("  (typical range ~0.25-0.35; higher = more on-prompt)")
+
+        # --- Pixel-level metrics ---
         metrics = compute_video_metrics(frames_base, frames_quant)
         print_metrics(metrics, label=args.kernel)
 
