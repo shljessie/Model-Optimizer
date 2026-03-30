@@ -292,7 +292,7 @@ markers = [
 [tool.coverage.run]
 branch = false
 include = ["modelopt/*"]
-omit = ["*/plugins/*", "*/export/*"]
+omit = ["*/plugins/*", "*/export/*", "modelopt/torch/puzzletron/*"]
 
 
 [tool.coverage.report]
