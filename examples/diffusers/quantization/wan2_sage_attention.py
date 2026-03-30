@@ -534,7 +534,8 @@ def compute_clip_score(
 
     Returns:
         Mean CLIP cosine similarity score in ``[-1, 1]``.
-        Typical values for good text-video alignment: ~0.25-0.35.
+        Typical values for good text-video alignment: ~0.15-0.30
+        (varies by model and prompt; compare baseline vs quantized delta).
     """
     from transformers import CLIPModel, CLIPProcessor
 
@@ -720,7 +721,9 @@ def main() -> None:
             )
             print(f"  baseline CLIP:  {clip_base:.4f}")
             print(f"  {args.kernel} CLIP:  {clip_quant:.4f}  (delta {clip_quant - clip_base:+.4f})")
-            print("  (typical range ~0.25-0.35; higher = more on-prompt)")
+            print(
+                "  (absolute value varies by model; focus on the delta between baseline and quantized)"
+            )
             print(
                 "  Tip: set HF_TOKEN env var or use --clip-model <local-path> to avoid rate limits"
             )
