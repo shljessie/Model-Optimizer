@@ -34,6 +34,12 @@ Four attention kernel variants are supported via ``--kernel``:
     - Dequantize back to BF16, then run standard SDPA
     - No CUDA kernel required. Use for accuracy verification on any GPU.
 
+``nvfp4`` (always available)
+    Python-level NVFP4 E2M1 attention. Inspired by SageAttention3:
+    - Same channel-wise mean smoothing as fp8
+    - Per-token scaling to NVFP4 range, rounded to nearest of 8 levels {0,0.5,1,1.5,2,3,4,6}
+    - No CUDA kernel required. Use to measure accuracy vs FP8.
+
 Requirements::
 
     pip install sageattention diffusers transformers accelerate ftfy
@@ -79,13 +85,15 @@ DEFAULT_NEGATIVE_PROMPT = "low quality, blurry, distorted, watermark, text, crop
 
 # Kernel choices
 KERNEL_FP8 = "fp8"
+KERNEL_NVFP4 = "nvfp4"
 KERNEL_SAGE1 = "sage1"
 KERNEL_SAGE2_FP16 = "sage2-fp16"
 KERNEL_SAGE2_FP8 = "sage2-fp8"
-KERNEL_CHOICES = [KERNEL_FP8, KERNEL_SAGE1, KERNEL_SAGE2_FP16, KERNEL_SAGE2_FP8]
+KERNEL_CHOICES = [KERNEL_FP8, KERNEL_NVFP4, KERNEL_SAGE1, KERNEL_SAGE2_FP16, KERNEL_SAGE2_FP8]
 
 _KERNEL_DESCRIPTIONS = {
     KERNEL_FP8: "FP8 E4M3 QKV (Python-level, SA2-inspired smoothing, no CUDA kernel required)",
+    KERNEL_NVFP4: "NVFP4 E2M1 QKV (Python-level, SA3-inspired smoothing, no CUDA kernel required)",
     KERNEL_SAGE1: "sageattn (SA1, INT8 QK + FP16 PV, auto-select)",
     KERNEL_SAGE2_FP16: "sageattn_qk_int8_pv_fp16_cuda (SA2, INT8 QK + FP16 PV, per-thread)",
     KERNEL_SAGE2_FP8: "sageattn_qk_int8_pv_fp8_cuda (SA2++, INT8 QK + FP8 PV, fp32+fp16 accum)",
@@ -103,6 +111,15 @@ _SUPPORTED_SM = {80, 86, 89, 90, 100}
 
 # FP8 max value for float8_e4m3fn
 _FP8_MAX = 448.0
+
+# NVFP4 E2M1 representable positive values and their rounding boundaries.
+# Format: 1 sign + 2 exponent + 1 mantissa bit, exponent bias = 1.
+# Positive levels:  0.0  0.5  1.0  1.5  2.0  3.0  4.0  6.0
+# Rounding boundaries (midpoints between adjacent levels):
+#                   0.25 0.75 1.25 1.75 2.5  3.5  5.0
+_FP4_MAX = 6.0
+_FP4_BOUNDARIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+_FP4_LEVELS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +142,7 @@ def _detect_available_kernels() -> list[str]:
     """Return kernels available given the installed packages and GPU."""
     available = []
 
-    # fp8 is pure Python — available on any GPU as long as PyTorch >= 2.1
+    # fp8 and nvfp4 are pure Python — available on any GPU / PyTorch version
     if _fp8_available():
         available.append(KERNEL_FP8)
     else:
@@ -133,6 +150,8 @@ def _detect_available_kernels() -> list[str]:
             "[FP8] WARNING: torch.float8_e4m3fn not found. "
             "Upgrade to PyTorch >= 2.1 to use the fp8 kernel."
         )
+    # nvfp4 uses only standard float ops — always available
+    available.append(KERNEL_NVFP4)
 
     try:
         import sageattention as _sa
@@ -221,6 +240,74 @@ def _fp8_sdpa(
 
 
 # ---------------------------------------------------------------------------
+# NVFP4 attention — Python-level, SA3-inspired
+# ---------------------------------------------------------------------------
+
+
+def _quantize_to_fp4_levels(x_abs: torch.Tensor) -> torch.Tensor:
+    """Round absolute values to the nearest NVFP4 E2M1 representable level.
+
+    Uses vectorised ``torch.bucketize`` against the 7 midpoint boundaries
+    between the 8 positive FP4 levels ``{0, 0.5, 1, 1.5, 2, 3, 4, 6}``.
+    """
+    boundaries = torch.tensor(_FP4_BOUNDARIES, dtype=x_abs.dtype, device=x_abs.device)
+    levels = torch.tensor(_FP4_LEVELS, dtype=x_abs.dtype, device=x_abs.device)
+    idx = torch.bucketize(x_abs.contiguous(), boundaries)
+    return levels[idx]
+
+
+def _smooth_quantize_fp4(x: torch.Tensor) -> torch.Tensor:
+    """Smooth + NVFP4 E2M1-quantize + dequantize a Q, K, or V tensor.
+
+    Mirrors the SA3 (arXiv 2505.11594) channel-wise smoothing strategy:
+
+    1. Subtract per-channel mean across the token dimension.
+    2. Scale so the per-token max maps to ``_FP4_MAX`` (6.0).
+    3. Round to the nearest NVFP4 E2M1 level via a boundary lookup.
+    4. Dequantize back to the original dtype and restore the mean.
+
+    No CUDA kernel required — works on any GPU or CPU.
+
+    Args:
+        x: Attention tensor ``(B, H, N, D)``.
+
+    Returns:
+        Tensor of the same shape and dtype, simulating NVFP4 E2M1 precision.
+    """
+    orig_dtype = x.dtype
+    x = x.float()
+
+    # Step 1 — channel smoothing
+    mean = x.mean(dim=-2, keepdim=True)
+    x_smooth = x - mean
+
+    # Step 2 — per-token scale to fit in [-FP4_MAX, FP4_MAX]
+    scale = x_smooth.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / _FP4_MAX
+    x_scaled = (x_smooth / scale).clamp(-_FP4_MAX, _FP4_MAX)
+
+    # Step 3 — quantize: preserve sign, round magnitude to nearest FP4 level
+    sign = x_scaled.sign()
+    x_dq = sign * _quantize_to_fp4_levels(x_scaled.abs())
+
+    # Step 4 — dequantize and restore mean
+    return (x_dq * scale + mean).to(orig_dtype)
+
+
+def _nvfp4_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+) -> torch.Tensor:
+    """NVFP4 E2M1 attention with SA3-inspired Q/K/V smoothing."""
+    q_dq = _smooth_quantize_fp4(query)
+    k_dq = _smooth_quantize_fp4(key)
+    v_dq = _smooth_quantize_fp4(value)
+    return _orig_sdpa(q_dq, k_dq, v_dq, is_causal=is_causal, scale=scale)
+
+
+# ---------------------------------------------------------------------------
 # SDPA patching
 # ---------------------------------------------------------------------------
 
@@ -239,6 +326,9 @@ def _run_kernel(
 ) -> torch.Tensor:
     if _active_kernel == KERNEL_FP8:
         return _fp8_sdpa(query, key, value, is_causal=is_causal, scale=scale)
+
+    if _active_kernel == KERNEL_NVFP4:
+        return _nvfp4_sdpa(query, key, value, is_causal=is_causal, scale=scale)
 
     if _active_kernel == KERNEL_SAGE1:
         from sageattention import sageattn
