@@ -523,7 +523,9 @@ class HFDFlashModel(DFlashModel):
                 preds = active_logits.argmax(dim=-1)
                 accuracy = (preds == active_labels).float().mean().item()
         else:
-            loss = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+            # No valid positions — compute a zero loss that still flows through
+            # dflash_module parameters to keep DDP gradient sync happy
+            loss = logits.sum() * 0.0
             accuracy = 0.0
 
         return ModelOutput(
