@@ -91,7 +91,6 @@ puzzletron = [ # Dependedencies for modelopt.torch.puzzletron subpackage
     "immutabledict",
     "lru-dict",
     "mip",
-    "omegaconf==2.3.0",
     "pandas",
     "typeguard",
 ]

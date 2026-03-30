@@ -222,7 +222,9 @@ class FFNConfig(SubblockConfig):
         elif self.is_moe:
             self._force_setattr("intermediate_size", None)
         else:
-            assert self.intermediate_size is not None, "Intermediate size must be provided for an FFN block"
+            assert self.intermediate_size is not None, (
+                "Intermediate size must be provided for an FFN block"
+            )
 
     def to_blockconfig(self) -> "BlockConfig":
         return BlockConfig(attention=AttentionConfig(no_op=True), ffn=self)
