@@ -91,7 +91,15 @@ def restore_quantized_model(
     # initialize the true module if necessary
     convert_to_quantized_model(model, config)
 
-    return restore_quantizer_state(model, config, metadata)
+    model = restore_quantizer_state(model, config, metadata)
+
+    # Propagate sequential calibration progress to the model for resume
+    if "seq_calib_progress" in metadata:
+        from .utils.checkpoint import SEQ_CALIB_PROGRESS_ATTR
+
+        setattr(model, SEQ_CALIB_PROGRESS_ATTR, metadata["seq_calib_progress"])
+
+    return model
 
 
 def restore_quantizer_state(model: nn.Module, config: QuantizeConfig, metadata: MetadataDict):
@@ -169,6 +177,16 @@ def update_quantize_metadata(
 ) -> None:
     """Update the quantizer state in the metadata dict."""
     metadata["quantizer_state"] = quantizer_state(model)
+
+    # Propagate sequential calibration progress if present (for checkpoint save)
+    from .utils.checkpoint import SEQ_CALIB_PROGRESS_ATTR
+
+    progress = getattr(model, SEQ_CALIB_PROGRESS_ATTR, None)
+    if progress is not None:
+        metadata["seq_calib_progress"] = progress
+    elif "seq_calib_progress" in metadata:
+        # Clean up stale progress from a previous save (calibration completed)
+        del metadata["seq_calib_progress"]
 
 
 def quantizer_state(model: nn.Module) -> dict[str, Any]:

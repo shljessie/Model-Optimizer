@@ -228,6 +228,9 @@ def wrapped_calib_func(
         kwargs["algorithm"] = method
 
     moe_calib_experts_ratio = kwargs.pop("moe_calib_experts_ratio", None)
+    checkpoint_dir = kwargs.pop("sequential_checkpoint_dir", None)
+    checkpoint_interval = kwargs.pop("sequential_checkpoint_interval", None)
+
     if moe_calib_experts_ratio is not None:
         assert (
             isinstance(moe_calib_experts_ratio, (int, float)) and 0 < moe_calib_experts_ratio <= 1
@@ -248,6 +251,8 @@ def wrapped_calib_func(
                 model,
                 forward_loop=forward_loop,
                 calib_func=func,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_interval=checkpoint_interval,
                 **kwargs,
             )
         else:
