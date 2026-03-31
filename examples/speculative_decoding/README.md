@@ -319,15 +319,96 @@ trainer.save_state()
 trainer.save_model("<path to the output directory>")
 ```
 
+## DFlash: Block Diffusion for Flash Speculative Decoding
+
+DFlash ([arXiv:2602.06036](https://arxiv.org/abs/2602.06036)) is a parallel speculative decoding method that predicts multiple tokens simultaneously using block diffusion. Unlike autoregressive methods (EAGLE, Medusa) that draft one token at a time, DFlash predicts an entire block of tokens in parallel, then iteratively denoises them.
+
+### Architecture
+
+DFlash uses three key mechanisms:
+
+- **Feature Fusion**: Multi-layer hidden states from the target model are projected via a fully-connected layer and RMSNorm to create context features
+- **KV Injection**: Context features are injected as K/V in every draft decoder layer, while Q comes from the noise embeddings. QK-Norm (RMSNorm on Q and K before RoPE) stabilizes attention
+- **Parallel Drafting**: Within each block of size B, unknown positions use a `mask_token_id` token. Only block-start positions get the real token. The attention mask allows noise tokens to attend to all context tokens from previous blocks, plus causally within the same block
+
+### Training
+
+```bash
+./launch_train.sh --model $BASE_MODEL \
+            --output_dir $OUTPUT_DIR \
+            --data input_conversations/train.jsonl \
+            --num_epochs $NUM_EPOCH \
+            --mode dflash \
+            --dflash_block_size 16 \
+            --dflash_num_layers 5
+```
+
+Key arguments:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode dflash` | - | Enable DFlash mode |
+| `--dflash_block_size` | 16 | Block size for parallel prediction |
+| `--dflash_num_layers` | 5 | Number of decoder layers in draft module |
+| `--dflash_config` | None | Path to JSON config for custom architecture |
+| `--dflash_mask_token_id` | auto | Mask token ID (auto-detected from model) |
+| `--dflash_disable_torch_compile` | False | Disable torch.compile |
+| `--dflash_use_logit_distillation` | False | Use KD from target model logits instead of hard CE |
+
+### mask_token_id
+
+The `mask_token_id` is critical for DFlash training and inference. It must be consistent between training and deployment. Auto-detection logic:
+
+| Model Family | mask_token_id | Source |
+|-------------|---------------|--------|
+| Qwen3.5 | 248070 | Built-in `[MASK]` token |
+| Qwen3 (8B) | 151643 | `eos_token_id` |
+| Llama 3 | 128002 | `reserved_special_token_0` |
+| Others | `pad_token_id` | Fallback |
+
+Override with `--dflash_mask_token_id <id>` if auto-detection is incorrect.
+
+### Configuring Draft Model
+
+Similar to EAGLE, provide a JSON config to customize the draft architecture:
+
+```json
+{
+    "num_hidden_layers": 5,
+    "rms_norm_eps": 1e-6
+}
+```
+
+Model dimensions (hidden_size, num_attention_heads, etc.) are automatically inherited from the base model.
+
+### Current Status (WIP)
+
+| Feature | Status |
+|---------|--------|
+| Architecture (Feature Fusion, KV Injection, Parallel Drafting) | Working |
+| Online training with HF Trainer | Working |
+| Inference / AR validation (`pseudo_speculative_generate`) | Working |
+| z-lab checkpoint loading and inference (AR 7-9) | Working |
+| Logit distillation option | Working |
+| Response-only loss masking | Working |
+| DDP training | Working (with `find_unused_parameters=True`) |
+
+**Known gap**: Training with ModelOpt achieves ~35% per-token accuracy (matching SpecForge's ~30%), but acceptance rate (AR) is lower than SpecForge-trained checkpoints (1.15 vs 1.95). Investigation shows the **data pipeline** differs significantly:
+
+- SpecForge uses its own tokenizer template with system prompt and response-only loss mask
+- ModelOpt's `LanguageDataCollator` uses `apply_chat_template` with different formatting
+
+Aligning the data pipeline is the next step to close the AR gap.
+
 ## Support Matrix
 
-| Model | Medusa | EAGLE1/2 | EAGLE3 |
-| :---: | :---: | :---: | :---: |
-| LLAMA 2 | ✅ | ✅ | ✅ |
-| LLAMA 3, 3.1 | ✅ | ✅ | ✅ |
-| Mistral | ✅ | ✅ | ✅ |
-| Phi 3 | ✅ | ✅ | ✅ |
-| QWen 1.5,2,2.5,3 | ✅ | ✅ | ✅ |
+| Model | Medusa | EAGLE1/2 | EAGLE3 | DFlash |
+| :---: | :---: | :---: | :---: | :---: |
+| LLAMA 2 | ✅ | ✅ | ✅ | ✅ |
+| LLAMA 3, 3.1 | ✅ | ✅ | ✅ | ✅ |
+| Mistral | ✅ | ✅ | ✅ | ✅ |
+| Phi 3 | ✅ | ✅ | ✅ | ✅ |
+| QWen 1.5,2,2.5,3 | ✅ | ✅ | ✅ | ✅ |
 
 ## Speculation Module Checkpoints
 
