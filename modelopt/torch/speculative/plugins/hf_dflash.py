@@ -26,20 +26,62 @@ Architecture:
 Reference: "DFlash: Block Diffusion for Flash Speculative Decoding" (arXiv:2602.06036)
 """
 
+import importlib
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
-from transformers.models.llama.modeling_llama import (
-    LlamaMLP,
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
-    rotate_half,
-)
 from transformers.utils import ModelOutput
 
 from ..dflash.conversion import DFlashDMRegistry
 from ..dflash.dflash_model import DFlashModel
+
+
+def _resolve_model_components(model_type):
+    """Resolve MLP, RMSNorm, RotaryEmbedding from the base model's transformers module.
+
+    Falls back to Llama components if the model type is unknown.
+    """
+    fallback = "llama"
+    model_type = model_type or fallback
+    try:
+        mod = importlib.import_module(f"transformers.models.{model_type}.modeling_{model_type}")
+    except (ImportError, ModuleNotFoundError):
+        mod = importlib.import_module(f"transformers.models.{fallback}.modeling_{fallback}")
+        model_type = fallback
+
+    prefix = model_type.capitalize()
+    # Handle multi-word model types (e.g., "qwen3" -> "Qwen3")
+    for attr in dir(mod):
+        if attr.lower() == f"{model_type}mlp":
+            prefix = attr.replace("MLP", "")
+            break
+
+    mlp_cls = getattr(mod, f"{prefix}MLP", None)
+    norm_cls = getattr(mod, f"{prefix}RMSNorm", None)
+    rotary_cls = getattr(mod, f"{prefix}RotaryEmbedding", None)
+    rotate_half_fn = getattr(mod, "rotate_half", None)
+
+    # Fallback to Llama if any component is missing
+    if not all([mlp_cls, norm_cls, rotary_cls, rotate_half_fn]):
+        from transformers.models.llama.modeling_llama import (
+            LlamaMLP,
+            LlamaRMSNorm,
+            LlamaRotaryEmbedding,
+        )
+        from transformers.models.llama.modeling_llama import rotate_half as _rotate_half
+
+        mlp_cls = mlp_cls or LlamaMLP
+        norm_cls = norm_cls or LlamaRMSNorm
+        rotary_cls = rotary_cls or LlamaRotaryEmbedding
+        rotate_half_fn = rotate_half_fn or _rotate_half
+
+    return mlp_cls, norm_cls, rotary_cls, rotate_half_fn
+
+
+# Default to Llama components; overridden per-model during convert()
+_MLP_CLS, _NORM_CLS, _ROTARY_CLS, _rotate_half = _resolve_model_components("llama")
 
 __all__ = ["HFDFlashModel"]
 
@@ -51,9 +93,7 @@ def build_target_layer_ids(num_target_layers, num_draft_layers):
     start = 1
     end = num_target_layers - 3
     span = end - start
-    return [
-        int(round(start + (i * span) / (num_draft_layers - 1))) for i in range(num_draft_layers)
-    ]
+    return [round(start + (i * span) / (num_draft_layers - 1)) for i in range(num_draft_layers)]
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -61,8 +101,8 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     cos = cos.unsqueeze(1)  # [B, 1, seq, dim]
     sin = sin.unsqueeze(1)
     q_len = q.size(2)
-    q_embed = (q * cos[:, :, -q_len:, :]) + (rotate_half(q) * sin[:, :, -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos[:, :, -q_len:, :]) + (_rotate_half(q) * sin[:, :, -q_len:, :])
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
 
 
@@ -87,8 +127,8 @@ class DFlashAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
         # QK norm (matches Qwen3DFlashAttention)
-        self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = _NORM_CLS(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = _NORM_CLS(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, target_hidden, position_embeddings, attention_mask=None):
         bsz, q_len, _ = hidden_states.shape
@@ -138,9 +178,9 @@ class DFlashDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.self_attn = DFlashAttention(config, layer_idx)
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = _MLP_CLS(config)
+        self.input_layernorm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, target_hidden, position_embeddings, attention_mask=None):
         residual = hidden_states
@@ -168,14 +208,14 @@ class DFlashModule(nn.Module):
         # Feature fusion
         num_fused_layers = len(config.target_layer_ids)
         self.fc = nn.Linear(num_fused_layers * config.hidden_size, config.hidden_size, bias=False)
-        self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_norm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
 
         # Decoder layers
         self.layers = nn.ModuleList(
             [DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.norm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = _ROTARY_CLS(config=config)
 
     def forward(self, noise_embedding, target_hidden, position_ids, attention_mask=None):
         """Forward matching SpecForge DFlashDraftModel.forward."""
@@ -356,7 +396,8 @@ class HFDFlashModel(DFlashModel):
             self.dflash_config.mlp_bias = False
 
         self.dflash_config.head_dim = getattr(
-            self.dflash_config, "head_dim",
+            self.dflash_config,
+            "head_dim",
             self.dflash_config.hidden_size // self.dflash_config.num_attention_heads,
         )
         self.dflash_config.block_size = self.dflash_block_size
@@ -389,6 +430,14 @@ class HFDFlashModel(DFlashModel):
 
         self._find_base_model_parts()
 
+        # Resolve model-specific components (MLP, RMSNorm, RotaryEmbedding)
+        # from the base model's architecture for weight compatibility
+        global _MLP_CLS, _NORM_CLS, _ROTARY_CLS, _rotate_half
+        _MLP_CLS, _NORM_CLS, _ROTARY_CLS, _rotate_half = _resolve_model_components(
+            getattr(base_config, "model_type", "llama")
+        )
+        print(f"DFlash: using {_MLP_CLS.__name__} from {base_config.model_type}")
+
         self.dflash_module = DFlashModule(self.dflash_config)
         self.dflash_module.to(self._base_model.dtype).to(
             next(self._base_model.layers[-1].parameters()).device
@@ -400,7 +449,13 @@ class HFDFlashModel(DFlashModel):
         # DynamicModule changes type(self) but the original class is in _original_cls.
         # Find the original HF model class (e.g., Qwen3_5ForConditionalGeneration)
         # by walking MRO and skipping DFlash/DynamicModule classes
-        skip_names = {"HFDFlashModel", "DFlashModel", "DynamicModule", "DFlashPreTrainedModel", "DFlashDraftModel"}
+        skip_names = {
+            "HFDFlashModel",
+            "DFlashModel",
+            "DynamicModule",
+            "DFlashPreTrainedModel",
+            "DFlashDraftModel",
+        }
         original_cls = None
         for cls in type(self).__mro__:
             if (
@@ -580,18 +635,19 @@ class HFDFlashModel(DFlashModel):
 
         # Extract target hidden states (raw, before FC projection)
         hid_offset = 1
-        if not hasattr(self, '_psg_debug'):
+        if not hasattr(self, "_psg_debug"):
             self._psg_debug = True
             sel = [base_outputs.hidden_states[lid + hid_offset] for lid in self.target_layer_ids]
-            th = torch.cat(sel, dim=-1)
-            print(f"[psg] hidden_states layers: {len(base_outputs.hidden_states)}, target_hidden norm: {th.norm().item():.2f}, shape: {th.shape}")
+            th_dbg = torch.cat(sel, dim=-1)
+            n_layers = len(base_outputs.hidden_states)
+            th_norm = th_dbg.norm().item()
+            print(
+                f"[psg] hidden layers: {n_layers}, target_hidden: {th_dbg.shape}, norm: {th_norm:.2f}"
+            )
             print(f"[psg] base_token: {base_token.item()}, mask_token_id: {self.mask_token_id}")
-            print(f"[psg] block_ids: {[self.mask_token_id]*self.dflash_block_size}")
-            bi = torch.full((1, self.dflash_block_size), self.mask_token_id, dtype=torch.long, device=input_ids.device)
-            bi[0, 0] = base_token[0, 0]
-            ne = self._base_model_embeddings(bi)
-            print(f"[psg] noise_emb norm: {ne.norm().item():.2f}, shape: {ne.shape}")
-            print(f"[psg] pos_ids will be: ctx=[0..{input_ids.shape[1]-1}], blk=[{input_ids.shape[1]}..{input_ids.shape[1]+self.dflash_block_size-1}]")
+            seq_len = input_ids.shape[1]
+            blk = self.dflash_block_size
+            print(f"[psg] pos: ctx=[0..{seq_len - 1}], blk=[{seq_len}..{seq_len + blk - 1}]")
         selected = [base_outputs.hidden_states[lid + hid_offset] for lid in self.target_layer_ids]
         target_hidden = torch.cat(selected, dim=-1)
 
@@ -615,9 +671,7 @@ class HFDFlashModel(DFlashModel):
         pos_ids = torch.cat([ctx_positions, block_positions]).unsqueeze(0).expand(bsz, -1)
 
         # Attention mask: block sees ALL context + causal within block
-        attn_mask = torch.zeros(
-            1, 1, block_size, ctx_len + block_size, device=device, dtype=dtype
-        )
+        attn_mask = torch.zeros(1, 1, block_size, ctx_len + block_size, device=device, dtype=dtype)
         block_causal = torch.triu(
             torch.full(
                 (block_size, block_size), torch.finfo(dtype).min, device=device, dtype=dtype
