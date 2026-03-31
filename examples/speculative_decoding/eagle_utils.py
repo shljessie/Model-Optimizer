@@ -139,6 +139,7 @@ def make_eagle_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
     data_args,
     train_len=None,
+    answer_only_loss=False,
 ) -> dict:
     if data_args.offline_data_path is None:
         train_dataset = ShardedDataset("json", data_files=data_args.data_path)
@@ -148,6 +149,7 @@ def make_eagle_supervised_data_module(
                 tokenizer=tokenizer,
                 train_len=train_len,
                 return_labels=True,
+                answer_only_loss=answer_only_loss,
             )
         else:
             data_collator = VisionLanguageDataCollator(
