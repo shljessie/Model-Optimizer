@@ -1878,6 +1878,7 @@ def gptq(
             Follows the 3-loop structure from the VQ GPTQ reference
             (adaptive_rounding.py: gptq_quantize_scaled_vq).
             """
+            print_rank_0(f"  [{self.name}] Using PSX LUTS GPTQ path (v2)")
             extra_args = quantizer.backend_extra_args
             encode_format = quantizer.num_bits
             encode_path = extra_args.get("encode_path", "")
