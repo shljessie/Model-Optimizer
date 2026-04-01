@@ -22,7 +22,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from .image_processor import BaseImageProcessor
+from .image_processor import BaseImageProcessor, _Qwen3OmniProcessorMixin
 
 # Use dict to store the config for each dataset.
 SUPPORTED_VIDEO_DATASET_CONFIG: dict[str, dict[str, Any]] = {
@@ -161,7 +161,7 @@ def get_video_dataset_dataloader(
     )
 
 
-class Qwen3OmniVideoProcessor(BaseImageProcessor):
+class Qwen3OmniVideoProcessor(_Qwen3OmniProcessorMixin, BaseImageProcessor):
     """Video processor for Qwen3-Omni multimodal model with finevideo dataset support."""
 
     def __init__(self, tokenizer, device="cuda", dtype=None, use_audio_in_video=True):
@@ -204,6 +204,16 @@ class Qwen3OmniVideoProcessor(BaseImageProcessor):
             f.write(video_bytes)
         return video_path
 
+    _ALL_KEYS = [
+        "input_ids",
+        "attention_mask",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "video_second_per_grid",
+        "feature_attention_mask",
+        "input_features",
+    ]
+
     def preprocess_function(self, examples):
         """Preprocess function for Qwen3-Omni with video support.
 
@@ -212,7 +222,6 @@ class Qwen3OmniVideoProcessor(BaseImageProcessor):
         # Get question/prompt - finevideo has metadata in 'json' field
         if "json" in examples and examples["json"] is not None:
             metadata = examples["json"]
-            # Try to get a meaningful question from metadata
             category = metadata.get("content_fine_category", "")
             question = (
                 f"Describe what is happening in this video in detail. Category hint: {category}"
@@ -226,10 +235,8 @@ class Qwen3OmniVideoProcessor(BaseImageProcessor):
         # Handle video - check for raw bytes (finevideo format) or path
         video_path = None
         if examples.get("mp4") is not None:
-            # finevideo format: raw video bytes in 'mp4' field
             video_path = self._save_video_bytes_to_file(examples["mp4"])
         elif examples.get("video") is not None:
-            # Standard format: video path or URL
             video_path = examples["video"]
 
         if video_path is not None:
@@ -238,92 +245,24 @@ class Qwen3OmniVideoProcessor(BaseImageProcessor):
         content.append({"type": "text", "text": question})
 
         conversation = [{"role": "user", "content": content}]
-        text = self.tokenizer.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False, enable_thinking=False
-        )
-
-        # Extract multimodal info using qwen_omni_utils
-        audios, images, videos = self.process_mm_info(
-            conversation, use_audio_in_video=self.use_audio_in_video
-        )
-
-        # Process inputs with the processor
-        values = self.tokenizer(
-            text=text,
-            audio=audios,
-            images=images,
-            videos=videos,
-            return_tensors="pt",
-            padding=True,
-            use_audio_in_video=self.use_audio_in_video,
-        )
-        # Define all possible keys to ensure consistent schema for Arrow serialization
-        all_keys = [
-            "input_ids",
-            "attention_mask",
-            "pixel_values_videos",
-            "video_grid_thw",
-            "video_second_per_grid",
-            "feature_attention_mask",
-            "input_features",
-        ]
-
-        # Convert tensors to lists for Arrow serialization compatibility
-        # Tensor conversion back happens in collate_function
-        result = dict.fromkeys(all_keys)  # Initialize all keys to None
-        for key, val in values.items():
-            if val is not None and hasattr(val, "tolist"):
-                result[key] = val.tolist()
-            elif val is not None:
-                result[key] = val
-
-        return result
+        values = self._tokenize_conversation(conversation)
+        return self._serialize_for_arrow(values, self._ALL_KEYS)
 
     def collate_function(self, batch):
         """Collate function to process inputs during data loading."""
-        result = {}
-
-        # Take first item only — multimodal inputs have variable-length sequences
-        # (video frames, audio) that cannot be stacked, so batch_size=1 is expected.
-        first = batch[0]
-
-        # Convert lists to tensors and move to device
-        if first.get("input_ids") is not None:
-            result["input_ids"] = torch.LongTensor(first["input_ids"]).to(self.device)
-        if first.get("attention_mask") is not None:
-            result["attention_mask"] = torch.LongTensor(first["attention_mask"]).to(self.device)
-
-        # Handle pixel values for video frames
-        if first.get("pixel_values_videos") is not None:
-            pv = torch.tensor(first["pixel_values_videos"])
-            if self.dtype is not None:
-                pv = pv.to(self.dtype)
-            result["pixel_values_videos"] = pv.to(self.device)
-
-        # Handle video grid thw (tile height width info)
-        if first.get("video_grid_thw") is not None:
-            result["video_grid_thw"] = torch.LongTensor(first["video_grid_thw"]).to(self.device)
-
-        # Handle video second per grid (temporal info for rope)
-        if first.get("video_second_per_grid") is not None:
-            result["video_second_per_grid"] = torch.tensor(first["video_second_per_grid"]).to(
-                self.device
-            )
-
-        # Handle audio features if present
-        if first.get("feature_attention_mask") is not None:
-            result["feature_attention_mask"] = torch.LongTensor(first["feature_attention_mask"]).to(
-                self.device
-            )
-        if first.get("input_features") is not None:
-            inp_feat = torch.tensor(first["input_features"])
-            if self.dtype is not None:
-                inp_feat = inp_feat.to(self.dtype)
-            result["input_features"] = inp_feat.to(self.device)
-
+        result = self._collate_first_item(
+            batch,
+            long_keys=(
+                "input_ids",
+                "attention_mask",
+                "video_grid_thw",
+                "feature_attention_mask",
+            ),
+            float_keys=("pixel_values_videos", "video_second_per_grid", "input_features"),
+            dtype=self.dtype,
+        )
         # Pass use_audio_in_video flag to model.generate() for Qwen3Omni
         result["use_audio_in_video"] = self.use_audio_in_video
-
         return result
 
     def cleanup(self):
@@ -332,3 +271,7 @@ class Qwen3OmniVideoProcessor(BaseImageProcessor):
 
         if os.path.exists(self._temp_dir):
             shutil.rmtree(self._temp_dir)
+
+    def __del__(self):
+        """Ensure temporary files are cleaned up when the processor is garbage collected."""
+        self.cleanup()

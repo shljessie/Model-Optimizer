@@ -212,6 +212,44 @@ def _auto_preprocess_sample(
     )
 
 
+def _load_text_samples(dataset_name, num_samples, **kwargs):
+    """Normalize inputs and load raw text samples from one or more datasets.
+
+    Args:
+        dataset_name: Single name or list of names.
+        num_samples: Single count or list of counts (must match dataset_name length).
+        **kwargs: Forwarded to get_dataset_samples().
+
+    Returns:
+        List of raw text strings.
+    """
+    if isinstance(num_samples, int):
+        num_samples = [num_samples]
+    if isinstance(dataset_name, str):
+        dataset_name = [dataset_name]
+    assert len(dataset_name) == len(num_samples), (
+        "dataset_name and num_samples must be the same length"
+    )
+    all_samples = []
+    for ds_name, num_sample in zip(dataset_name, num_samples):
+        samples = get_dataset_samples(ds_name, num_sample, **kwargs)
+        all_samples.extend(samples)
+    return all_samples
+
+
+class _ListDataset(torch.utils.data.Dataset):
+    """Simple dataset wrapping a list of dicts."""
+
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+    def __len__(self):
+        return len(self.samples)
+
+
 def get_qwen3omni_text_dataloader(
     dataset_name: str | list[str] = "cnn_dailymail",
     processor=None,
@@ -236,58 +274,24 @@ def get_qwen3omni_text_dataloader(
     """
     assert processor is not None, "Please provide a Qwen3OmniTextProcessor."
 
-    if isinstance(num_samples, int):
-        num_samples = [num_samples]
+    all_samples = _load_text_samples(dataset_name, num_samples)
 
-    if isinstance(dataset_name, str):
-        dataset_name = [dataset_name]
+    # Preprocess each sample with the conversation template and convert to lists
+    from .image_processor import _Qwen3OmniProcessorMixin
 
-    assert len(dataset_name) == len(num_samples), (
-        "dataset_name and num_samples must be the same length"
-    )
-
-    # Get raw text samples
-    all_samples = []
-    for ds_name, num_sample in zip(dataset_name, num_samples):
-        samples = get_dataset_samples(ds_name, num_sample)
-        all_samples.extend(samples)
-
-    # Preprocess each sample with the conversation template
     processed_samples = []
     for text in all_samples:
-        # Apply conversation template and tokenize
         values = processor.preprocess_function(text)
+        processed_samples.append(
+            _Qwen3OmniProcessorMixin._serialize_for_arrow(values, list(values.keys()))
+        )
 
-        # Convert to lists for dataset compatibility
-        sample_dict = {}
-        for key, val in values.items():
-            if val is not None and hasattr(val, "tolist"):
-                sample_dict[key] = val.tolist()
-            elif val is not None:
-                sample_dict[key] = val
-        processed_samples.append(sample_dict)
-
-    # Create dataset
-    class _Qwen3OmniTextDataset(torch.utils.data.Dataset):
-        def __init__(self, samples):
-            self.samples = samples
-
-        def __getitem__(self, idx):
-            return self.samples[idx]
-
-        def __len__(self):
-            return len(self.samples)
-
-    dataset = _Qwen3OmniTextDataset(processed_samples)
-
-    calib_dataloader = DataLoader(
-        dataset,
+    return DataLoader(
+        _ListDataset(processed_samples),
         batch_size=batch_size,
         shuffle=False,
         collate_fn=processor.collate_function,
     )
-
-    return calib_dataloader
 
 
 def get_dataset_samples(
@@ -446,22 +450,12 @@ def get_dataset_dataloader(
             "Tokenizer with the right padding_side may impact calibration accuracy. Recommend set to left"
         )
 
-    if isinstance(num_samples, int):
-        num_samples = [num_samples]
-
-    if isinstance(dataset_name, str):
-        dataset_name = [dataset_name]
-
-    assert len(dataset_name) == len(num_samples), (
-        "dataset_name and num_samples must be the same length"
+    all_samples = _load_text_samples(
+        dataset_name,
+        num_samples,
+        apply_chat_template=apply_chat_template,
+        tokenizer=tokenizer,
     )
-
-    all_samples = []
-    for ds_name, num_sample in zip(dataset_name, num_samples):
-        samples = get_dataset_samples(
-            ds_name, num_sample, apply_chat_template=apply_chat_template, tokenizer=tokenizer
-        )
-        all_samples.extend(samples)
 
     batch_encoded = tokenizer(
         all_samples,
@@ -531,7 +525,7 @@ def get_max_batch_size(
     torch.cuda.empty_cache()
 
     free_mem_before, max_allocated_before = _get_free_gpu_mem()
-    use_generate = model_type_is_enc_dec(model)
+    use_generate = _should_use_generate(model)
     infer_method = model.generate if use_generate else model.forward
 
     if sample_input_single_batch is None:
@@ -587,7 +581,7 @@ def get_max_batch_size(
         return 512
 
 
-def _process_batch(batch_data, infer_method, generation_kwargs={}, max_working_batch_size=None):
+def _process_batch(batch_data, infer_method, generation_kwargs=None, max_working_batch_size=None):
     """Process a batch of data through the model's inference method.
 
     Args:
@@ -599,6 +593,8 @@ def _process_batch(batch_data, infer_method, generation_kwargs={}, max_working_b
     Returns:
         The maximum batch size that worked successfully
     """
+    if generation_kwargs is None:
+        generation_kwargs = {}
     # Separate tensor values from scalar parameters (like max_new_tokens)
     tensor_data = {k: v for k, v in batch_data.items() if torch.is_tensor(v) or v is None}
     scalar_data = {k: v for k, v in batch_data.items() if not torch.is_tensor(v) and v is not None}
@@ -663,7 +659,7 @@ def _process_batch(batch_data, infer_method, generation_kwargs={}, max_working_b
 
 
 def _forward_loop(
-    model: torch.nn.Module, dataloader: DataLoader, generation_kwargs: dict = {}
+    model: torch.nn.Module, dataloader: DataLoader, generation_kwargs: dict | None = None
 ) -> None:
     """Runs forward passes through the model using data from the dataloader.
 
@@ -672,9 +668,10 @@ def _forward_loop(
         dataloader: DataLoader containing the batched input data
         generation_kwargs: Keyword arguments to pass to the model.generate() method.
     """
+    if generation_kwargs is None:
+        generation_kwargs = {}
     with torch.no_grad():
-        # use_generate = _should_use_generate(model)
-        use_generate = model_type_is_enc_dec(model)
+        use_generate = _should_use_generate(model)
         infer_method = model.generate if use_generate else model.forward
         max_working_batch_size = None  # Initialize max working batch size as None
 
@@ -695,7 +692,7 @@ def create_forward_loop(
     device: str | None = None,
     include_labels: bool = False,
     dataloader: DataLoader | None = None,
-    generation_kwargs: dict = {},
+    generation_kwargs: dict | None = None,
 ) -> Callable:
     """Creates and returns a forward loop function configured for a specific model, dataset, and tokenizer.
 
@@ -737,6 +734,8 @@ def create_forward_loop(
         A forward loop function that can be called with no arguments. When called, this function iterates over
             the dataset specified by `dataset_name`.
     """
+    if generation_kwargs is None:
+        generation_kwargs = {}
     if dataloader is None:
         if batch_size == 0:
             # We let the system to determine the max data batch for each forward.
@@ -860,4 +859,7 @@ def _should_use_generate(model):
     """
     generate_model_list = ["qwen3omni"]
     model_name = model.__class__.__name__.lower()
-    return model_type_is_enc_dec(model) or any(name in model_name for name in generate_model_list)
+    needs_generate = model_type_is_enc_dec(model) or any(
+        name in model_name for name in generate_model_list
+    )
+    return needs_generate and hasattr(model, "generate")

@@ -67,15 +67,33 @@ __doc__ = f"""Utility functions for model type detection and classification.
         {MODEL_NAME_TO_TYPE=}
 """
 
-__all__ = ["get_language_model_from_vl", "get_model_type", "is_multimodal_model"]
+__all__ = [
+    "get_language_model_from_vl",
+    "get_model_type",
+    "is_multimodal_model",
+    "match_model_type_by_name",
+]
+
+
+def match_model_type_by_name(name: str) -> str | None:
+    """Match a model type from MODEL_NAME_TO_TYPE by case-insensitive substring match.
+
+    Args:
+        name: String to match against (e.g. class name, architecture string, model_type field).
+
+    Returns:
+        Matched model type string, or None.
+    """
+    name_lower = name.lower()
+    for k, v in MODEL_NAME_TO_TYPE.items():
+        if k.lower() in name_lower:
+            return v
+    return None
 
 
 def get_model_type(model):
     """Try get the model type from the model name. If not found, return None."""
-    for k, v in MODEL_NAME_TO_TYPE.items():
-        if k.lower() in type(model).__name__.lower():
-            return v
-    return None
+    return match_model_type_by_name(type(model).__name__)
 
 
 def is_multimodal_model(model):

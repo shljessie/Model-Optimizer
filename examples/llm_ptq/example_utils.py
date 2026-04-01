@@ -45,7 +45,7 @@ try:
 except ImportError:
     snapshot_download = None
 
-from modelopt.torch.export.model_utils import MODEL_NAME_TO_TYPE
+from modelopt.torch.export.model_utils import match_model_type_by_name
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.image_processor import (
     BaseImageProcessor,
@@ -95,19 +95,13 @@ def get_model_type_from_config(model_path: str) -> str | None:
         config = json.load(f)
 
     # Check architectures field first
-    architectures = config.get("architectures", [])
-    for arch in architectures:
-        for key, model_type in MODEL_NAME_TO_TYPE.items():
-            if key.lower() in arch.lower():
-                return model_type
+    for arch in config.get("architectures", []):
+        result = match_model_type_by_name(arch)
+        if result is not None:
+            return result
 
     # Fallback to model_type field
-    model_type_field = config.get("model_type", "")
-    for key, model_type in MODEL_NAME_TO_TYPE.items():
-        if key.lower() in model_type_field.lower():
-            return model_type
-
-    return None
+    return match_model_type_by_name(config.get("model_type", ""))
 
 
 def get_sampling_params_from_config(model_path: str) -> dict:
@@ -164,10 +158,13 @@ def ensure_tokenizer_files(model_path: str, source_model_id: str) -> None:
 
     print(f"Copying missing tokenizer files from {source_model_id}...")
     # Download only tokenizer files from HF
-    cache_dir = snapshot_download(
-        source_model_id,
-        allow_patterns=TOKENIZER_FILES,
-    )
+    if os.path.isdir(source_model_id):
+        cache_dir = source_model_id
+    else:
+        cache_dir = snapshot_download(
+            source_model_id,
+            allow_patterns=TOKENIZER_FILES,
+        )
 
     for fname in TOKENIZER_FILES:
         src = os.path.join(cache_dir, fname)
@@ -990,55 +987,6 @@ def copy_custom_model_files(source_path: str, export_path: str, trust_remote_cod
         print(f"Successfully copied {len(copied_files)} custom model files to {export_path}")
     else:
         print("No custom model files found to copy")
-
-
-def patch_config_for_unified_export(model_type: str, export_path: str) -> None:
-    """Patch config files to add missing exclusion patterns for unified HF export.
-
-    This function adds missing exclusion patterns for modules that should not be quantized
-    (e.g., audio tower, visual encoder, lm_head) to both hf_quant_config.json and config.json.
-
-    Args:
-        export_path: Path to the exported model directory.
-    """
-    if model_type == "qwen3omni":
-        missing_patterns = [
-            "thinker.audio_tower*",
-            "thinker.visual*",
-            "thinker.lm_head",
-        ]
-
-        # (filename, path_to_exclude_list)
-        configs = [
-            ("hf_quant_config.json", ["quantization", "exclude_modules"]),
-            ("config.json", ["quantization_config", "ignore"]),
-        ]
-
-        for filename, keys in configs:
-            filepath = os.path.join(export_path, filename)
-            if not os.path.exists(filepath):
-                continue
-            try:
-                with open(filepath) as f:
-                    config = json.load(f)
-
-                # Navigate to nested key
-                target = config
-                for key in keys[:-1]:
-                    target = target.get(key, {})
-
-                exclude_list = target.get(keys[-1])
-                if exclude_list is None:
-                    continue
-
-                added = [p for p in missing_patterns if p not in exclude_list]
-                if added:
-                    exclude_list.extend(added)
-                    with open(filepath, "w") as f:
-                        json.dump(config, f, indent=2)
-                    print(f"Patched {filename} with exclusions: {added}")
-            except Exception as e:
-                print(f"Warning: Failed to patch {filename}: {e}")
 
 
 def get_qwen3omni_dataloader(

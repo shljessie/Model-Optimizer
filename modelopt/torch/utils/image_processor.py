@@ -16,6 +16,8 @@
 # Adapted from tensorrt_llm/quantization/image_processing.py
 """Utility classes for image processing."""
 
+from typing import Any
+
 import torch
 
 
@@ -38,6 +40,33 @@ class BaseImageProcessor:
     def collate_function(self, examples):
         """Collate function to process images during data loading."""
         raise NotImplementedError("Each image processor must implement its own collate method")
+
+    def _collate_first_item(self, batch, long_keys=(), float_keys=(), dtype=None):
+        """Shared collate helper: validates batch_size=1, converts lists to tensors.
+
+        Args:
+            batch: List of sample dicts from the DataLoader.
+            long_keys: Keys to convert via torch.LongTensor.
+            float_keys: Keys to convert via torch.tensor with optional dtype cast.
+            dtype: Optional dtype for float_keys tensors.
+
+        Returns:
+            Dict of tensors moved to self.device.
+        """
+        if len(batch) != 1:
+            raise ValueError(f"{type(self).__name__} currently supports batch_size=1 only.")
+        first = batch[0]
+        result = {}
+        for key in long_keys:
+            if first.get(key) is not None:
+                result[key] = torch.LongTensor(first[key]).to(self.device)
+        for key in float_keys:
+            if first.get(key) is not None:
+                t = torch.tensor(first[key])
+                if dtype is not None:
+                    t = t.to(dtype)
+                result[key] = t.to(self.device)
+        return result
 
 
 # A light Encapsulation for Huggingface MllamaImageProcessor
@@ -161,19 +190,76 @@ class Qwen3OmniTextProcessor(BaseImageProcessor):
 
     def collate_function(self, batch):
         """Collate function to process text inputs during data loading."""
-        result = {}
-        first = batch[0]
+        return self._collate_first_item(
+            batch,
+            long_keys=("input_ids", "attention_mask"),
+        )
 
-        if "input_ids" in first and first["input_ids"] is not None:
-            result["input_ids"] = torch.LongTensor(first["input_ids"]).to(self.device)
-        if "attention_mask" in first and first["attention_mask"] is not None:
-            result["attention_mask"] = torch.LongTensor(first["attention_mask"]).to(self.device)
 
+class _Qwen3OmniProcessorMixin:
+    """Shared preprocessing logic for Qwen3-Omni image/video processors."""
+
+    tokenizer: Any
+    process_mm_info: Any
+    use_audio_in_video: Any
+
+    def _tokenize_conversation(self, conversation):
+        """Tokenize a Qwen3-Omni conversation and return processor outputs.
+
+        Args:
+            conversation: List of conversation dicts in Qwen format.
+
+        Returns:
+            Processor output dict with tensors.
+        """
+        text = self.tokenizer.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=False, enable_thinking=False
+        )
+        audios, images, videos = self.process_mm_info(
+            conversation, use_audio_in_video=self.use_audio_in_video
+        )
+        return self.tokenizer(
+            text=text,
+            audio=audios,
+            images=images,
+            videos=videos,
+            return_tensors="pt",
+            padding=True,
+            use_audio_in_video=self.use_audio_in_video,
+        )
+
+    @staticmethod
+    def _serialize_for_arrow(values, all_keys):
+        """Convert processor outputs to lists for Arrow serialization.
+
+        Args:
+            values: Processor output dict (may contain tensors).
+            all_keys: List of keys to include in the result (ensures consistent schema).
+
+        Returns:
+            Dict with all_keys initialized to None, populated from values.
+        """
+        result = dict.fromkeys(all_keys)
+        for key, val in values.items():
+            if val is not None and hasattr(val, "tolist"):
+                result[key] = val.tolist()
+            elif val is not None:
+                result[key] = val
         return result
 
 
-class Qwen3OmniImageProcessor(BaseImageProcessor):
+class Qwen3OmniImageProcessor(_Qwen3OmniProcessorMixin, BaseImageProcessor):
     """Image processor for Qwen3-Omni multimodal model."""
+
+    _ALL_KEYS = [
+        "input_ids",
+        "attention_mask",
+        "pixel_values",
+        "image_grid_thw",
+        "audio_features",
+        "audio_feature_lens",
+        "video_grid_thw",
+    ]
 
     def __init__(self, tokenizer, device="auto", dtype=None, use_audio_in_video=False):
         """Constructor."""
@@ -206,86 +292,20 @@ class Qwen3OmniImageProcessor(BaseImageProcessor):
         content.append({"type": "text", "text": question})
 
         conversation = [{"role": "user", "content": content}]
-        text = self.tokenizer.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False, enable_thinking=False
-        )
-
-        # Extract multimodal info using qwen_omni_utils
-        audios, images, videos = self.process_mm_info(
-            conversation, use_audio_in_video=self.use_audio_in_video
-        )
-
-        # Process inputs with the processor
-        values = self.tokenizer(
-            text=text,
-            audio=audios,
-            images=images,
-            videos=videos,
-            return_tensors="pt",
-            padding=True,
-            use_audio_in_video=self.use_audio_in_video,
-        )
-
-        # Define all possible keys to ensure consistent schema for Arrow serialization
-        all_keys = [
-            "input_ids",
-            "attention_mask",
-            "pixel_values",
-            "image_grid_thw",
-            "audio_features",
-            "audio_feature_lens",
-            "video_grid_thw",
-        ]
-
-        # Convert tensors to lists for Arrow serialization compatibility
-        # Tensor conversion back happens in collate_function
-        result = dict.fromkeys(all_keys)  # Initialize all keys to None
-        for key, val in values.items():
-            if val is not None and hasattr(val, "tolist"):
-                result[key] = val.tolist()
-            elif val is not None:
-                result[key] = val
-
-        return result
+        values = self._tokenize_conversation(conversation)
+        return self._serialize_for_arrow(values, self._ALL_KEYS)
 
     def collate_function(self, batch):
         """Collate function to process inputs during data loading."""
-        result = {}
-
-        # Take first item only — multimodal inputs have variable-length sequences
-        # (images, audio) that cannot be stacked, so batch_size=1 is expected.
-        first = batch[0]
-
-        # Convert lists to tensors and move to device
-        if "input_ids" in first and first["input_ids"] is not None:
-            result["input_ids"] = torch.LongTensor(first["input_ids"]).to(self.device)
-        if "attention_mask" in first and first["attention_mask"] is not None:
-            result["attention_mask"] = torch.LongTensor(first["attention_mask"]).to(self.device)
-
-        # Handle pixel values for images
-        if first.get("pixel_values") is not None:
-            pv = torch.tensor(first["pixel_values"])
-            if self.dtype is not None:
-                pv = pv.to(self.dtype)
-            result["pixel_values"] = pv.to(self.device)
-
-        # Handle image grid thw (tile height width info)
-        if first.get("image_grid_thw") is not None:
-            result["image_grid_thw"] = torch.LongTensor(first["image_grid_thw"]).to(self.device)
-
-        # Handle audio features if present
-        if first.get("audio_feature_lens") is not None:
-            result["audio_feature_lens"] = torch.LongTensor(first["audio_feature_lens"]).to(
-                self.device
-            )
-        if first.get("audio_features") is not None:
-            af = torch.tensor(first["audio_features"])
-            if self.dtype is not None:
-                af = af.to(self.dtype)
-            result["audio_features"] = af.to(self.device)
-
-        # Handle video features if present
-        if first.get("video_grid_thw") is not None:
-            result["video_grid_thw"] = torch.LongTensor(first["video_grid_thw"]).to(self.device)
-
-        return result
+        return self._collate_first_item(
+            batch,
+            long_keys=(
+                "input_ids",
+                "attention_mask",
+                "image_grid_thw",
+                "audio_feature_lens",
+                "video_grid_thw",
+            ),
+            float_keys=("pixel_values", "audio_features"),
+            dtype=self.dtype,
+        )

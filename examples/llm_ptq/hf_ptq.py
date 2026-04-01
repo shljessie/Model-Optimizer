@@ -18,6 +18,7 @@ import copy
 import random
 import time
 import warnings
+from collections import namedtuple
 from typing import Any
 
 import numpy as np
@@ -35,7 +36,6 @@ from example_utils import (
     is_enc_dec,
     is_nemotron_vl,
     load_mtp_weights,
-    patch_config_for_unified_export,
     run_nemotron_vl_preview,
 )
 from torch.utils.data import DataLoader
@@ -735,9 +735,6 @@ def export_quantized(
                     extra_state_dict=mtp_state_dict,
                 )
 
-            # Exclude non-quantized modules in config.json and hf_quant_config.json
-            patch_config_for_unified_export(model_type, export_path)
-
         # Restore default padding and export the tokenizer as well.
         if tokenizer is not None:
             tokenizer.padding_side = default_padding_side
@@ -755,6 +752,23 @@ def export_quantized(
         print(
             f"Quantized model exported to: {export_path}. Total time used {end_time - start_time}s"
         )
+
+
+PreQuantizeResult = namedtuple(
+    "PreQuantizeResult", ["preview_input_ids", "generated_ids_before_ptq", "calib_batch"]
+)
+
+
+def _qwen3omni_generate(model, calib_batch):
+    """Run Qwen3Omni generate and unpack the result.
+
+    Qwen3Omni returns a (text_ids, audio) tuple; text_ids may have a .sequences attribute.
+    """
+    result = model.generate(**calib_batch, return_audio=False, thinker_max_new_tokens=100)
+    if isinstance(result, tuple):
+        text_ids, _ = result
+        return text_ids.sequences if hasattr(text_ids, "sequences") else text_ids
+    return result
 
 
 def pre_quantize(
@@ -799,20 +813,15 @@ def pre_quantize(
             allow_fallback=False,
         )
     elif model_type == "qwen3omni":
-        # Qwen3Omni returns (text_ids, audio) tuple; text_ids has .sequences
-        # Pass full batch with all multimodal inputs
-        result = full_model.generate(**calib_batch, return_audio=False, thinker_max_new_tokens=100)
-        if isinstance(result, tuple):
-            text_ids, _ = result
-            generated_ids_before_ptq = (
-                text_ids.sequences if hasattr(text_ids, "sequences") else text_ids
-            )
-        else:
-            generated_ids_before_ptq = result
+        # Use only a single sample for preview generation to avoid OOM
+        single_sample = {
+            k: v[0:1] if isinstance(v, torch.Tensor) else v for k, v in calib_batch.items()
+        }
+        generated_ids_before_ptq = _qwen3omni_generate(full_model, single_sample)
     else:
         generated_ids_before_ptq = full_model.generate(preview_input_ids, max_new_tokens=100)
 
-    return preview_input_ids, generated_ids_before_ptq, calib_batch
+    return PreQuantizeResult(preview_input_ids, generated_ids_before_ptq, calib_batch)
 
 
 def post_quantize(
@@ -861,25 +870,23 @@ def post_quantize(
     """
 
     if args.verbose:
-        mtq.print_quant_summary(full_model, save_path=args.quant_summary_path)
-        save_expert_token_count_table(full_model, args.export_path)
+        try:
+            mtq.print_quant_summary(full_model, save_path=args.quant_summary_path)
+            save_expert_token_count_table(full_model, args.export_path)
+        except Exception as e:
+            print(f"Warning: Failed to print quant summary: {e}")
 
     # Run some samples
     torch.cuda.empty_cache()
     generated_ids_after_ptq = None
     if generated_ids_before_ptq is None:
         pass
-    elif model_type == "qwen3omni":
-        # Qwen3Omni returns (text_ids, audio) tuple; text_ids has .sequences
-        # Pass full batch with all multimodal inputs
-        result = full_model.generate(**calib_batch, return_audio=False, thinker_max_new_tokens=100)
-        if isinstance(result, tuple):
-            text_ids, _ = result
-            generated_ids_after_ptq = (
-                text_ids.sequences if hasattr(text_ids, "sequences") else text_ids
-            )
-        else:
-            generated_ids_after_ptq = result
+    elif model_type == "qwen3omni" and calib_batch is not None:
+        # Use only a single sample for preview generation to avoid OOM
+        single_sample = {
+            k: v[0:1] if isinstance(v, torch.Tensor) else v for k, v in calib_batch.items()
+        }
+        generated_ids_after_ptq = _qwen3omni_generate(full_model, single_sample)
     elif model_type != "llama4" and not is_nemotron_vl_model:
         # Our fake quantizer may not be fully compatible with torch.compile.
         generated_ids_after_ptq = full_model.generate(preview_input_ids, max_new_tokens=100)

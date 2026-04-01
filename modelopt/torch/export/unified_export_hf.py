@@ -87,7 +87,7 @@ from .model_config import (
     QUANTIZATION_W4A8_AWQ,
     QUANTIZATION_W4A8_NVFP4_FP8,
 )
-from .model_utils import get_language_model_from_vl, is_multimodal_model
+from .model_utils import get_language_model_from_vl, get_model_type, is_multimodal_model
 from .plugins import SpeculativeDecodingExporter, has_spec_opt
 from .quant_utils import (
     fuse_prequant_layernorm,
@@ -781,6 +781,16 @@ def _export_transformers_checkpoint(
                 exclude_modules.append(pattern)
                 print(f"Adding MTP layer to quantization_config ignore: {pattern}")
 
+    # Add model-specific non-quantized module exclusions
+    _model_type_exclusions = {
+        "qwen3omni": ["thinker.audio_tower*", "thinker.visual*", "thinker.lm_head"],
+    }
+    model_type = get_model_type(model)
+    for pattern in _model_type_exclusions.get(model_type, []):
+        exclude_modules = quant_config["quantization"].setdefault("exclude_modules", [])
+        if pattern not in exclude_modules:
+            exclude_modules.append(pattern)
+
     # Safety net: sync any gate/up weight quantizer amaxes that
     # requantize_resmooth_fused_llm_layers did not reach (e.g. experts not
     # activated during the dummy forward, or non-standard expert naming).
@@ -1185,6 +1195,8 @@ def export_hf_checkpoint(
 
         # Fix generation_config conflicts before saving
         # Some models have temperature/top_p/top_k set but do_sample=False which causes validation errors
+        # Restore the original value after save to avoid mutating the caller's model.
+        _gen_config_restore = None
         if hasattr(model, "generation_config") and model.generation_config is not None:
             gen_config = model.generation_config
             if not getattr(gen_config, "do_sample", True):
@@ -1193,6 +1205,7 @@ def export_hf_checkpoint(
                     getattr(gen_config, attr, None) is not None
                     for attr in ["temperature", "top_p", "top_k"]
                 ):
+                    _gen_config_restore = gen_config.do_sample
                     gen_config.do_sample = True
 
         # Save model
@@ -1211,6 +1224,8 @@ def export_hf_checkpoint(
             )
         finally:
             _unpatch_revert_weight_conversion(_patches)
+            if _gen_config_restore is not None:
+                model.generation_config.do_sample = _gen_config_restore
 
         original_config = f"{export_dir}/config.json"
         config_data = {}
