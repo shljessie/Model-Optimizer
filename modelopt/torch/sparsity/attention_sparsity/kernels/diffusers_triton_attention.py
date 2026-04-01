@@ -48,11 +48,15 @@ def set_triton_skip_softmax_config(
     threshold: float | None = None,
     normalize_by_seqlen: bool = False,
     enable_v25: bool = False,
+    majority_pct: float = 0.0,
+    sparsity_counters: "torch.Tensor | None" = None,
 ) -> None:
     """Set thread-local skip-softmax config for the next Triton attention call."""
     _thread_local.skip_threshold = threshold
     _thread_local.normalize_by_seqlen = normalize_by_seqlen
     _thread_local.enable_v25 = enable_v25
+    _thread_local.majority_pct = majority_pct
+    _thread_local.sparsity_counters = sparsity_counters
     # V2.5 v_mean buffer is lazy-allocated on first attention call
     if not enable_v25:
         _thread_local.v_mean_cache = None
@@ -63,6 +67,8 @@ def clear_triton_skip_softmax_config() -> None:
     _thread_local.skip_threshold = None
     _thread_local.normalize_by_seqlen = False
     _thread_local.enable_v25 = False
+    _thread_local.majority_pct = 0.0
+    _thread_local.sparsity_counters = None
     _thread_local.v_mean_cache = None
 
 
@@ -244,6 +250,16 @@ def _diffusers_triton_attention(
                 )
 
             kw["v_mean_cache"] = _thread_local.v_mean_cache
+
+        # V3: majority vote
+        majority_pct = getattr(_thread_local, "majority_pct", 0.0)
+        if majority_pct > 0:
+            kw["majority_pct"] = majority_pct
+
+        # Runtime sparsity measurement
+        counters = getattr(_thread_local, "sparsity_counters", None)
+        if counters is not None:
+            kw["sparsity_counters"] = counters
 
     o = attention(q, k, v, **kw)
 

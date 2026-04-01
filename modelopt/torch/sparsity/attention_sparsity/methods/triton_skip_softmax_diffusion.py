@@ -59,12 +59,18 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
         self.backend = config.get("backend", "triton")
         self.is_causal = config.get("is_causal", False)
         self.enable_v25 = config.get("enable_v25", False)
+        self.enable_v3 = config.get("enable_v3", False)
+        self.majority_pct = config.get("majority_pct", 0.9)
         self.enable_lite_attention = config.get("enable_lite_attention", False)
         self.lite_threshold = config.get("lite_threshold", -5.0)
+        self.measure_sparsity = config.get("measure_sparsity", False)
 
         # These are set by the Triton kernel integration and read by HF/diffusers backends
         self.skip_softmax_threshold: float | None = None
         self.skip_softmax_normalize_by_seqlen: bool = True
+
+        # Runtime sparsity counters: [0]=total tiles, [1]=skipped tiles (int64)
+        self._sparsity_counters: torch.Tensor | None = None
 
     def set_calibration_mode(self, enabled: bool):
         """Set calibration mode."""
@@ -261,6 +267,16 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
         """Context manager for Triton inference (fused kernel tile skipping)."""
         threshold = self._effective_threshold
         use_lite = self.enable_lite_attention
+        normalize = self.skip_softmax_normalize_by_seqlen
+
+        # Lazy-allocate sparsity counters if measurement is enabled
+        counters = None
+        if self.measure_sparsity and not use_lite:
+            device = next(
+                (p.device for p in module.parameters() if p.device.type == "cuda"),
+                torch.device("cuda"),
+            )
+            counters = self._ensure_sparsity_counters(device)
 
         with ExitStack() as stack:
             if use_lite or (threshold is not None and threshold > 0.0):
@@ -273,8 +289,10 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
 
                     set_triton_skip_softmax_config(
                         threshold=threshold if not use_lite else None,
-                        normalize_by_seqlen=True,
+                        normalize_by_seqlen=normalize,
                         enable_v25=self.enable_v25,
+                        majority_pct=self.majority_pct if self.enable_v3 else 0.0,
+                        sparsity_counters=counters,
                     )
                     stack.callback(clear_triton_skip_softmax_config)
                 except ImportError:
@@ -290,9 +308,11 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
                     set_ltx_triton_context(
                         active=True,
                         threshold=threshold if not use_lite else None,
-                        normalize_by_seqlen=True,
+                        normalize_by_seqlen=normalize,
                         enable_v25=self.enable_v25,
+                        majority_pct=self.majority_pct if self.enable_v3 else 0.0,
                         lite_threshold=self.lite_threshold if use_lite else None,
+                        sparsity_counters=counters,
                     )
                     stack.callback(clear_ltx_triton_context)
                 except ImportError:
@@ -302,7 +322,6 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
                     # Also set module flags for HF Triton backend (hf_triton_attention.py)
                     module._apply_skip_softmax = True
                     self.skip_softmax_threshold = threshold
-                    self.skip_softmax_normalize_by_seqlen = True
                     stack.callback(setattr, module, "_apply_skip_softmax", False)
 
             # Activate the diffusers Triton backend
@@ -314,6 +333,38 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
                 pass
 
             yield
+
+    # -----------------------------------------------------------------------
+    # Runtime sparsity measurement
+    # -----------------------------------------------------------------------
+
+    def _ensure_sparsity_counters(self, device: torch.device) -> torch.Tensor:
+        """Lazy-allocate the [2] int64 counter tensor on the given device."""
+        if self._sparsity_counters is None or self._sparsity_counters.device != device:
+            self._sparsity_counters = torch.zeros(2, dtype=torch.int64, device=device)
+        return self._sparsity_counters
+
+    def get_runtime_sparsity(self) -> float:
+        """Return cumulative tile skip ratio since last reset.
+
+        Returns 0.0 if no tiles have been evaluated yet.
+        """
+        if self._sparsity_counters is None:
+            return 0.0
+        total = self._sparsity_counters[0].item()
+        skipped = self._sparsity_counters[1].item()
+        return skipped / total if total > 0 else 0.0
+
+    def get_sparsity_counters(self) -> tuple[int, int]:
+        """Return (total_tiles, skipped_tiles) as ints."""
+        if self._sparsity_counters is None:
+            return (0, 0)
+        return (self._sparsity_counters[0].item(), self._sparsity_counters[1].item())
+
+    def reset_sparsity_counters(self) -> None:
+        """Zero the counters (call between experiments or images)."""
+        if self._sparsity_counters is not None:
+            self._sparsity_counters.zero_()
 
     # -----------------------------------------------------------------------
     # SparseAttentionMethod interface

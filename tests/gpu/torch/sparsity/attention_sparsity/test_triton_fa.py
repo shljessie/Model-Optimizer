@@ -791,6 +791,158 @@ class TestSkipSoftmaxV25:
 
 
 @pytest.mark.skipif(not TRITON_KERNEL_AVAILABLE, reason="Need CUDA + triton")
+class TestSkipSoftmaxV3:
+    """V3 majority-vote skip decision tests."""
+
+    def _make_inputs(
+        self,
+        batch=1,
+        seq_len=2048,
+        num_heads=4,
+        num_kv_heads=4,
+        head_dim=64,
+        dtype=torch.float32,
+    ):
+        """Create diffusion-like Q/K/V (same as V2.5 tests)."""
+        total = batch * seq_len
+        BLOCK_N = 64
+        torch.manual_seed(42)
+        centroid = torch.randn(1, 1, head_dim, device="cuda", dtype=dtype)
+        q = centroid.expand(total, num_heads, head_dim) + torch.randn(
+            total, num_heads, head_dim, device="cuda", dtype=dtype
+        ) * 0.8
+        k = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=dtype) * 0.5
+        for tile_i in [0, 5]:
+            s = tile_i * BLOCK_N
+            k[s : s + BLOCK_N] = centroid.expand(
+                BLOCK_N, num_kv_heads, head_dim
+            ) + torch.randn(BLOCK_N, num_kv_heads, head_dim, device="cuda", dtype=dtype) * 0.5
+        v = torch.randn(total, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+        b_seq_len = torch.full((batch,), seq_len, device="cuda", dtype=torch.int32)
+        b_start_loc = torch.zeros(batch, device="cuda", dtype=torch.int32)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], dim=0)
+        return q, k, v, b_start_loc, b_seq_len
+
+    def _run_v3(self, q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim,
+                majority_pct=0.9):
+        """Run V3 attention: V2.5 pool-K + majority vote."""
+        import math
+
+        import triton
+
+        BLOCK_N = 64
+        batch = lens.shape[0]
+        n_kv_tiles = math.ceil(seq_len / BLOCK_N)
+        BLOCK_D = triton.next_power_of_2(head_dim)
+        v_mean_cache = torch.zeros(
+            batch, num_kv_heads, n_kv_tiles, BLOCK_D, device="cuda", dtype=torch.float32
+        )
+        return attention(
+            q, k, v, locs, lens, seq_len,
+            is_causal=False,
+            skip_softmax_threshold=threshold,
+            skip_softmax_normalize_by_seqlen=True,
+            v_mean_cache=v_mean_cache,
+            majority_pct=majority_pct,
+        )
+
+    def _run_v25(self, q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim):
+        """Run V2.51 attention (unanimity, for comparison)."""
+        import math
+
+        import triton
+
+        BLOCK_N = 64
+        batch = lens.shape[0]
+        n_kv_tiles = math.ceil(seq_len / BLOCK_N)
+        BLOCK_D = triton.next_power_of_2(head_dim)
+        v_mean_cache = torch.zeros(
+            batch, num_kv_heads, n_kv_tiles, BLOCK_D, device="cuda", dtype=torch.float32
+        )
+        return attention(
+            q, k, v, locs, lens, seq_len,
+            is_causal=False,
+            skip_softmax_threshold=threshold,
+            skip_softmax_normalize_by_seqlen=True,
+            v_mean_cache=v_mean_cache,
+        )
+
+    def test_v3_no_nan_inf(self):
+        """V3 output should be finite."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out = self._run_v3(q, k, v, locs, lens, seq_len, 0.15, num_kv_heads, head_dim)
+        assert torch.isfinite(out).all(), "V3 output contains NaN or Inf"
+
+    def test_v3_majority_100_matches_v25(self):
+        """V3 with majority_pct=1.0 should match V2.51 (unanimity)."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        threshold = 0.15
+        # majority_pct=1.0 means BLOCK_M out of BLOCK_M must agree = unanimity
+        # But int(1.0 * 128) = 128 which is same as min==1 (all must agree)
+        # However the m_new fix (using tile_row_max) is always active in V3.
+        # With unanimity, tile_row_max < row_max for all rows, so m_new is
+        # the same either way. The outputs should match.
+        out_v25 = self._run_v25(q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim)
+        out_v3_100 = self._run_v3(
+            q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim, majority_pct=1.0
+        )
+        torch.testing.assert_close(out_v3_100, out_v25, rtol=1e-4, atol=1e-4)
+
+    def test_v3_skips_more_than_v25(self):
+        """V3 with 70% majority should produce different output than V2.51.
+
+        With majority vote, more tiles get skipped (pool-K instead of full),
+        so the output should differ from V2.51 unless the threshold is so
+        conservative that no tiles are borderline.
+        """
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        threshold = 0.15
+        out_v25 = self._run_v25(q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim)
+        out_v3_70 = self._run_v3(
+            q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim, majority_pct=0.7
+        )
+        # With aggressive majority, some tiles that V2.51 keeps will be skipped
+        # by V3, producing a different (approximate) output.
+        diff = (out_v3_70 - out_v25).abs().mean().item()
+        assert diff > 1e-6, (
+            f"V3 with 70% majority should differ from V2.51 but diff={diff:.8f}"
+        )
+
+    def test_v3_bounded_error_vs_dense(self):
+        """V3 error vs dense should be bounded and reasonable."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 4, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        threshold = 0.15
+        out_dense = attention(q, k, v, locs, lens, seq_len, is_causal=False)
+        out_v3 = self._run_v3(
+            q, k, v, locs, lens, seq_len, threshold, num_kv_heads, head_dim, majority_pct=0.9
+        )
+        err = (out_v3 - out_dense).abs().mean().item()
+        assert err < 0.5, f"V3 error vs dense too large: {err:.6f}"
+
+    def test_v3_gqa(self):
+        """V3 works with grouped-query attention."""
+        seq_len, num_heads, num_kv_heads, head_dim = 2048, 4, 2, 64
+        q, k, v, locs, lens = self._make_inputs(
+            seq_len=seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+        )
+        out = self._run_v3(q, k, v, locs, lens, seq_len, 0.15, num_kv_heads, head_dim)
+        assert torch.isfinite(out).all()
+        assert out.shape == (seq_len, num_heads, head_dim)
+
+
+@pytest.mark.skipif(not TRITON_KERNEL_AVAILABLE, reason="Need CUDA + triton")
 class TestLiteAttentionSimulation:
     """LiteAttention-style skip mask simulation tests."""
 

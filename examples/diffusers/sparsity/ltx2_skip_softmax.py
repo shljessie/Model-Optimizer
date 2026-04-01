@@ -136,6 +136,19 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of prompts to use for calibration (from OpenVid-1M dataset)",
     )
+
+    # V3 majority vote options
+    parser.add_argument(
+        "--enable-v3",
+        action="store_true",
+        help="Enable V3 majority-vote skip decision (increases skip rate for LTX-2)",
+    )
+    parser.add_argument(
+        "--majority-pct",
+        type=float,
+        default=0.9,
+        help="Fraction of rows that must agree to skip (0.0-1.0). Default 0.9 (90%%)",
+    )
     return parser.parse_args()
 
 
@@ -192,6 +205,12 @@ def build_sparse_config(args: argparse.Namespace) -> dict:
         "collect_stats": True,
         "enable": True,
     }
+
+    # V3: majority-vote skip decision
+    if getattr(args, "enable_v3", False):
+        attn_cfg["enable_v25"] = True  # V3 requires V2.5 pool-K approximation
+        attn_cfg["enable_v3"] = True
+        attn_cfg["majority_pct"] = getattr(args, "majority_pct", 0.9)
 
     sparse_cfg: dict = {
         "*.attn1": attn_cfg,  # Self-attention only

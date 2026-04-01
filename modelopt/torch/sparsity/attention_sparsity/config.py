@@ -117,6 +117,27 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         ),
     )
 
+    enable_v3: bool = ModeloptField(
+        default=False,
+        title="Enable V3 majority-vote skip decision.",
+        description=(
+            "When True, tiles are skipped if majority_pct of rows agree (majority vote) "
+            "instead of requiring all rows to agree (unanimity). "
+            "Increases skip rate on short-sequence models like LTX-2. "
+            "Only used by triton_skip_softmax_diffusion with enable_v25=True."
+        ),
+    )
+
+    majority_pct: float = ModeloptField(
+        default=0.9,
+        title="Majority vote percentage for V3.",
+        description=(
+            "Fraction of BLOCK_M rows that must agree to skip a tile (0.0-1.0). "
+            "0.9 = 90% agreement (recommended). 0.7 = aggressive. 1.0 = unanimity (V2.51). "
+            "Only used when enable_v3=True."
+        ),
+    )
+
     enable_lite_attention: bool = ModeloptField(
         default=False,
         title="Enable LiteAttention simulation.",
@@ -135,6 +156,17 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
             "Gap threshold in log2 space for LiteAttention tile skipping. "
             "More negative = more conservative (fewer skips). "
             "Typical range: -1.0 to -15.0. Only used when enable_lite_attention=True."
+        ),
+    )
+
+    measure_sparsity: bool = ModeloptField(
+        default=False,
+        title="Measure runtime tile sparsity.",
+        description=(
+            "When True, the Triton kernel counts skipped vs total KV tiles via atomic "
+            "counters. After inference, read the average sparsity from the method instance. "
+            "Gated by a tl.constexpr — zero overhead when False. "
+            "Supported by triton_skip_softmax_diffusion (V1/V2.51/V3 paths)."
         ),
     )
 

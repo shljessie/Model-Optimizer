@@ -171,12 +171,18 @@ def _attn_fwd_body(
     STORE_LSE: tl.constexpr,  # Whether to save LSE for backward pass
     APPLY_SKIP_SOFTMAX: tl.constexpr = False,  # Skip KV tiles with negligible scores
     skip_threshold_log2=0.0,  # Effective log2-space threshold
+    # --- V3 majority-vote parameters (optional) ---
+    APPLY_MAJORITY_VOTE: tl.constexpr = False,  # Use sum >= threshold instead of min == 1
+    majority_threshold=0,  # Number of rows that must agree to skip (e.g. 115 for 90% of 128)
     # --- V2.5 parameters (optional) ---
     APPLY_SKIP_V25: tl.constexpr = False,  # Pool-K approximate weight + fresh v_mean
     Vmean_cache=None,  # [batch, num_kv_heads, num_kv_tiles, BLOCK_D] float32 (precomputed)
     stride_vm_b=0,  # Vmean_cache strides
     stride_vm_h=0,
     stride_vm_t=0,
+    # --- Runtime sparsity measurement (optional) ---
+    MEASURE_SPARSITY: tl.constexpr = False,  # Count skipped vs total tiles via atomic adds
+    Sparsity_counters=None,  # [2] int64: [0]=total tiles, [1]=skipped tiles
     # --- LiteAttention simulation parameters (optional) ---
     APPLY_LITE_ATTENTION: tl.constexpr = False,  # LiteAttention-style skip with mask
     LITE_MODE_WARMUP: tl.constexpr = False,  # True=dense+write mask, False=read mask+sparse
@@ -313,14 +319,21 @@ def _attn_fwd_body(
             scores = _apply_mask(scores, q_pos, kv_pos, seq_len_q, seq_len_kv, kv_start, IS_CAUSAL)
 
             if APPLY_SKIP_SOFTMAX:
-                # --- Skip-softmax: tile-level skipping only ---
-                # Check if ALL rows agree this tile is negligible.
-                # No per-row zeroing — KEEP tiles do full attention for all rows.
-                # (Per-row zeroing saves nothing since V is loaded + BMM2 runs
-                # anyway, but destroys information whose aggregate matters.)
+                # --- Skip-softmax: tile-level skipping ---
+                # V2.51: ALL rows must agree (unanimity).
+                # V3: majority_threshold rows must agree (majority vote).
                 tile_row_max = tl.max(scores, 1)  # [BLOCK_M]
                 can_skip = tile_row_max < (row_max + skip_threshold_log2)
-                all_skip = tl.min(can_skip.to(tl.int32)) == 1
+                if APPLY_MAJORITY_VOTE:
+                    num_skip = tl.sum(can_skip.to(tl.int32))
+                    all_skip = num_skip >= majority_threshold
+                else:
+                    all_skip = tl.min(can_skip.to(tl.int32)) == 1
+
+                if MEASURE_SPARSITY:
+                    tl.atomic_add(Sparsity_counters, 1)  # total tiles
+                    if all_skip:
+                        tl.atomic_add(Sparsity_counters + 1, 1)  # skipped tiles
 
                 if not all_skip:
                     # KEEP: full attention for all rows (no per-row zeroing)
@@ -352,7 +365,12 @@ def _attn_fwd_body(
                     # The * BLOCK_N approximates sum_j(exp(q·k_j)) ≈ N * exp(q·mean(k))
                     approx_score = tl.sum(q * k_mean[None, :], 1) * qk_scale  # [BLOCK_M]
 
-                    m_new = tl.maximum(row_max, approx_score)
+                    # V3 fix: use tile_row_max (actual max) instead of approx_score
+                    # for m_new. With majority vote, dissenting rows may have
+                    # tile_row_max > row_max; using approx_score would leave
+                    # row_max stale. Safe for unanimity too (tile_row_max < row_max
+                    # when all rows agree to skip, so max() = row_max either way).
+                    m_new = tl.maximum(row_max, tile_row_max)
                     p_approx = tl.math.exp2(approx_score - m_new) * n_valid_kv  # [BLOCK_M], 128 exp2
                     correction = tl.math.exp2(row_max - m_new)
                     row_sum = row_sum * correction + p_approx
@@ -438,6 +456,8 @@ def _attn_fwd(
     STORE_LSE: tl.constexpr,
     APPLY_SKIP_SOFTMAX: tl.constexpr = False,
     skip_threshold_log2=0.0,
+    MEASURE_SPARSITY: tl.constexpr = False,
+    Sparsity_counters=None,
 ):
     """Autotuned forward kernel (V1 skip-softmax, no V2.5 cache)."""
     _attn_fwd_body(
@@ -472,6 +492,8 @@ def _attn_fwd(
         APPLY_SKIP_SOFTMAX=APPLY_SKIP_SOFTMAX,
         skip_threshold_log2=skip_threshold_log2,
         APPLY_SKIP_V25=False,
+        MEASURE_SPARSITY=MEASURE_SPARSITY,
+        Sparsity_counters=Sparsity_counters,
     )
 
 
@@ -786,6 +808,7 @@ class _Attention(torch.autograd.Function):
         max_input_len_k,
         skip_softmax_threshold,
         skip_softmax_normalize_by_seqlen,
+        sparsity_counters,
     ):
         HEAD_DIM = q.shape[2]
         num_q_heads = q.shape[1]
@@ -859,6 +882,8 @@ class _Attention(torch.autograd.Function):
             STORE_LSE=True,
             APPLY_SKIP_SOFTMAX=apply_skip,
             skip_threshold_log2=skip_threshold_log2,
+            MEASURE_SPARSITY=sparsity_counters is not None,
+            Sparsity_counters=sparsity_counters,
             # BLOCK_M, BLOCK_N, num_warps, num_stages chosen by autotune
         )
 
@@ -976,7 +1001,7 @@ class _Attention(torch.autograd.Function):
             num_stages=1,
         )
 
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 def _attention_v25_forward(
@@ -993,10 +1018,13 @@ def _attention_v25_forward(
     max_input_len_k: int,
     skip_threshold_log2: float,
     v_mean_cache: torch.Tensor,
+    majority_pct: float = 0.0,
+    sparsity_counters: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """V2.5 forward: pool-K approximate weights + fresh precomputed v_mean.
+    """V2.5/V3 forward: pool-K approximate weights + fresh precomputed v_mean.
 
-    No autograd — V2.5 is a forward-only inference optimization.
+    No autograd — forward-only inference optimization.
+    When majority_pct > 0, uses V3 majority-vote skip decision instead of unanimity.
     """
     HEAD_DIM = q.shape[2]
     num_q_heads = q.shape[1]
@@ -1061,11 +1089,15 @@ def _attention_v25_forward(
         STORE_LSE=False,
         APPLY_SKIP_SOFTMAX=True,
         skip_threshold_log2=skip_threshold_log2,
+        APPLY_MAJORITY_VOTE=majority_pct > 0,
+        majority_threshold=int(majority_pct * BLOCK_M) if majority_pct > 0 else 0,
         APPLY_SKIP_V25=True,
         Vmean_cache=v_mean_cache,
         stride_vm_b=v_mean_cache.stride(0),
         stride_vm_h=v_mean_cache.stride(1),
         stride_vm_t=v_mean_cache.stride(2),
+        MEASURE_SPARSITY=sparsity_counters is not None,
+        Sparsity_counters=sparsity_counters,
         num_warps=4,
         num_stages=1,
     )
@@ -1177,6 +1209,8 @@ def attention(
     skip_softmax_threshold: float | None = None,
     skip_softmax_normalize_by_seqlen: bool = False,
     v_mean_cache: torch.Tensor | None = None,
+    majority_pct: float = 0.0,
+    sparsity_counters: torch.Tensor | None = None,
     lite_attention_threshold: float | None = None,
     lite_attention_skip_read: torch.Tensor | None = None,
     lite_attention_skip_write: torch.Tensor | None = None,
@@ -1204,6 +1238,9 @@ def attention(
             ``[batch, num_kv_heads, num_kv_tiles, head_dim_padded]``.
             Populated by a precompute kernel before attention. Skipped tiles
             use pool-K approximate weight + this fresh v_mean.
+        sparsity_counters: Optional ``[2]`` int64 tensor for runtime sparsity
+            measurement. ``[0]`` accumulates total tile evaluations, ``[1]``
+            accumulates skipped tiles. Updated via atomic adds in the kernel.
         lite_attention_threshold: LiteAttention-style log2-space gap threshold
             (e.g. -10.0). When set, enables LiteAttention simulation mode.
         lite_attention_skip_read: ``[batch, num_q_heads, q_tiles, k_tiles]``
@@ -1278,6 +1315,8 @@ def attention(
             max_input_len_k,
             skip_threshold_log2,
             v_mean_cache,
+            majority_pct=majority_pct,
+            sparsity_counters=sparsity_counters,
         )
 
     # Standard path (V1 or no skip) with autograd support
@@ -1295,6 +1334,7 @@ def attention(
         max_input_len_k,
         skip_softmax_threshold,
         skip_softmax_normalize_by_seqlen,
+        sparsity_counters,
     )
 
 
