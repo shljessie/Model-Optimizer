@@ -124,8 +124,10 @@ _FP4_MAX = 6.0
 _FP4_BOUNDARIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
 _FP4_LEVELS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
-# Tile size for per-tile NVFP4 quantization of P (matches flash-attention tile granularity)
-_NVFP4_TILE = 64
+# Per-tile NVFP4 quantization tile shape (tile_rows, tile_cols).
+# Smaller tiles give better accuracy at the cost of more overhead.
+# Configurable via --nvfp4-tile (e.g. "1x64", "32x32", "64x64").
+_nvfp4_tile: tuple[int, int] = (64, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -257,42 +259,41 @@ def _quantize_to_fp4_levels(x_abs: torch.Tensor) -> torch.Tensor:
     return levels[torch.bucketize(x_abs.contiguous(), boundaries)]
 
 
-def _quantize_p_to_nvfp4_pertile(p: torch.Tensor, tile: int = _NVFP4_TILE) -> torch.Tensor:
+def _quantize_p_to_nvfp4_pertile(p: torch.Tensor, tile_r: int, tile_c: int) -> torch.Tensor:
     """Per-tile NVFP4 E2M1 quantize + dequantize the post-softmax P matrix.
 
-    Matches the granularity of a real flash-attention CUDA kernel: each (tile × tile)
-    block of P gets its own max-based scale so the 8 FP4 levels cover the local value
-    range rather than being dominated by the single row-max outlier.
+    Each (tile_r x tile_c) block of P gets its own max-based scale so the 8 FP4
+    levels cover the local value range rather than being dominated by a distant
+    outlier.  Smaller tiles give better accuracy; the SA3 CUDA kernel operates at
+    per-thread granularity which is much finer than a 64x64 block.
 
     Args:
-        p: Post-softmax attention weights ``(B, H, N, M)``, float32.
-        tile: Tile size (default 64, matching typical flash-attention block size).
+        p: Post-softmax attention weights ``(b, h, n, m)``, float32.
+        tile_r: Tile height (Q / row dimension).
+        tile_c: Tile width (K / column dimension).
 
     Returns:
         Quantized-dequantized P of the same shape in float32.
     """
     b, h, n, m = p.shape
 
-    # Pad both dims to a multiple of tile
-    pad_n = (tile - n % tile) % tile
-    pad_m = (tile - m % tile) % tile
+    pad_n = (tile_r - n % tile_r) % tile_r
+    pad_m = (tile_c - m % tile_c) % tile_c
     if pad_n or pad_m:
         p = F.pad(p, (0, pad_m, 0, pad_n))
 
     np_, mp_ = p.shape[-2], p.shape[-1]
-    nr, nc = np_ // tile, mp_ // tile
+    nr, nc = np_ // tile_r, mp_ // tile_c
 
-    # View as tiles: (b, h, nr, tile, nc, tile)
-    p_tiled = p.reshape(b, h, nr, tile, nc, tile)
+    # View as tiles: (b, h, nr, tile_r, nc, tile_c)
+    p_tiled = p.reshape(b, h, nr, tile_r, nc, tile_c)
 
     # Per-tile max → scale: (b, h, nr, 1, nc, 1)
     scale = p_tiled.amax(dim=(3, 5), keepdim=True).clamp(min=1e-12) / _FP4_MAX
 
-    # Quantize to NVFP4 levels, then dequantize
     p_scaled = (p_tiled / scale).clamp(0.0, _FP4_MAX)
     p_dq = _quantize_to_fp4_levels(p_scaled) * scale
 
-    # Reshape back and remove padding
     p_dq = p_dq.reshape(b, h, np_, mp_)
     if pad_n or pad_m:
         p_dq = p_dq[..., :n, :m]
@@ -343,7 +344,8 @@ def _nvfp4_sdpa(
             attn_chunk = attn_chunk.masked_fill(cols > rows, float("-inf"))
 
         p_chunk = torch.softmax(attn_chunk, dim=-1)
-        p_dq = _quantize_p_to_nvfp4_pertile(p_chunk)
+        tile_r, tile_c = _nvfp4_tile
+        p_dq = _quantize_p_to_nvfp4_pertile(p_chunk, tile_r, tile_c)
         out_chunks.append(torch.matmul(p_dq, v))
 
     return torch.cat(out_chunks, dim=-2).to(orig_dtype)
@@ -443,9 +445,19 @@ def _patched_sdpa(
         return _orig_sdpa(query, key, value, is_causal=is_causal, scale=scale)
 
 
-def enable_attention_kernel(kernel: str = KERNEL_FP8) -> None:
-    """Patch ``F.scaled_dot_product_attention`` with the selected kernel."""
-    global _active_kernel, _sage_calls, _fallback_calls
+def enable_attention_kernel(
+    kernel: str = KERNEL_FP8,
+    nvfp4_tile: tuple[int, int] | None = None,
+) -> None:
+    """Patch ``F.scaled_dot_product_attention`` with the selected kernel.
+
+    Args:
+        kernel: Kernel name from ``KERNEL_CHOICES``.
+        nvfp4_tile: ``(tile_r, tile_c)`` for per-tile NVFP4 P quantization.
+                    Only used when ``kernel == 'nvfp4'``.  Defaults to the
+                    current value of ``_nvfp4_tile`` (initially ``(64, 64)``).
+    """
+    global _active_kernel, _sage_calls, _fallback_calls, _nvfp4_tile
 
     if kernel not in KERNEL_CHOICES:
         raise ValueError(f"Unknown kernel {kernel!r}. Choose from {KERNEL_CHOICES}")
@@ -456,12 +468,16 @@ def enable_attention_kernel(kernel: str = KERNEL_FP8) -> None:
     _sage_calls = 0
     _fallback_calls = 0
 
+    if nvfp4_tile is not None and kernel == KERNEL_NVFP4:
+        _nvfp4_tile = nvfp4_tile
+
     F.scaled_dot_product_attention = _patched_sdpa
     import torch.nn.functional as _F
 
     _F.scaled_dot_product_attention = _patched_sdpa
 
-    print(f"[Attention] kernel={kernel}  {_KERNEL_DESCRIPTIONS[kernel]}")
+    tile_info = f"  tile={_nvfp4_tile[0]}x{_nvfp4_tile[1]}" if kernel == KERNEL_NVFP4 else ""
+    print(f"[Attention] kernel={kernel}{tile_info}  {_KERNEL_DESCRIPTIONS[kernel]}")
 
 
 def disable_attention_kernel() -> None:
@@ -702,9 +718,22 @@ def parse_args() -> argparse.Namespace:
         choices=KERNEL_CHOICES,
         help=(
             "fp8: Python-level FP8 E4M3 (SA2 smoothing, no CUDA kernel, accuracy testing); "
+            "nvfp4: Python-level NVFP4 E2M1 post-softmax P (SA3-inspired, per-tile); "
             "sage1: SA1 INT8+FP16; "
             "sage2-fp16: SA2 INT8+FP16; "
             "sage2-fp8: SA2++ INT8+FP8"
+        ),
+    )
+    parser.add_argument(
+        "--nvfp4-tile",
+        type=str,
+        default="64x64",
+        metavar="TRxTC",
+        help=(
+            "Tile shape for per-tile NVFP4 P quantization (only used with --kernel nvfp4). "
+            "Format: TRxTC where TR=tile rows, TC=tile cols. "
+            "Examples: '64x64' (default), '32x32', '1x64'. "
+            "Smaller tiles give finer-grained scales and better accuracy."
         ),
     )
     parser.add_argument(
@@ -737,8 +766,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_nvfp4_tile(tile_str: str) -> tuple[int, int]:
+    """Parse a 'TRxTC' tile string into ``(tile_r, tile_c)``."""
+    parts = tile_str.lower().split("x")
+    if len(parts) != 2:
+        raise ValueError(f"--nvfp4-tile must be in TRxTC format (e.g. '64x64'), got {tile_str!r}")
+    try:
+        tile_r, tile_c = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"--nvfp4-tile values must be integers, got {tile_str!r}")
+    if tile_r <= 0 or tile_c <= 0:
+        raise ValueError(f"--nvfp4-tile values must be positive, got {tile_str!r}")
+    return tile_r, tile_c
+
+
 def main() -> None:
     args = parse_args()
+    nvfp4_tile = _parse_nvfp4_tile(args.nvfp4_tile)
     pipe = load_pipeline(args.model)
 
     if args.compare:
@@ -746,7 +790,7 @@ def main() -> None:
         _, frames_base = run_inference(pipe, args, label="baseline")
 
         # --- Quantized ---
-        enable_attention_kernel(args.kernel)
+        enable_attention_kernel(args.kernel, nvfp4_tile=nvfp4_tile)
         _, frames_quant = run_inference(pipe, args, label=args.kernel)
         print_kernel_stats()
         disable_attention_kernel()
@@ -786,7 +830,7 @@ def main() -> None:
             if kernel not in AVAILABLE_KERNELS:
                 print(f"\n[{kernel}] Skipped — not available")
                 continue
-            enable_attention_kernel(kernel)
+            enable_attention_kernel(kernel, nvfp4_tile=nvfp4_tile)
             timing[kernel], _ = run_inference(pipe, args, label=kernel)
             print_kernel_stats()
             disable_attention_kernel()
@@ -808,7 +852,7 @@ def main() -> None:
         run_inference(pipe, args, label="baseline")
 
     else:
-        enable_attention_kernel(args.kernel)
+        enable_attention_kernel(args.kernel, nvfp4_tile=nvfp4_tile)
         run_inference(pipe, args, label=args.kernel)
         print_kernel_stats()
         disable_attention_kernel()
