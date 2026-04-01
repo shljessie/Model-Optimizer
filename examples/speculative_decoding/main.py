@@ -152,12 +152,12 @@ class DFlashArguments:
     dflash_num_layers: int = field(
         default=5, metadata={"help": "Number of decoder layers in the DFlash draft module."}
     )
-    dflash_config: str = field(default=None, metadata={"help": "Path to dflash_config.json"})
+    dflash_config: str | None = field(default=None, metadata={"help": "Path to dflash_config.json"})
     dflash_disable_torch_compile: bool = field(
         default=False,
         metadata={"help": "Disable torch.compile on DFlash forward/loss methods."},
     )
-    dflash_mask_token_id: int = field(
+    dflash_mask_token_id: int | None = field(
         default=None,
         metadata={"help": "Mask token ID for DFlash. If not set, auto-detected from model."},
     )
