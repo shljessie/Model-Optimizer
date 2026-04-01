@@ -17,7 +17,7 @@
 """Quantization utilities."""
 
 from .activation_collector import LayerActivationCollector
-from .checkpoint import get_checkpoint_saver, register_checkpoint_save_support
+from .checkpoint import get_checkpoint_saver, register_seq_calib_checkpoint_saver
 from .core_utils import *
 
 __all__ = [
@@ -31,7 +31,7 @@ __all__ = [
     "is_quantized_row_parallel_linear",
     "reduce_amax",
     "reduce_sum",
-    "register_checkpoint_save_support",
+    "register_seq_calib_checkpoint_saver",
     "replace_function",
     "update_quant_cfg_with_kv_cache_quant",
     "weight_attr_names",

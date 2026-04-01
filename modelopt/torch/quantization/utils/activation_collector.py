@@ -238,6 +238,37 @@ class LayerActivationCollector:
         self._cleanup_layers()
         self._patched = False
 
+    def _set_layer_mode(self, layer_idx: int, mode: str) -> None:
+        """Set the mode for a single decoder layer with appropriate side effects.
+
+        * **skip** — free cached inputs (output_meta is kept for dummy outputs).
+        * **run** — move ``collected_inputs`` → ``cached_inputs`` for replay.
+          Raises if the layer has no collected inputs.
+        * **capture** — clear ``collected_inputs`` for a fresh capture pass.
+        * **original** — reset to the default passthrough mode (no side effects).
+        """
+        assert self._decoder_layers is not None
+        state = self._decoder_layers[layer_idx]._seq_calib
+
+        if mode == "skip":
+            state.mode = "skip"
+            state.cached_inputs.clear()
+        elif mode == "run":
+            if not state.collected_inputs:
+                raise RuntimeError(
+                    f"Layer {layer_idx} ({state.name!r}) has no collected inputs to replay. "
+                    "Layers must be calibrated sequentially — ensure get_input_activations() "
+                    "was called for every preceding layer in order."
+                )
+            state.mode = "run"
+            state.cached_inputs = deque(state.collected_inputs)
+            state.collected_inputs = []
+        elif mode == "capture":
+            state.mode = "capture"
+            state.collected_inputs = []
+        else:
+            state.mode = mode
+
     def _set_layer_states(self, layer_idx: int):
         """Transition layer modes for the next calibration step.
 
@@ -247,30 +278,11 @@ class LayerActivationCollector:
         * Layer ``i - 1`` → **run** (replay captured inputs with calibrated weights).
         * Layer ``i``     → **capture** (record inputs, then early-stop).
         """
-        assert self._decoder_layers is not None
-
         if layer_idx > 1:
-            done = self._decoder_layers[layer_idx - 2]._seq_calib
-            # output_meta is intentionally kept: skip mode needs it to produce
-            # correctly shaped zero-filled outputs for the parent forward.
-            done.mode = "skip"
-            done.cached_inputs.clear()
-
+            self._set_layer_mode(layer_idx - 2, "skip")
         if layer_idx > 0:
-            prev = self._decoder_layers[layer_idx - 1]._seq_calib
-            if not prev.collected_inputs:
-                raise RuntimeError(
-                    f"Layer {layer_idx - 1} ({prev.name!r}) has no collected inputs to replay. "
-                    "Layers must be calibrated sequentially — ensure get_input_activations() "
-                    "was called for every preceding layer in order."
-                )
-            prev.mode = "run"
-            prev.cached_inputs = deque(prev.collected_inputs)
-            prev.collected_inputs = []
-
-        cur = self._decoder_layers[layer_idx]._seq_calib
-        cur.mode = "capture"
-        cur.collected_inputs = []
+            self._set_layer_mode(layer_idx - 1, "run")
+        self._set_layer_mode(layer_idx, "capture")
 
     def _log_layer_summary(self, layer_idx: int):
         """Log a one-line summary of layer modes for the current calibration step."""
@@ -347,6 +359,49 @@ class LayerActivationCollector:
         info.mode = "original"
         return inputs
 
+    def _restore_output_metas(self, saved_output_metas: dict[int, tuple] | None) -> None:
+        """Populate ``output_meta`` on layer states from a checkpoint dict."""
+        if not saved_output_metas:
+            return
+        assert self._decoder_layers is not None
+        for idx, meta in saved_output_metas.items():
+            if idx < len(self._decoder_layers):
+                self._decoder_layers[idx]._seq_calib.output_meta = meta
+
+    def _validate_skip_metas(self, indices: range) -> None:
+        """Raise if any layer in *indices* is missing ``output_meta`` for skip mode."""
+        assert self._decoder_layers is not None
+        for i in indices:
+            if self._decoder_layers[i]._seq_calib.output_meta is None:
+                raise RuntimeError(
+                    f"Layer {i} has no output_meta but must be in skip mode for resume. "
+                    "The checkpoint may be corrupted or missing layer_output_metas."
+                )
+
+    def _run_warmup_capture(self, capture_layer_idx: int, forward_loop: ForwardLoop) -> None:
+        """Run a forward pass with *capture_layer_idx* in capture mode.
+
+        Raises RuntimeError if no inputs are collected.
+        """
+        assert self._decoder_layers is not None
+        state = self._decoder_layers[capture_layer_idx]._seq_calib
+        state.mode = "capture"
+        state.collected_inputs = []
+
+        try:
+            forward_loop(self.model)
+        except Exception:
+            state.mode = "original"
+            state.collected_inputs = []
+            raise
+
+        if not state.collected_inputs:
+            state.mode = "original"
+            raise RuntimeError(
+                f"Warm-up forward collected no inputs for layer {capture_layer_idx}. "
+                "Cannot resume sequential calibration."
+            )
+
     @torch.no_grad()
     def prepare_for_resume(
         self,
@@ -356,20 +411,12 @@ class LayerActivationCollector:
     ):
         """Set up layer states for resuming sequential calibration from a checkpoint.
 
-        Layers ``0 .. resume_layer_idx - 1`` have already been calibrated.  This
-        method runs a single warm-up forward pass so that the next call to
+        Runs a single warm-up forward pass so that the next call to
         :meth:`get_input_activations` for ``resume_layer_idx`` produces the
-        correct inputs.
-
-        **Warm-up pass** — layers ``0 .. K-2`` run in *original* mode (real
-        computation with their calibrated weights) and layer ``K-1`` runs in
-        *capture* mode to record its inputs.  After the pass, layers
-        ``0 .. K-2`` switch to *skip* (with ``output_metas`` restored from the
-        checkpoint) and layer ``K-1`` retains its ``collected_inputs``.  When
-        ``get_input_activations(resume_layer_idx)`` is later called,
-        ``_set_layer_states`` will put ``K-1`` into *run* mode (replaying the
-        warm-up inputs) and ``resume_layer_idx`` into *capture*, which is
-        exactly the normal state-machine flow.
+        correct inputs.  Layers ``0 .. K-2`` run in *original* mode (real
+        computation), layer ``K-1`` in *capture* mode.  After the pass,
+        ``0 .. K-2`` switch to *skip* and ``K-1`` retains its
+        ``collected_inputs`` for the subsequent *run* transition.
 
         Args:
             resume_layer_idx: Index of the first layer to calibrate (0-based).
@@ -384,51 +431,21 @@ class LayerActivationCollector:
         if resume_layer_idx == 0:
             return
 
-        assert self._decoder_layers is not None
         k = resume_layer_idx
+        preceding = range(k - 1)
 
-        # Restore saved output_metas onto layer states (needed for skip mode
-        # after warm-up and for subsequent main-loop iterations).
-        if saved_output_metas:
-            for idx, meta in saved_output_metas.items():
-                if idx < len(self._decoder_layers):
-                    self._decoder_layers[idx]._seq_calib.output_meta = meta
-
-        # Warm-up: layers 0..k-2 in "original" mode (real computation with
-        # calibrated weights), layer k-1 in "capture" mode.
-        for i in range(k - 1):
-            self._decoder_layers[i]._seq_calib.mode = "original"
-
-        capture_state = self._decoder_layers[k - 1]._seq_calib
-        capture_state.mode = "capture"
-        capture_state.collected_inputs = []
+        self._restore_output_metas(saved_output_metas)
+        for i in preceding:
+            self._set_layer_mode(i, "original")
 
         print_rank_0(
             f"Running warm-up forward pass for resume "
             f"(layers 0..{k - 2} original, layer {k - 1} capture)"
         )
-        try:
-            forward_loop(self.model)
-        except Exception:
-            capture_state.mode = "original"
-            capture_state.collected_inputs = []
-            raise
+        self._run_warmup_capture(k - 1, forward_loop)
 
-        if not capture_state.collected_inputs:
-            capture_state.mode = "original"
-            raise RuntimeError(
-                f"Warm-up forward collected no inputs for layer {k - 1}. "
-                "Cannot resume sequential calibration."
-            )
-
-        # After warm-up: set layers 0..k-2 to "skip" for the main loop.
-        for i in range(k - 1):
-            state = self._decoder_layers[i]._seq_calib
-            state.mode = "skip"
-            if state.output_meta is None:
-                raise RuntimeError(
-                    f"Layer {i} has no output_meta but must be in skip mode for resume. "
-                    "The checkpoint may be corrupted or missing layer_output_metas."
-                )
+        for i in preceding:
+            self._set_layer_mode(i, "skip")
+        self._validate_skip_metas(preceding)
 
         print_rank_0(f"Warm-up complete. Ready to resume from layer {k}.")

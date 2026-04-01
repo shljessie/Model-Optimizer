@@ -40,7 +40,7 @@ from ..nn.modules.quant_linear import _QuantLinear
 from ..triton import IS_AVAILABLE as IS_TRITON_AVAILABLE
 from ..utils import replace_function, sync_moe_expert_amax
 from ..utils.activation_collector import LayerActivationCollector
-from ..utils.checkpoint import register_checkpoint_save_support
+from ..utils.checkpoint import register_seq_calib_checkpoint_saver
 from .attention import register_attention_for_kv_quant
 from .custom import CUSTOM_MODEL_PLUGINS, _ParallelLinear, _QuantFunctionalMixin
 
@@ -1478,7 +1478,7 @@ def _hf_checkpoint_save(model: nn.Module, checkpoint_dir: str) -> None:
     model.save_pretrained(checkpoint_dir)
 
 
-register_checkpoint_save_support(_is_supported_hf_model, _hf_checkpoint_save)
+register_seq_calib_checkpoint_saver(_is_supported_hf_model, _hf_checkpoint_save)
 
 
 class _QuantMoELinear(QuantModule):

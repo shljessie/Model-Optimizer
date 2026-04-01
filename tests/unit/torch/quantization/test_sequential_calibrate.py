@@ -29,7 +29,7 @@ from modelopt.torch.quantization.utils.checkpoint import (
     _CHECKPOINT_SAVE_SUPPORT,
     SEQ_CALIB_PROGRESS_ATTR,
     get_checkpoint_saver,
-    register_checkpoint_save_support,
+    register_seq_calib_checkpoint_saver,
 )
 
 
@@ -583,7 +583,7 @@ class TestCheckpointSaveRegistry:
         _CHECKPOINT_SAVE_SUPPORT.clear()
         try:
             saver = MagicMock()
-            register_checkpoint_save_support(lambda m: True, saver)
+            register_seq_calib_checkpoint_saver(lambda m: True, saver)
             model = nn.Linear(4, 4)
             assert get_checkpoint_saver(model) is saver
         finally:
@@ -605,8 +605,8 @@ class TestCheckpointSaveRegistry:
         try:
             pred = lambda m: True  # noqa: E731
             saver = lambda m, d: None  # noqa: E731
-            register_checkpoint_save_support(pred, saver)
-            register_checkpoint_save_support(pred, saver)
+            register_seq_calib_checkpoint_saver(pred, saver)
+            register_seq_calib_checkpoint_saver(pred, saver)
             assert len(_CHECKPOINT_SAVE_SUPPORT) == 1
         finally:
             _CHECKPOINT_SAVE_SUPPORT.clear()
@@ -643,7 +643,7 @@ class TestCheckpointSave:
             progress = getattr(m, SEQ_CALIB_PROGRESS_ATTR)
             save_calls.append(progress["completed_layer_idx"])
 
-        register_checkpoint_save_support(lambda m: True, mock_saver)
+        register_seq_calib_checkpoint_saver(lambda m: True, mock_saver)
 
         sequential_calibrate(
             model,
@@ -664,7 +664,7 @@ class TestCheckpointSave:
             progress = getattr(m, SEQ_CALIB_PROGRESS_ATTR)
             save_calls.append(progress["completed_layer_idx"])
 
-        register_checkpoint_save_support(lambda m: True, mock_saver)
+        register_seq_calib_checkpoint_saver(lambda m: True, mock_saver)
 
         # interval=1 would save every layer, but should still skip the last
         sequential_calibrate(
@@ -698,7 +698,7 @@ class TestCheckpointSave:
             # During save, the attribute should be set
             assert hasattr(m, SEQ_CALIB_PROGRESS_ATTR)
 
-        register_checkpoint_save_support(lambda m: True, mock_saver)
+        register_seq_calib_checkpoint_saver(lambda m: True, mock_saver)
 
         sequential_calibrate(
             model,
@@ -719,7 +719,7 @@ class TestCheckpointSave:
             progress = getattr(m, SEQ_CALIB_PROGRESS_ATTR)
             saved_progress.update(progress)
 
-        register_checkpoint_save_support(lambda m: True, mock_saver)
+        register_seq_calib_checkpoint_saver(lambda m: True, mock_saver)
 
         sequential_calibrate(
             model,
@@ -972,20 +972,6 @@ class TestMetadataIntegration:
 
         assert metadata["seq_calib_progress"] == progress
         delattr(model, SEQ_CALIB_PROGRESS_ATTR)
-
-    def test_stale_progress_cleaned_from_metadata(self):
-        """If model has no progress, stale metadata entry should be removed."""
-        metadata = {"seq_calib_progress": {"completed_layer_idx": 5}}
-        model = nn.Linear(4, 4)
-
-        # Simulate the cleanup logic from update_quantize_metadata
-        progress = getattr(model, SEQ_CALIB_PROGRESS_ATTR, None)
-        if progress is not None:
-            metadata["seq_calib_progress"] = progress
-        elif "seq_calib_progress" in metadata:
-            del metadata["seq_calib_progress"]
-
-        assert "seq_calib_progress" not in metadata
 
     def test_output_meta_serialization_roundtrip(self):
         """layer_output_metas should survive torch.save/load roundtrip."""
