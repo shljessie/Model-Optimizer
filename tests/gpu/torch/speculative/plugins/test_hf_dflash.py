@@ -64,8 +64,11 @@ class TestDFlashModuleGPU:
         hidden_size = model.config.hidden_size
         num_layers = len(model.target_layer_ids)
 
-        target_hidden = torch.randn(bsz, SEQ_LEN, num_layers * hidden_size, device="cuda")
-        noise_emb = torch.randn(bsz, SEQ_LEN, hidden_size, device="cuda")
+        dtype = next(model.dflash_module.parameters()).dtype
+        target_hidden = torch.randn(
+            bsz, SEQ_LEN, num_layers * hidden_size, device="cuda", dtype=dtype
+        )
+        noise_emb = torch.randn(bsz, SEQ_LEN, hidden_size, device="cuda", dtype=dtype)
         pos_ids = (
             torch.cat([torch.arange(SEQ_LEN), torch.arange(SEQ_LEN)])
             .unsqueeze(0)
@@ -89,8 +92,11 @@ class TestDFlashModuleGPU:
         hidden_size = model.config.hidden_size
         num_layers = len(model.target_layer_ids)
 
-        target_hidden = torch.randn(bsz, SEQ_LEN, num_layers * hidden_size, device="cuda")
-        noise_emb = torch.randn(bsz, SEQ_LEN, hidden_size, device="cuda")
+        dtype = next(model.dflash_module.parameters()).dtype
+        target_hidden = torch.randn(
+            bsz, SEQ_LEN, num_layers * hidden_size, device="cuda", dtype=dtype
+        )
+        noise_emb = torch.randn(bsz, SEQ_LEN, hidden_size, device="cuda", dtype=dtype)
         pos_ids = torch.cat([torch.arange(SEQ_LEN), torch.arange(SEQ_LEN)]).unsqueeze(0).cuda()
 
         with torch.no_grad():
