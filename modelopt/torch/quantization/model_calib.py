@@ -50,6 +50,7 @@ from .utils import (
     weight_attr_names,
 )
 from .utils.checkpoint import (
+    SEQ_CALIB_PROGRESS_ATTR,
     detect_sequential_resume_layer,
     save_sequential_checkpoint,
     should_save_seq_calib_checkpoint,
@@ -1947,6 +1948,9 @@ def sequential_calibrate(
                     model, layer_idx, num_layers, checkpoint_dir, layer_output_metas
                 )
     finally:
-        if hasattr(model, "_seq_calib_progress"):
-            del model._seq_calib_progress
+        # Sole owner of _seq_calib_progress cleanup.  The attribute may be set
+        # by save_sequential_checkpoint (save path) or restore_quantizer_state
+        # (resume path); neither deletes it — this is the single cleanup point.
+        if hasattr(model, SEQ_CALIB_PROGRESS_ATTR):
+            delattr(model, SEQ_CALIB_PROGRESS_ATTR)
         input_getter._unpatch_all_layers()

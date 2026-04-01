@@ -16,6 +16,7 @@
 """Unit tests for sequential_calibrate and LayerActivationCollector."""
 
 import io
+import warnings
 from collections import deque
 from unittest.mock import MagicMock
 
@@ -23,6 +24,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from modelopt.torch.quantization.config import MaxCalibConfig
+from modelopt.torch.quantization.mode import wrapped_calib_func
 from modelopt.torch.quantization.model_calib import sequential_calibrate
 from modelopt.torch.quantization.utils.activation_collector import LayerActivationCollector
 from modelopt.torch.quantization.utils.checkpoint import (
@@ -549,19 +552,23 @@ def test_skip_output_meta_not_shared_across_heterogeneous_layers(monkeypatch):
 
 
 @pytest.fixture
-def _register_discoverer(monkeypatch):
+def _clean_checkpoint_registry():
+    """Isolate the checkpoint saver registry for a single test."""
+    old = _CHECKPOINT_SAVE_SUPPORT.copy()
+    _CHECKPOINT_SAVE_SUPPORT.clear()
+    yield
+    _CHECKPOINT_SAVE_SUPPORT.clear()
+    _CHECKPOINT_SAVE_SUPPORT.extend(old)
+
+
+@pytest.fixture
+def _register_discoverer(monkeypatch, _clean_checkpoint_registry):
     """Register a simple discoverer and clear checkpoint saver registry."""
     monkeypatch.setattr(
         LayerActivationCollector,
         "_decoder_layer_support",
         [(lambda m: hasattr(m, "layers"), lambda m: m.layers)],
     )
-    # Save and restore checkpoint registry
-    old = _CHECKPOINT_SAVE_SUPPORT.copy()
-    _CHECKPOINT_SAVE_SUPPORT.clear()
-    yield
-    _CHECKPOINT_SAVE_SUPPORT.clear()
-    _CHECKPOINT_SAVE_SUPPORT.extend(old)
 
 
 def _make_forward_loop(tokens):
@@ -577,40 +584,23 @@ def _noop_calib(layer, forward_loop, **kwargs):
     forward_loop(layer)
 
 
+@pytest.mark.usefixtures("_clean_checkpoint_registry")
 class TestCheckpointSaveRegistry:
     def test_register_and_get_saver(self):
-        old = _CHECKPOINT_SAVE_SUPPORT.copy()
-        _CHECKPOINT_SAVE_SUPPORT.clear()
-        try:
-            saver = MagicMock()
-            register_seq_calib_checkpoint_saver(lambda m: True, saver)
-            model = nn.Linear(4, 4)
-            assert get_checkpoint_saver(model) is saver
-        finally:
-            _CHECKPOINT_SAVE_SUPPORT.clear()
-            _CHECKPOINT_SAVE_SUPPORT.extend(old)
+        saver = MagicMock()
+        register_seq_calib_checkpoint_saver(lambda m: True, saver)
+        model = nn.Linear(4, 4)
+        assert get_checkpoint_saver(model) is saver
 
     def test_get_saver_returns_none_when_empty(self):
-        old = _CHECKPOINT_SAVE_SUPPORT.copy()
-        _CHECKPOINT_SAVE_SUPPORT.clear()
-        try:
-            assert get_checkpoint_saver(nn.Linear(4, 4)) is None
-        finally:
-            _CHECKPOINT_SAVE_SUPPORT.clear()
-            _CHECKPOINT_SAVE_SUPPORT.extend(old)
+        assert get_checkpoint_saver(nn.Linear(4, 4)) is None
 
     def test_dedup_registration(self):
-        old = _CHECKPOINT_SAVE_SUPPORT.copy()
-        _CHECKPOINT_SAVE_SUPPORT.clear()
-        try:
-            pred = lambda m: True  # noqa: E731
-            saver = lambda m, d: None  # noqa: E731
-            register_seq_calib_checkpoint_saver(pred, saver)
-            register_seq_calib_checkpoint_saver(pred, saver)
-            assert len(_CHECKPOINT_SAVE_SUPPORT) == 1
-        finally:
-            _CHECKPOINT_SAVE_SUPPORT.clear()
-            _CHECKPOINT_SAVE_SUPPORT.extend(old)
+        pred = lambda m: True  # noqa: E731
+        saver = lambda m, d: None  # noqa: E731
+        register_seq_calib_checkpoint_saver(pred, saver)
+        register_seq_calib_checkpoint_saver(pred, saver)
+        assert len(_CHECKPOINT_SAVE_SUPPORT) == 1
 
 
 @pytest.mark.usefixtures("_register_discoverer")
@@ -757,9 +747,9 @@ class TestPrepareForResume:
 
         # Now simulate resume from layer 2
         collector2 = LayerActivationCollector(model)
-        collector2._patch_all_layers()
+        collector2._patch_all_layers(layer_output_metas=output_metas)
         try:
-            collector2.prepare_for_resume(2, fwd, output_metas)
+            collector2.prepare_for_resume(2, fwd)
 
             # Layer 0 should be in skip mode
             assert model.layers[0]._seq_calib.mode == "skip"
@@ -795,9 +785,9 @@ class TestPrepareForResume:
 
         # Resume from layer 1
         collector2 = LayerActivationCollector(model)
-        collector2._patch_all_layers()
+        collector2._patch_all_layers(layer_output_metas=output_metas)
         try:
-            collector2.prepare_for_resume(1, fwd, output_metas)
+            collector2.prepare_for_resume(1, fwd)
 
             # Layer 0 should have collected_inputs from warm-up capture
             assert len(model.layers[0]._seq_calib.collected_inputs) > 0
@@ -816,7 +806,7 @@ class TestPrepareForResume:
         collector = LayerActivationCollector(model)
         collector._patch_all_layers()
         try:
-            collector.prepare_for_resume(0, fwd, None)
+            collector.prepare_for_resume(0, fwd)
             # All layers should still be in original mode
             for layer in model.layers:
                 assert layer._seq_calib.mode == "original"
@@ -1075,3 +1065,20 @@ class TestFullCheckpointResumeRoundtrip:
         assert len(resumed_layers) == 2
         assert resumed_layers[0] == id(model2.layers[3])
         assert resumed_layers[1] == id(model2.layers[4])
+
+
+class TestWrappedCalibFuncWarning:
+    def test_checkpoint_config_without_sequential_warns(self):
+        """Setting checkpoint config without use_sequential=True should warn."""
+        config = MaxCalibConfig(
+            sequential_checkpoint_dir="/tmp/test",
+            sequential_checkpoint_interval=2,
+            use_sequential=False,
+        )
+        model = nn.Linear(4, 4)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            wrapped_calib_func(model, config, forward_loop=None, func=None)
+            assert len(w) == 1
+            assert "use_sequential is False" in str(w[0].message)

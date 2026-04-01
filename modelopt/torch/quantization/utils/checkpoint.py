@@ -77,6 +77,8 @@ def detect_sequential_resume_layer(model: nn.Module, num_layers: int) -> tuple[i
     """Read checkpoint progress from the model and return ``(resume_layer_idx, layer_output_metas)``.
 
     Returns ``(0, None)`` for a fresh run with no checkpoint present.
+    The attribute is **not** deleted here — cleanup is owned by
+    :func:`sequential_calibrate`'s ``finally`` block.
     """
     progress = getattr(model, SEQ_CALIB_PROGRESS_ATTR, None)
     if progress is None:
@@ -91,7 +93,6 @@ def detect_sequential_resume_layer(model: nn.Module, num_layers: int) -> tuple[i
             f"{num_layers} layers. Cannot resume."
         )
 
-    delattr(model, SEQ_CALIB_PROGRESS_ATTR)
     resume_from = completed_layer + 1
     print_rank_0(
         f"Resuming sequential calibration from layer {resume_from} "
@@ -121,8 +122,9 @@ def save_sequential_checkpoint(
 ) -> None:
     """Save a rolling checkpoint during sequential calibration.
 
-    Attaches progress to the model, calls the registered saver, then cleans up
-    the progress attribute.
+    Temporarily attaches progress to the model so that ``update_quantize_metadata``
+    can serialize it during ``save_pretrained``.  The attribute is **not** deleted
+    here — cleanup is owned by :func:`sequential_calibrate`'s ``finally`` block.
     """
     saver = get_checkpoint_saver(model)
     if saver is None:
@@ -144,5 +146,3 @@ def save_sequential_checkpoint(
         f"Saved sequential calibration checkpoint at layer "
         f"{completed_layer_idx + 1}/{total_layers} to {checkpoint_dir}"
     )
-
-    del model._seq_calib_progress

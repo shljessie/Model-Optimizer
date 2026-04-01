@@ -22,7 +22,7 @@ layer-by-layer calibration.
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -44,7 +44,7 @@ class _LayerCalibState:
     patched forward to decide skip / run / capture / original behaviour.
     """
 
-    mode: str = "original"
+    mode: Literal["original", "skip", "run", "capture"] = "original"
     name: str = ""
     cached_inputs: deque = field(default_factory=deque)
     collected_inputs: list = field(default_factory=list)
@@ -246,7 +246,9 @@ class LayerActivationCollector:
         self._cleanup_layers()
         self._patched = False
 
-    def _set_layer_mode(self, layer_idx: int, mode: str) -> None:
+    def _set_layer_mode(
+        self, layer_idx: int, mode: Literal["original", "skip", "run", "capture"]
+    ) -> None:
         """Set the mode for a single decoder layer with appropriate side effects."""
         assert self._decoder_layers is not None
         state = self._decoder_layers[layer_idx]._seq_calib
