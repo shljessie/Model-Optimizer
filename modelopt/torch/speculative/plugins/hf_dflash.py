@@ -267,6 +267,19 @@ class DFlashModule(nn.Module):
         self.norm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = _ROTARY_CLS(config=config)
 
+        # Initialize weights matching HF PreTrainedModel (normal_ with initializer_range)
+        # SpecForge's DFlashDraftModel uses Qwen3PreTrainedModel.post_init() which does this.
+        self._init_weights(config)
+
+    def _init_weights(self, config):
+        """Initialize weights matching HF PreTrainedModel._init_weights."""
+        std = getattr(config, "initializer_range", 0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, noise_embedding, target_hidden, position_ids, attention_mask=None):
         """Forward matching SpecForge DFlashDraftModel.forward."""
         hidden_states = noise_embedding
