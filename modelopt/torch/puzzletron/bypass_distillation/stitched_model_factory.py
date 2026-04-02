@@ -638,7 +638,3 @@ def bypass_factory_fn(
         student_model_config,
     )
 
-
-# Backward-compatible name aliases
-gqa_factory_fn = bypass_factory_fn
-moe_factory_fn = bypass_factory_fn

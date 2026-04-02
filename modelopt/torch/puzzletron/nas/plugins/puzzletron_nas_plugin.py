@@ -137,7 +137,7 @@ def convert_puzzletron_model(model: nn.Module, config: PuzzletronConfig) -> Conv
     hydra_cfg = hydra.utils.instantiate(hydra_cfg)
 
     has_bypass = hydra_cfg.get("bypass", None) is not None
-    N = _total_steps(hydra_cfg)
+    n = _total_steps(hydra_cfg)
 
     puzzle_dir = Path(config.puzzle_dir)
 
@@ -150,11 +150,11 @@ def convert_puzzletron_model(model: nn.Module, config: PuzzletronConfig) -> Conv
         already_done = convert_marker.exists() or (teacher_dir / "config.json").exists()
         if already_done:
             mprint(
-                f"Puzzletron Progress 2/{N}: teacher checkpoint already exists, skipping conversion"
+                f"Puzzletron Progress 2/{n}: teacher checkpoint already exists, skipping conversion"
             )
         else:
             mprint(
-                f"Puzzletron Progress 2/{N}: converting model to Puzzletron heterogeneous format (single-gpu)"
+                f"Puzzletron Progress 2/{n}: converting model to Puzzletron heterogeneous format (single-gpu)"
             )
 
             # Get descriptor and converter from the hydra config
@@ -197,11 +197,11 @@ def convert_puzzletron_model(model: nn.Module, config: PuzzletronConfig) -> Conv
     )
     if already_scored:
         mprint(
-            f"Puzzletron Progress 3/{N}: pruning activation scores already exist, skipping scoring"
+            f"Puzzletron Progress 3/{n}: pruning activation scores already exist, skipping scoring"
         )
         dist.barrier()
     else:
-        mprint(f"Puzzletron Progress 3/{N}: scoring pruning activations (multi-gpu)")
+        mprint(f"Puzzletron Progress 3/{n}: scoring pruning activations (multi-gpu)")
         score_pruning_activations.launch_score_activations(hydra_cfg)
         if dist.is_master():
             score_marker.touch()
@@ -216,10 +216,10 @@ def convert_puzzletron_model(model: nn.Module, config: PuzzletronConfig) -> Conv
             pruned_ckpts_dir.exists() and any(pruned_ckpts_dir.iterdir())
         )
         if already_pruned:
-            mprint(f"Puzzletron Progress 4/{N}: pruned checkpoints already exist, skipping pruning")
+            mprint(f"Puzzletron Progress 4/{n}: pruned checkpoints already exist, skipping pruning")
         else:
             mprint(
-                f"Puzzletron Progress 4/{N}: pruning the model and saving pruned checkpoints (single-gpu)"
+                f"Puzzletron Progress 4/{n}: pruning the model and saving pruned checkpoints (single-gpu)"
             )
             pruning_ckpts.launch_prune_ckpt(hydra_cfg)
             prune_marker.touch()
@@ -227,7 +227,7 @@ def convert_puzzletron_model(model: nn.Module, config: PuzzletronConfig) -> Conv
 
     # Step 5: Bypass distillation (optional, distributed processing)
     if has_bypass:
-        mprint(f"Puzzletron Progress 5/{N}: running bypass distillation (multi-gpu)")
+        mprint(f"Puzzletron Progress 5/{n}: running bypass distillation (multi-gpu)")
         bypass_distillation.launch_bypass_distillation(hydra_cfg)
 
     return model, {}
@@ -301,7 +301,7 @@ class PuzzletronSearcher(BaseSearcher):
         hydra_cfg = hydra.utils.instantiate(hydra_cfg)
 
         has_bypass = hydra_cfg.get("bypass", None) is not None
-        N = _total_steps(hydra_cfg)
+        n = _total_steps(hydra_cfg)
         # With bypass:    library=6, scoring=7, mip=8  (out of 9)
         # Without bypass: library=5, scoring=6, mip=7  (out of 8)
         library_step = 6 if has_bypass else 5
@@ -320,20 +320,20 @@ class PuzzletronSearcher(BaseSearcher):
             )
             if already_built:
                 mprint(
-                    f"Puzzletron Progress {library_step}/{N}: replacement library and subblock stats already exist, skipping"
+                    f"Puzzletron Progress {library_step}/{n}: replacement library and subblock stats already exist, skipping"
                 )
             else:
                 mprint(
-                    f"Puzzletron Progress {library_step}/{N}: building replacement library and subblock statistics (single-gpu)"
+                    f"Puzzletron Progress {library_step}/{n}: building replacement library and subblock statistics (single-gpu)"
                 )
                 build_library_and_stats.launch_build_library_and_stats(hydra_cfg)
                 library_marker.touch()
         dist.barrier()
 
         # Calculate one block scores (distributed processing)
-        mprint(f"Puzzletron Progress {scoring_step}/{N}: calculating one block scores (multi-gpu)")
+        mprint(f"Puzzletron Progress {scoring_step}/{n}: calculating one block scores (multi-gpu)")
         scoring.launch_scoring(hydra_cfg)
 
         # MIP search and realize models (distributed processing)
-        mprint(f"Puzzletron Progress {mip_step}/{N}: running MIP and realizing models (multi-gpu)")
+        mprint(f"Puzzletron Progress {mip_step}/{n}: running MIP and realizing models (multi-gpu)")
         mip_and_realize_models.launch_mip_and_realize_model(hydra_cfg)

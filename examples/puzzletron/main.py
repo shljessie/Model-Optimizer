@@ -71,28 +71,35 @@ def parse_args():
     return parser.parse_args()
 
 
+def _setup(hydra_config_path: str):
+    """Common setup for all entry points: distributed init, Hydra config load.
+
+    Returns:
+        Tuple of (hydra_cfg, hydra_config_dir, hydra_config_name, n) where n is
+        the total number of pipeline steps.
+    """
+    dist.setup(timeout=timedelta(minutes=10))
+    register_hydra_resolvers()
+
+    resolved = Path(hydra_config_path).resolve()
+    hydra_config_dir = str(resolved.parent)
+    hydra_config_name = resolved.stem
+
+    hydra_cfg = initialize_hydra_config_for_dir(
+        config_dir=hydra_config_dir,
+        config_name=hydra_config_name,
+        overrides=[],
+    )
+    return hydra_cfg, hydra_config_dir, hydra_config_name, _total_steps(hydra_cfg)
+
+
 def run_full_puzzletron(hydra_config_path: str):
     """Run the full puzzletron pipeline.
 
     Args:
         config_path: Path to the YAML configuration file
     """
-    dist.setup(timeout=timedelta(minutes=10))
-
-    # Register Hydra custom resolvers (needed for config resolution)
-    register_hydra_resolvers()
-
-    hydra_config_path = Path(hydra_config_path).resolve()
-    hydra_config_dir = str(hydra_config_path.parent)
-    hydra_config_name = hydra_config_path.stem
-
-    # Load hydra config to determine total step count (bypass adds one step)
-    hydra_cfg = initialize_hydra_config_for_dir(
-        config_dir=hydra_config_dir,
-        config_name=hydra_config_name,
-        overrides=[],
-    )
-    n = _total_steps(hydra_cfg)
+    hydra_cfg, hydra_config_dir, hydra_config_name, n = _setup(hydra_config_path)
 
     mprint(f"Puzzletron Progress 1/{n}: starting puzzletron pipeline")
 
@@ -137,23 +144,7 @@ def run_mip_only(hydra_config_path: str):
     Args:
         hydra_config_path: Path to the YAML configuration file
     """
-    dist.setup(timeout=timedelta(minutes=10))
-
-    # Register Hydra custom resolvers (needed for config resolution)
-    register_hydra_resolvers()
-
-    hydra_config_path = Path(hydra_config_path).resolve()
-    hydra_config_dir = str(hydra_config_path.parent)
-    hydra_config_name = hydra_config_path.stem
-
-    # Load hydra config
-    hydra_cfg = initialize_hydra_config_for_dir(
-        config_dir=hydra_config_dir,
-        config_name=hydra_config_name,
-        overrides=[],
-    )
-
-    n = _total_steps(hydra_cfg)
+    hydra_cfg, _hydra_config_dir, _hydra_config_name, n = _setup(hydra_config_path)
     mip_step = n - 1
 
     # Check if sweep mode is enabled
