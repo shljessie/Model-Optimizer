@@ -7,18 +7,25 @@ compressed models by producing better "puzzle pieces" for the MIP solver.
 
 ## When to use bypass
 
-Bypass distillation is most beneficial for **aggressive compression**. For mild FFN pruning
-(e.g., keeping most of the intermediate width), weight-initialization-based pruning alone often
-provides a reasonable starting point and bypass may not be essential. Use bypass when:
+Bypass is most beneficial whenever the pruned block structure deviates significantly from the
+teacher — either because the weight-initialisation heuristic is too coarse, or because one
+sub-block must compensate for something the other no longer provides. Specifically, use bypass
+when:
 
-- **Heavy FFN pruning**: the target `intermediate_size` is significantly smaller than the
-  teacher's (e.g., ≤ 1/8 of the teacher width). For example, on Llama-3.1-8B
-  (`intermediate_size=14336`), bypass is strongly recommended for sizes ≤ 1792.
-- **KV head compression**: `num_key_value_heads` is being significantly reduced. The
-  `AverageKV` initialisation provides a useful starting point but bypass distillation recovers
-  additional accuracy.
-- **Attention no-op blocks**: when a full attention block is removed (`no_op: true`), bypass
-  trains the co-located FFN to compensate for the missing attention.
+- **KV head reduction (any amount)**: the `AverageKV` initialisation is a naive starting point
+  that averages existing KV heads together. The resulting weights are a poor local minimum and
+  bypass distillation is needed to repair the quality loss. This applies even to moderate
+  reductions (e.g., 8 → 4 heads).
+- **Attention removed (`no_op: true`)**: removing an entire attention block leaves the co-located
+  FFN doing all the work for that block. Bypass trains the FFN to compensate for the missing
+  attention and recover the representational capacity.
+- **FFN removed (`no_op: true`)**: similarly, when an FFN block is removed, bypass trains the
+  remaining attention to compensate.
+- **Extreme FFN / MoE compression**: when the target `intermediate_size` is reduced by more than
+  ~3/4 of the teacher width, or the number of MoE experts is reduced by half or more, simple
+  weight truncation / expert selection leaves the block far from a good solution and bypass
+  significantly improves quality. For example, on Llama-3.1-8B (`intermediate_size=14336`),
+  bypass is strongly recommended for sizes ≤ 3584.
 
 ## Time cost
 
@@ -60,13 +67,10 @@ targets.
 | `subblock_mamba` | Mamba SSM weights (hybrid models, e.g. NemotronH) |
 | `entire_block` | Full transformer block (coupled BLD) |
 
-**Coupled BLD** (`keys_to_learn: entire_block`) trains the whole block end-to-end and can
-capture interactions between attention and FFN. It is more expensive and can be harder to
-optimise. Decoupled BLD is recommended as a first step and often sufficient.
-
-Typical decoupled workflow:
-1. Run `keys_to_learn: subblock_ffn` for all FFN sizes you want in the replacement library.
-2. Optionally run `keys_to_learn: subblock_attention` for blocks where KV heads are reduced.
+**Coupled BLD** (`keys_to_learn: entire_block`) trains the whole block end-to-end and captures
+interactions between attention and FFN. The main cost is combinatorial: if you have N FFN sizes
+and M attention sizes in your replacement library, coupled BLD requires N × M training runs
+instead of N + M for decoupled. Decoupled BLD is therefore the default and usually sufficient.
 
 ## Training multiple configurations
 
