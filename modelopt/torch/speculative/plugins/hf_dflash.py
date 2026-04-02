@@ -253,8 +253,12 @@ def create_dflash_attention_mask(seq_len, block_size, device, dtype):
 
     full_mask_bool = torch.cat([ctx_mask, noise_mask], dim=1)
 
-    full_mask = torch.zeros(seq_len, 2 * seq_len, device=device, dtype=dtype)
-    full_mask.masked_fill_(~full_mask_bool, torch.finfo(dtype).min)
+    # Create in f32 then cast, matching SpecForge. This ensures masked
+    # positions get -inf in bf16 (f32 min overflows to -inf when cast),
+    # not the largest finite negative bf16 value.
+    full_mask = torch.zeros(seq_len, 2 * seq_len, device=device, dtype=torch.float32)
+    full_mask.masked_fill_(~full_mask_bool, torch.finfo(torch.float32).min)
+    full_mask = full_mask.to(dtype=dtype)
 
     return full_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L, 2L]
 
