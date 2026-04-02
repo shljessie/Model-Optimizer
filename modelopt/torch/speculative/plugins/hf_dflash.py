@@ -673,12 +673,12 @@ class HFDFlashModel(DFlashModel):
         block_ids[:, 0] = base_token.squeeze(-1)
         noise_embedding = self._base_model_embeddings(block_ids)
 
-        # Position IDs must match training: [0..ctx_len-1, 0..block_size-1]
-        # Training uses [0..L-1, 0..L-1] — context and noise share positions.
-        # At inference, the block positions should start from 0 (same as training blocks).
+        # Position IDs: training uses [0..L-1, 0..L-1] where noise positions
+        # mirror context positions. At inference, block predicts tokens at
+        # seq_len..seq_len+B-1, so noise positions continue from ctx_len.
         ctx_len = target_hidden.shape[1]
         ctx_positions = torch.arange(ctx_len, device=device)
-        block_positions = torch.arange(block_size, device=device)
+        block_positions = torch.arange(ctx_len, ctx_len + block_size, device=device)
         pos_ids = torch.cat([ctx_positions, block_positions]).unsqueeze(0).expand(bsz, -1)
 
         # Attention mask: block sees ALL context + reverse-causal within block
