@@ -347,26 +347,7 @@ def train(
         time_now = time.time()
         # Check if we've reached the maximum number of steps
         if cfg.bypass.step_num >= cfg.bypass.training.max_steps:
-            if (
-                cfg.bypass.model.model_overrides.save_checkpoint_when_done
-                and not cfg.bypass.disable_checkpoint_save
-            ):
-                mprint("Saving final checkpoint before training completion")
-                subdir_name = f"final-iter-{cfg.bypass.iter_num:06d}-ckpt"
-                save_bypass_checkpoint(
-                    cfg=cfg,
-                    descriptor=descriptor,
-                    model=student_model,
-                    stitched_module_descriptors=stitched_module_descriptors,
-                    checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
-                    reference_checkpoint_dir=cfg.teacher_dir,
-                )
-
-                if cfg.bypass.model.model_overrides.delete_old_checkpoints and dist.is_master():
-                    existing_ckpt_paths = list(Path(cfg.bypass.experiment_dir).glob("iter-*"))
-                    for old_ckpt_path in existing_ckpt_paths:
-                        if old_ckpt_path.name != subdir_name:
-                            shutil.rmtree(str(old_ckpt_path))
+            _save_final_checkpoint(cfg, descriptor, student_model, stitched_module_descriptors)
             break
 
         is_accumulating = cfg.bypass.iter_num % cfg.bypass.training.grad_accumulation_steps != 0
@@ -518,75 +499,13 @@ def train(
 
         # Logging
         if dist.is_master():
-            assert stitched_losses_history is not None
-            while len(stitched_losses_history) >= cfg.bypass.training.log_interval:
-                lowest_iter = next(iter(stitched_losses_history.keys()))
-
-                log_chunk = {
-                    it: losses
-                    for it, losses in stitched_losses_history.items()
-                    if it - lowest_iter < cfg.bypass.training.log_interval
-                }
-                if len(log_chunk) < cfg.bypass.training.log_interval:
-                    break
-
-                highest_iter = list(log_chunk.keys())[-1]
-                highest_iter_stats = iter_stats_history[highest_iter]
-
-                losses_by_name = defaultdict[str, list[float]](lambda: [])
-                for losses in log_chunk.values():
-                    for name, loss in losses.items():
-                        losses_by_name[name].append(loss)
-
-                losses_by_name_avg = {name: mean(losses) for name, losses in losses_by_name.items()}
-
-                # Update best losses tracking
-                for name, current_loss in losses_by_name_avg.items():
-                    if name not in best_losses_by_name or current_loss < best_losses_by_name[name]:
-                        best_losses_by_name[name] = current_loss
-                        best_steps_by_name[name] = highest_iter
-
-                chunk_iter_durations = [
-                    iter_stats_history[it].iter_duration for it in log_chunk.keys()
-                ]
-                avg_chunk_iter_duration = mean(chunk_iter_durations)
-                avg_token_speed = cfg.bypass.training.tokens_per_iter / avg_chunk_iter_duration
-                mprint(
-                    f"iter {highest_iter}/{cfg.bypass.training.max_steps:,}:"
-                    f" avg_iter_time={avg_chunk_iter_duration * 1000:.2f}ms"
-                    f" avg_token_speed={avg_token_speed:,.0f}[tok/s]"
-                )
-                mprint(
-                    format_stitched_losses(
-                        losses_dict=losses_by_name_avg,
-                        best_steps_dict=best_steps_by_name,
-                        best_values_dict=best_losses_by_name,
-                        step_number=highest_iter,
-                        title="Stitched Module Losses",
-                    )
-                )
-
-                if cfg.bypass.wandb_log:
-                    try:
-                        import wandb
-
-                        wandb.log(
-                            {
-                                "iter": highest_iter,
-                                "step": highest_iter_stats.step_num,
-                                "token_count": highest_iter_stats.token_count,
-                                "token_speed": avg_token_speed,
-                                "lr": highest_iter_stats.lr,
-                                "grad_clipping": highest_iter_stats.clipping_count,
-                            },
-                            step=highest_iter,
-                        )
-                    except ImportError:
-                        pass
-
-                for it in log_chunk.keys():
-                    del iter_stats_history[it]
-                    del stitched_losses_history[it]
+            _log_training_stats(
+                cfg,
+                stitched_losses_history,
+                iter_stats_history,
+                best_losses_by_name,
+                best_steps_by_name,
+            )
 
         # Validation
         if (
@@ -594,86 +513,231 @@ def train(
             and (cfg.bypass.step_num % cfg.bypass.training.eval_interval) == 0
             and val_dataloader is not None
         ):
-            from modelopt.torch.puzzletron.utils.validate_runtime_pipeline import (
-                calculate_losses_pipeline,
+            _run_validation(
+                cfg, descriptor, student_model, student_stitched_model,
+                stitched_module_descriptors, val_dataloader, device,
             )
-
-            losses, _ = calculate_losses_pipeline(
-                stitched_model=student_stitched_model,
-                dataloader=val_dataloader,
-                descriptor=descriptor,
-            )
-
-            val_loss = float("inf")
-            if losses is not None and "lm_loss" in losses:
-                val_loss = losses["lm_loss"]["avg"]
-                mprint(f"Validation loss at iter {cfg.bypass.iter_num}: {val_loss:.4f}")
-
-            # Broadcast val_loss so all ranks agree on checkpoint decisions
-            val_loss_tensor = torch.tensor([val_loss], device=device)
-            torch.distributed.broadcast(val_loss_tensor, src=dist.size() - 1)
-            val_loss = val_loss_tensor.item()
-
-            if val_loss < cfg.bypass.best_val_loss:
-                cfg.bypass.best_val_loss = val_loss
-                if not cfg.bypass.disable_checkpoint_save and cfg.bypass.save_best_ckpt:
-                    subdir_name = f"best-iter-{cfg.bypass.iter_num:06d}-ckpt"
-                    save_bypass_checkpoint(
-                        cfg=cfg,
-                        descriptor=descriptor,
-                        model=student_model,
-                        stitched_module_descriptors=stitched_module_descriptors,
-                        checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
-                        reference_checkpoint_dir=cfg.teacher_dir,
-                    )
-                    if cfg.bypass.kill_after_first_save:
-                        raise RuntimeError("Done saving checkpoint, kill_after_first_save=True")
 
         # Checkpoint saving (step-based or time-based)
-        if not is_accumulating and (
-            (cfg.bypass.step_num % cfg.bypass.model.model_overrides.save_interval) == 0
-            or step_to_save == cfg.bypass.step_num
-            or (
-                cfg.bypass.model.model_overrides.save_checkpoint_when_done
-                and cfg.bypass.step_num >= cfg.bypass.training.max_steps
-            )
-        ):
-            if not cfg.bypass.disable_checkpoint_save:
-                if (cfg.bypass.step_num % cfg.bypass.model.model_overrides.save_interval) == 0:
-                    mprint("Saving step-interval checkpoint")
-                elif step_to_save == cfg.bypass.step_num:
-                    mprint("Saving time-based checkpoint")
-                elif (
-                    cfg.bypass.model.model_overrides.save_checkpoint_when_done
-                    and cfg.bypass.step_num >= cfg.bypass.training.max_steps - 100
-                ):
-                    mprint("Saving final checkpoint")
-
-                subdir_name = f"iter-{cfg.bypass.iter_num:06d}-ckpt"
-                save_bypass_checkpoint(
-                    cfg=cfg,
-                    descriptor=descriptor,
-                    model=student_model,
-                    stitched_module_descriptors=stitched_module_descriptors,
-                    checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
-                    reference_checkpoint_dir=cfg.teacher_dir,
-                )
-
-                if cfg.bypass.kill_after_first_save:
-                    dist.barrier()
-                    raise RuntimeError("Done saving checkpoint, kill_after_first_save=True")
-
-                if cfg.bypass.model.model_overrides.delete_old_checkpoints and dist.is_master():
-                    existing_ckpt_paths = list(Path(cfg.bypass.experiment_dir).glob("iter-*"))
-                    for old_ckpt_path in existing_ckpt_paths:
-                        if old_ckpt_path.name != subdir_name:
-                            shutil.rmtree(str(old_ckpt_path))
+        _save_interval_checkpoint(
+            cfg, descriptor, student_model, stitched_module_descriptors,
+            step_to_save, is_accumulating,
+        )
 
         cfg.bypass.iter_num += 1
         if not is_accumulating:
             cfg.bypass.step_num += 1
 
     mprint("Finished successfully!")
+
+
+def _save_final_checkpoint(
+    cfg: DictConfig,
+    descriptor: Type[ModelDescriptor],
+    student_model: torch.nn.Module,
+    stitched_module_descriptors: OrderedDict[str, StitchedModuleDescriptor],
+) -> None:
+    """Save the final training checkpoint and delete old iter-* checkpoints if configured."""
+    if not (
+        cfg.bypass.model.model_overrides.save_checkpoint_when_done
+        and not cfg.bypass.disable_checkpoint_save
+    ):
+        return
+    mprint("Saving final checkpoint before training completion")
+    subdir_name = f"final-iter-{cfg.bypass.iter_num:06d}-ckpt"
+    save_bypass_checkpoint(
+        cfg=cfg,
+        descriptor=descriptor,
+        model=student_model,
+        stitched_module_descriptors=stitched_module_descriptors,
+        checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
+        reference_checkpoint_dir=cfg.teacher_dir,
+    )
+    if cfg.bypass.model.model_overrides.delete_old_checkpoints and dist.is_master():
+        for old_ckpt_path in Path(cfg.bypass.experiment_dir).glob("iter-*"):
+            if old_ckpt_path.name != subdir_name:
+                shutil.rmtree(str(old_ckpt_path))
+
+
+def _log_training_stats(
+    cfg: DictConfig,
+    stitched_losses_history: dict,
+    iter_stats_history: dict,
+    best_losses_by_name: dict,
+    best_steps_by_name: dict,
+) -> None:
+    """Log training statistics for the current log-interval chunk (master only).
+
+    Processes ``stitched_losses_history`` in chunks of ``log_interval`` iters, prints
+    per-block loss tables and speed metrics, optionally logs to W&B, then removes
+    processed entries from both history dicts.  Mutates ``best_losses_by_name`` and
+    ``best_steps_by_name`` in place.
+    """
+    assert stitched_losses_history is not None
+    while len(stitched_losses_history) >= cfg.bypass.training.log_interval:
+        lowest_iter = next(iter(stitched_losses_history.keys()))
+
+        log_chunk = {
+            it: losses
+            for it, losses in stitched_losses_history.items()
+            if it - lowest_iter < cfg.bypass.training.log_interval
+        }
+        if len(log_chunk) < cfg.bypass.training.log_interval:
+            break
+
+        highest_iter = list(log_chunk.keys())[-1]
+        highest_iter_stats = iter_stats_history[highest_iter]
+
+        losses_by_name = defaultdict[str, list[float]](lambda: [])
+        for losses in log_chunk.values():
+            for name, loss in losses.items():
+                losses_by_name[name].append(loss)
+
+        losses_by_name_avg = {name: mean(losses) for name, losses in losses_by_name.items()}
+
+        for name, current_loss in losses_by_name_avg.items():
+            if name not in best_losses_by_name or current_loss < best_losses_by_name[name]:
+                best_losses_by_name[name] = current_loss
+                best_steps_by_name[name] = highest_iter
+
+        chunk_iter_durations = [iter_stats_history[it].iter_duration for it in log_chunk.keys()]
+        avg_chunk_iter_duration = mean(chunk_iter_durations)
+        avg_token_speed = cfg.bypass.training.tokens_per_iter / avg_chunk_iter_duration
+        mprint(
+            f"iter {highest_iter}/{cfg.bypass.training.max_steps:,}:"
+            f" avg_iter_time={avg_chunk_iter_duration * 1000:.2f}ms"
+            f" avg_token_speed={avg_token_speed:,.0f}[tok/s]"
+        )
+        mprint(
+            format_stitched_losses(
+                losses_dict=losses_by_name_avg,
+                best_steps_dict=best_steps_by_name,
+                best_values_dict=best_losses_by_name,
+                step_number=highest_iter,
+                title="Stitched Module Losses",
+            )
+        )
+
+        if cfg.bypass.wandb_log:
+            try:
+                import wandb
+
+                wandb.log(
+                    {
+                        "iter": highest_iter,
+                        "step": highest_iter_stats.step_num,
+                        "token_count": highest_iter_stats.token_count,
+                        "token_speed": avg_token_speed,
+                        "lr": highest_iter_stats.lr,
+                        "grad_clipping": highest_iter_stats.clipping_count,
+                    },
+                    step=highest_iter,
+                )
+            except ImportError:
+                pass
+
+        for it in log_chunk.keys():
+            del iter_stats_history[it]
+            del stitched_losses_history[it]
+
+
+def _run_validation(
+    cfg: DictConfig,
+    descriptor: Type[ModelDescriptor],
+    student_model: torch.nn.Module,
+    student_stitched_model: StitchedModule,
+    stitched_module_descriptors: OrderedDict[str, StitchedModuleDescriptor],
+    val_dataloader: DataLoader,
+    device: torch.device,
+) -> None:
+    """Run validation, broadcast val_loss, and save best checkpoint if loss improved."""
+    from modelopt.torch.puzzletron.utils.validate_runtime_pipeline import (
+        calculate_losses_pipeline,
+    )
+
+    losses, _ = calculate_losses_pipeline(
+        stitched_model=student_stitched_model,
+        dataloader=val_dataloader,
+        descriptor=descriptor,
+    )
+
+    val_loss = float("inf")
+    if losses is not None and "lm_loss" in losses:
+        val_loss = losses["lm_loss"]["avg"]
+        mprint(f"Validation loss at iter {cfg.bypass.iter_num}: {val_loss:.4f}")
+
+    # Broadcast val_loss so all ranks agree on checkpoint decisions
+    val_loss_tensor = torch.tensor([val_loss], device=device)
+    torch.distributed.broadcast(val_loss_tensor, src=dist.size() - 1)
+    val_loss = val_loss_tensor.item()
+
+    if val_loss < cfg.bypass.best_val_loss:
+        cfg.bypass.best_val_loss = val_loss
+        if not cfg.bypass.disable_checkpoint_save and cfg.bypass.save_best_ckpt:
+            subdir_name = f"best-iter-{cfg.bypass.iter_num:06d}-ckpt"
+            save_bypass_checkpoint(
+                cfg=cfg,
+                descriptor=descriptor,
+                model=student_model,
+                stitched_module_descriptors=stitched_module_descriptors,
+                checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
+                reference_checkpoint_dir=cfg.teacher_dir,
+            )
+            if cfg.bypass.kill_after_first_save:
+                raise RuntimeError("Done saving checkpoint, kill_after_first_save=True")
+
+
+def _save_interval_checkpoint(
+    cfg: DictConfig,
+    descriptor: Type[ModelDescriptor],
+    student_model: torch.nn.Module,
+    stitched_module_descriptors: OrderedDict[str, StitchedModuleDescriptor],
+    step_to_save: Optional[int],
+    is_accumulating: bool,
+) -> None:
+    """Save a step-interval or time-based checkpoint if the current step qualifies."""
+    if is_accumulating:
+        return
+    if not (
+        (cfg.bypass.step_num % cfg.bypass.model.model_overrides.save_interval) == 0
+        or step_to_save == cfg.bypass.step_num
+        or (
+            cfg.bypass.model.model_overrides.save_checkpoint_when_done
+            and cfg.bypass.step_num >= cfg.bypass.training.max_steps
+        )
+    ):
+        return
+    if cfg.bypass.disable_checkpoint_save:
+        return
+
+    if (cfg.bypass.step_num % cfg.bypass.model.model_overrides.save_interval) == 0:
+        mprint("Saving step-interval checkpoint")
+    elif step_to_save == cfg.bypass.step_num:
+        mprint("Saving time-based checkpoint")
+    elif (
+        cfg.bypass.model.model_overrides.save_checkpoint_when_done
+        and cfg.bypass.step_num >= cfg.bypass.training.max_steps - 100
+    ):
+        mprint("Saving final checkpoint")
+
+    subdir_name = f"iter-{cfg.bypass.iter_num:06d}-ckpt"
+    save_bypass_checkpoint(
+        cfg=cfg,
+        descriptor=descriptor,
+        model=student_model,
+        stitched_module_descriptors=stitched_module_descriptors,
+        checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
+        reference_checkpoint_dir=cfg.teacher_dir,
+    )
+
+    if cfg.bypass.kill_after_first_save:
+        dist.barrier()
+        raise RuntimeError("Done saving checkpoint, kill_after_first_save=True")
+
+    if cfg.bypass.model.model_overrides.delete_old_checkpoints and dist.is_master():
+        for old_ckpt_path in Path(cfg.bypass.experiment_dir).glob("iter-*"):
+            if old_ckpt_path.name != subdir_name:
+                shutil.rmtree(str(old_ckpt_path))
 
 
 # Learning rate decay scheduler (cosine with warmup)
