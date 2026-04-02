@@ -222,7 +222,7 @@ elif [[ "$MODE" == "dflash" ]]; then
     SPECULATIVE_ARGS="$SPECULATIVE_ARGS --dflash_mask_token_id $DFLASH_MASK_TOKEN_ID"
   fi
   # DFlash uses DDP instead of FSDP
-  FSDP_ARGS="--ddp_find_unused_parameters True --ddp_timeout 300"
+  FSDP_ARGS="--ddp_find_unused_parameters True --ddp_timeout 1800"
 else
   echo "Unsupported mode: $MODE. Supported: eagle3, dflash"
   exit 1
