@@ -87,6 +87,46 @@ def filter_func_flux_dev(name: str) -> bool:
     return pattern.match(name) is not None
 
 
+def filter_func_ltx2_vae(name: str) -> bool:
+    """Filter function for LTX-2 VAE decoder layers that should NOT be quantized.
+
+    Only keeps conv1/conv2 inside resnet blocks within up_blocks.
+    Disables everything else: conv_in, conv_out, conv_shortcut, upsamplers,
+    per_channel_statistics, timestep layers, etc.
+    """
+    # Pattern matching conv1/conv2 inside up_blocks at any nesting depth
+    # e.g. up_blocks.0.conv1, up_blocks.2.res_blocks.0.conv2
+    keep_pattern = re.compile(r".*up_blocks\.\d+\.(?:res_blocks\.\d+\.)?conv[12](?:\.|$)")
+    # If the layer matches the keep pattern, do NOT disable it (return False)
+    if keep_pattern.match(name):
+        return False
+    # Disable everything else
+    return True
+
+
+def filter_func_wan_vae(name: str) -> bool:
+    """Filter function for WAN 2.2 VAE layers that should NOT be quantized.
+
+    Only keeps conv1/conv2 inside WanResidualBlock resnets within
+    encoder.down_blocks, encoder.mid_block, decoder.mid_block, decoder.up_blocks.
+    Disables: conv_in, conv_out, conv_shortcut, upsamplers, downsamplers (resample),
+    time_conv, quant_conv, post_quant_conv, attention layers (to_qkv, proj).
+    """
+    # Keep conv1/conv2 in resnet blocks:
+    #   14B flat:  encoder.down_blocks.N.conv1/conv2
+    #   5B nested: encoder.down_blocks.N.resnets.M.conv1/conv2
+    #   Both:      encoder/decoder.mid_block.resnets.N.conv1/conv2
+    #   Both:      decoder.up_blocks.N.resnets.M.conv1/conv2
+    keep_pattern = re.compile(
+        r".*(down_blocks\.\d+\.(?:resnets\.\d+\.)?conv[12]"
+        r"|mid_block\.resnets\.\d+\.conv[12]"
+        r"|up_blocks\.\d+\.resnets\.\d+\.conv[12])(?:\.|$)"
+    )
+    if keep_pattern.match(name):
+        return False
+    return True
+
+
 def filter_func_wan_video(name: str) -> bool:
     """Filter function specifically for WAN-Video models."""
     pattern = re.compile(

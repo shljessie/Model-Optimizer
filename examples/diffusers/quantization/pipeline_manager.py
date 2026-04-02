@@ -41,6 +41,7 @@ class PipelineManager:
         self.pipe: Any | None = None
         self.pipe_upsample: LTXLatentUpsamplePipeline | None = None  # For LTX-Video upsampling
         self._transformer: torch.nn.Module | None = None
+        self._video_decoder: torch.nn.Module | None = None
 
     @staticmethod
     def create_pipeline_from(
@@ -158,10 +159,10 @@ class PipelineManager:
 
     def get_backbone(self) -> torch.nn.Module:
         """
-        Get the backbone model (transformer or UNet).
+        Get the backbone model(s).
 
         Returns:
-            Backbone model module
+            Single module if one backbone, ModuleList if multiple.
         """
         if not self.pipe:
             raise RuntimeError("Pipeline not created. Call create_pipeline() first.")
@@ -173,24 +174,24 @@ class PipelineManager:
 
     def iter_backbones(self) -> Iterator[tuple[str, torch.nn.Module]]:
         """
-        Yield backbone modules by name, based on a backbone spec.
-
-        Yields:
-            (backbone_name, module) pairs
+        Yield (backbone_name, module) pairs.
         """
         if not self.pipe:
             raise RuntimeError("Pipeline not created. Call create_pipeline() first.")
 
         names = list(self.config.backbone)
-
-        if self.config.model_type == ModelType.LTX2:
-            self._ensure_ltx2_transformer_cached()
-            name = names[0] if names else "transformer"
-            yield name, self._transformer
-            return
-
         if not names:
             raise RuntimeError("No backbone names provided.")
+
+        if self.config.model_type == ModelType.LTX2:
+            for name in names:
+                if name == "video_decoder":
+                    self._ensure_ltx2_video_decoder_cached()
+                    yield name, self._video_decoder
+                else:
+                    self._ensure_ltx2_transformer_cached()
+                    yield name, self._transformer
+            return
 
         for name in names:
             module = getattr(self.pipe, name, None)
@@ -205,6 +206,16 @@ class PipelineManager:
             transformer = self.pipe.stage_1_model_ledger.transformer()
             self.pipe.stage_1_model_ledger.transformer = lambda: transformer
             self._transformer = transformer
+
+    def _ensure_ltx2_video_decoder_cached(self) -> None:
+        if not self.pipe:
+            raise RuntimeError("Pipeline not created. Call create_pipeline() first.")
+        if self._video_decoder is None:
+            video_decoder = self.pipe.stage_1_model_ledger.video_decoder()
+            # Cache it so subsequent calls return the same (quantized) instance
+            self.pipe.stage_1_model_ledger.video_decoder = lambda: video_decoder
+            self.pipe.stage_2_model_ledger.video_decoder = lambda: video_decoder
+            self._video_decoder = video_decoder
 
     def _create_ltx2_pipeline(self) -> Any:
         params = dict(self.config.extra_params)
@@ -228,7 +239,6 @@ class PipelineManager:
             raise ValueError("Missing required extra_param: gemma_root.")
 
         from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-        from ltx_core.quantization import QuantizationPolicy
         from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
         distilled_lora = [
@@ -244,13 +254,12 @@ class PipelineManager:
             "spatial_upsampler_path": str(spatial_upsampler_path),
             "gemma_root": str(gemma_root),
             "loras": [],
-            "quantization": QuantizationPolicy.fp8_cast() if fp8_quantization else None,
+            "fp8transformer": bool(fp8_quantization),
         }
         pipeline_kwargs.update(params)
         return TI2VidTwoStagesPipeline(**pipeline_kwargs)
 
     def print_quant_summary(self):
-        backbone_pairs = list(self.iter_backbones())
-        for name, backbone in backbone_pairs:
+        for name, backbone in self.iter_backbones():
             self.logger.info(f"{name} quantization info:")
             mtq.print_quant_summary(backbone)

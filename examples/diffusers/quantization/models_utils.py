@@ -33,7 +33,9 @@ except ImportError:
 from utils import (
     filter_func_default,
     filter_func_flux_dev,
+    filter_func_ltx2_vae,
     filter_func_ltx_video,
+    filter_func_wan_vae,
     filter_func_wan_video,
 )
 
@@ -54,31 +56,43 @@ class ModelType(str, Enum):
     WAN22_T2V_5b = "wan2.2-t2v-5b"
 
 
-def get_model_filter_func(model_type: ModelType) -> Callable[[str], bool]:
+# Filter function registry keyed by (ModelType, backbone_name).
+# Backbone names like "unet", "transformer" are DiT/UNet backbones;
+# "video_decoder", "vae" etc. are VAE backbones.
+_FILTER_FUNC_REGISTRY: dict[tuple[ModelType, str], Callable[[str], bool]] = {
+    # ---- DiT / UNet backbones ----
+    (ModelType.SDXL_BASE, "unet"): filter_func_default,
+    (ModelType.SDXL_TURBO, "unet"): filter_func_default,
+    (ModelType.SD3_MEDIUM, "transformer"): filter_func_default,
+    (ModelType.SD35_MEDIUM, "transformer"): filter_func_default,
+    (ModelType.FLUX_DEV, "transformer"): filter_func_flux_dev,
+    (ModelType.FLUX_SCHNELL, "transformer"): filter_func_default,
+    (ModelType.FLUX2_DEV, "transformer"): filter_func_flux_dev,
+    (ModelType.LTX_VIDEO_DEV, "transformer"): filter_func_ltx_video,
+    (ModelType.LTX2, "transformer"): filter_func_ltx_video,
+    (ModelType.WAN22_T2V_14b, "transformer"): filter_func_wan_video,
+    (ModelType.WAN22_T2V_5b, "transformer"): filter_func_wan_video,
+    # ---- VAE backbones ----
+    (ModelType.LTX2, "video_decoder"): filter_func_ltx2_vae,
+    (ModelType.WAN22_T2V_14b, "vae"): filter_func_wan_vae,
+    (ModelType.WAN22_T2V_5b, "vae"): filter_func_wan_vae,
+}
+
+
+def get_model_filter_func(
+    model_type: ModelType, backbone_name: str = "transformer"
+) -> Callable[[str], bool]:
     """
-    Get the appropriate filter function for a given model type.
+    Get the appropriate filter function for a given model type and backbone.
 
     Args:
         model_type: The model type enum
+        backbone_name: Name of the backbone being quantized (e.g., "transformer", "video_decoder")
 
     Returns:
-        A filter function appropriate for the model type
+        A filter function appropriate for the model type and backbone
     """
-    filter_func_map = {
-        ModelType.FLUX_DEV: filter_func_flux_dev,
-        ModelType.FLUX_SCHNELL: filter_func_default,
-        ModelType.FLUX2_DEV: filter_func_flux_dev,
-        ModelType.SDXL_BASE: filter_func_default,
-        ModelType.SDXL_TURBO: filter_func_default,
-        ModelType.SD3_MEDIUM: filter_func_default,
-        ModelType.SD35_MEDIUM: filter_func_default,
-        ModelType.LTX_VIDEO_DEV: filter_func_ltx_video,
-        ModelType.LTX2: filter_func_ltx_video,
-        ModelType.WAN22_T2V_14b: filter_func_wan_video,
-        ModelType.WAN22_T2V_5b: filter_func_wan_video,
-    }
-
-    return filter_func_map.get(model_type, filter_func_default)
+    return _FILTER_FUNC_REGISTRY.get((model_type, backbone_name), filter_func_default)
 
 
 # Model registry with HuggingFace model IDs
