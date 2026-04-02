@@ -456,8 +456,10 @@ class HFDFlashModel(DFlashModel):
             self.dflash_config.hidden_size // self.dflash_config.num_attention_heads,
         )
         self.dflash_config.block_size = self.dflash_block_size
+        # Default to sdpa, matching SpecForge's DFlashDraftModel(Qwen3PreTrainedModel)
+        # which resolves to sdpa via post_init()
         if self.dflash_config._attn_implementation is None:
-            self.dflash_config._attn_implementation = "eager"
+            self.dflash_config._attn_implementation = "sdpa"
 
         # Target layer IDs
         num_target_layers = base_config.num_hidden_layers
