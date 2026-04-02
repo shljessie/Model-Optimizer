@@ -57,7 +57,7 @@ hf auth login
 
    We can also set the target size of the resulting model using `num_params = 7_000_000_000`. This will be used as an upper bound for the number of parameters of the model.
 
-3. Run the puzzletron pipeline.
+3. Run the puzzletron pipeline. Bypass distillation is **disabled by default**; to enable it see [BYPASS.md](./BYPASS.md).
 
    ```bash
    torchrun --nproc_per_node 2 examples/puzzletron/main.py --config examples/puzzletron/configs/llama-3_1-8B_pruneffn_memory/llama-3_1-8B_pruneffn_memory.yaml 2>&1 | tee ./log.txt | grep "Puzzletron Progress"
@@ -132,88 +132,11 @@ hf auth login
 
 ## Bypass Distillation (Local Knowledge Distillation)
 
-Bypass distillation (also called Blockwise Local Distillation or BLD) is an **optional** pipeline stage that trains alternative transformer block configurations using per-block knowledge distillation from the teacher model. It significantly improves the quality of aggressively compressed models by producing better "puzzle pieces" for the MIP solver.
-
-### When to use bypass
-
-Bypass distillation is only necessary for **aggressive compression**. For mild pruning (e.g., reducing FFN intermediate size by less than 25%), weight-initialization-based pruning alone usually produces good results. Use bypass when:
-
-- **Heavy FFN pruning**: the target `intermediate_size` is ≤ 1/8 of the teacher's width.
-  For example, on Llama-3.1-8B (teacher `intermediate_size=14336`), run bypass for sizes ≤ 1792.
-  For milder reductions (e.g., to 3072 = ~21%), bypass improves quality but may not be essential.
-- **KV head compression**: the number of `num_key_value_heads` is being significantly reduced
-  (e.g., from 8 to 2 or fewer). The AverageKV initialization provides a good starting point,
-  but bypass distillation recovers additional accuracy.
-
-### Time cost
-
-Bypass distillation is a full training loop — plan for several hours per configuration when
-using ~1B training tokens on H100 GPUs. Total time scales with `len(bypass.configs) × training_tokens`.
-This is comparable to lightweight fine-tuning.
-
-### Sequential execution
-
-Each entry in `bypass.configs` trains **sequentially** (one config at a time). There is no
-parallelism across configurations — if you have 3 configs, they run one after the other within
-a single pipeline invocation. Distribute across different jobs if time is a constraint.
-
-### Configuration
-
-Add a `bypass` section to your config YAML (or include `bypass/defaults.yaml` via Hydra defaults).
-Key parameters:
-
-| Parameter | Description | Default |
-|---|---|---|
-| `training.learning_rate` | Initial learning rate | `1e-4` |
-| `training.training_tokens` | Total training tokens per config | `1e+9` (1B) |
-| `training.micro_batch_size` | Batch size per step | `2` |
-| `data.block_size` | Sequence length | `512` |
-| `model_factory.gqa_init_mode` | KV head init strategy (`AverageKV`, `RandomKV`) | `AverageKV` |
-| `model_factory.mlp_init_mode` | FFN init strategy (`Truncate`, `PruneByActivationsLog`) | `Truncate` |
-| `model_factory.keys_to_learn` | Which params to train (`subblock_ffn`, `subblock_attention`, `entire_block`) | computed |
-| `configs` | List of configurations to train sequentially | — |
-
-### Training multiple configurations
-
-Use `bypass.configs` to train multiple block configurations in a single run. Each entry
-overrides `model.model_config_overrides` and optionally `model_factory.keys_to_learn`:
-
-```yaml
-bypass:
-  training:
-    training_tokens: 1e+9   # ~1B tokens per config
-  configs:
-    - model_config_overrides:
-        ffn:
-          - intermediate_size: 1792  # ~1/8 of 14336 — bypass strongly recommended
-        attention:
-          - num_key_value_heads: 8
-      keys_to_learn: subblock_ffn
-    - model_config_overrides:
-        ffn:
-          - intermediate_size: 3584  # ~1/4 of 14336 — bypass optional but helpful
-        attention:
-          - num_key_value_heads: 8
-      keys_to_learn: subblock_ffn
-```
-
-Trained checkpoints are automatically symlinked into `$PUZZLE_DIR/ckpts/` where the replacement
-library builder picks them up in the next pipeline stage.
-
-### Weights & Biases logging
-
-Enable W&B to track per-block distillation loss and validation metrics during training:
-
-```yaml
-bypass:
-  wandb_log: true
-  wandb:
-    project: my-puzzletron-project
-    entity: my-org
-```
-
-W&B logs iteration number, token count, learning rate, and per-block loss at each log interval.
-If `wandb` is not installed, logging is silently disabled and training continues normally.
+Bypass distillation (Blockwise Local Distillation / BLD) is an **optional** pipeline stage that
+trains compressed block configurations via per-block knowledge distillation from the teacher.
+It is most beneficial for aggressive compression targets (heavy FFN pruning, KV head reduction,
+or full attention removal). See **[BYPASS.md](./BYPASS.md)** for the full guide, including
+decoupled vs. coupled BLD, auto-config generation, and a worked example with attention no-op blocks.
 
 ## Re-run MIP Search with different constraints
 

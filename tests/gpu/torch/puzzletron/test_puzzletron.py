@@ -90,7 +90,7 @@ def _test_puzzletron_multiprocess_job(
 ):
     # Set seed BEFORE dist.setup() to ensure reproducibility across all processes
     set_seed(SEED)
-    dist.setup(timeout=timedelta(10))
+    dist.setup(timeout=timedelta(minutes=10))
 
     # Setup the test model and data.
     puzzle_dir, hf_checkpoint_path, dataset_path = setup_test_model_and_data(
@@ -220,8 +220,7 @@ def _assert_score_pruning_activations(puzzle_dir: Path, hf_model_name: str):
         # failing: the layer-count check above already confirms the distribution is right.
         if len(expected) == total_layers:
             global_start = sum(
-                max(2, size) // size + (1 if r < max(2, size) % size else 0)
-                for r in range(rank)
+                max(2, size) // size + (1 if r < max(2, size) % size else 0) for r in range(rank)
             )
             for i, layer_name in enumerate(layer_names):
                 layer_data = pruning_scores[layer_name]
@@ -231,14 +230,20 @@ def _assert_score_pruning_activations(puzzle_dir: Path, hf_model_name: str):
                     layer_data["channels_importance_ascending"][0].item()
                     == expected[global_idx]["channels"]
                 )
-    else:
-        # Print values for new models - update EXPECTED_PRUNING_VALUES with these
-        # Note: values depend on GPU count (num_hidden_layers = max(2, size)).
+    # Print values for new models — update EXPECTED_PRUNING_VALUES with these.
+    # Only rank 0 prints: it loads all rank_*.pth files and outputs the complete
+    # ordered table so multi-GPU runs produce a single, uninterleaved snippet.
+    elif rank == 0:
         total_layers = max(2, size)
+        scores_dir = (puzzle_dir / rank_filepath).parent
+        all_scores: dict = {}
+        for r in range(size):
+            all_scores.update(torch.load(scores_dir / f"rank_{r}.pth"))
+        sorted_names = sorted(all_scores.keys())
         print(f"\n=== PRUNING VALUES for {hf_model_name} (num_layers={total_layers}) ===")
         print(f'"{hf_model_name}": [')
-        for layer_name in layer_names:
-            layer_data = pruning_scores[layer_name]
+        for layer_name in sorted_names:
+            layer_data = all_scores[layer_name]
             score = layer_data["score"][0].item()
             channels = layer_data["channels_importance_ascending"][0].item()
             print(f'    {{"score": {score}, "channels": {channels}}},')

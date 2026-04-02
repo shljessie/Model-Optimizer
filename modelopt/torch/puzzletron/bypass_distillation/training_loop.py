@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,16 +33,20 @@ from pathlib import Path
 from statistics import mean
 from typing import Optional, Type, cast
 
-import datasets
 import torch
 import torch.distributed
 import transformers
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data.dataloader import DataLoader
-from transformers import AutoTokenizer, PreTrainedTokenizerBase, PretrainedConfig
+from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
 
+import datasets
+import modelopt.torch.puzzletron.bypass_distillation.stitched_model_factory as stitched_model_factory_module
 import modelopt.torch.utils.distributed as dist
-from modelopt.torch.puzzletron.anymodel.model_descriptor import ModelDescriptor, ModelDescriptorFactory
+from modelopt.torch.puzzletron.anymodel.model_descriptor import (
+    ModelDescriptor,
+    ModelDescriptorFactory,
+)
 from modelopt.torch.puzzletron.sewing_kit import InputArgs, StitchedModule
 from modelopt.torch.puzzletron.sewing_kit.utils import fake_tensor
 from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import load_model_config
@@ -51,12 +55,15 @@ from modelopt.torch.puzzletron.tools.robust_json import json_load
 from modelopt.torch.puzzletron.tools.sharded_checkpoint_utils import load_and_shard_model
 from modelopt.torch.puzzletron.utils.parsing import format_global_config, format_stitched_losses
 
-from .bypass_checkpoint_utils import find_latest_run_dir, load_local_state, save_bypass_checkpoint
+from .bypass_checkpoint_utils import (
+    find_best_run_dir,
+    find_latest_run_dir,
+    load_local_state,
+    save_bypass_checkpoint,
+)
 from .bypass_utils import get_distributed_modules_ownership, set_experiment_dir, set_experiment_id
 from .data_classes import GlobalRank, IterNum, IterStatistics, LocalTrainingStats, TimeToSaveSignal
 from .stitched_model_factory import StitchedModuleDescriptor, StitchedModulesProcessOwnership
-
-import modelopt.torch.puzzletron.bypass_distillation.stitched_model_factory as stitched_model_factory_module
 
 time_start = time.time()
 
@@ -77,6 +84,115 @@ def launch_bypass_distillation(hydra_cfg: DictConfig) -> None:
         hydra_cfg: The full Hydra configuration with a 'bypass' section.
     """
     configs_list = hydra_cfg.bypass.get("configs", None)
+
+    # Auto-generate bypass configs from the pruning search space.
+    # bypass.auto_configs.ffn: true  → one subblock_ffn config per size in
+    #                                   pruning.intermediate_size_list (teacher size excluded)
+    # bypass.auto_configs.attn: true → one subblock_attention config per kv-head count derived
+    #                                   from pruning.n_heads_in_group_list (teacher kv excluded)
+    # bypass.auto_configs.blk: true  → cartesian product of ALL FFN sizes × ALL kv-head counts,
+    #                                   trained as entire_block; only the single combination where
+    #                                   both FFN and attention equal teacher values is skipped
+    if not configs_list:
+        auto_cfg = hydra_cfg.bypass.get("auto_configs", {}) or {}
+
+        do_ffn = bool(auto_cfg.get("ffn", False))
+        do_attn = bool(auto_cfg.get("attn", False))
+        do_blk = bool(auto_cfg.get("blk", False))
+
+        if do_ffn or do_attn or do_blk:
+            from transformers import AutoConfig as HFAutoConfig
+
+            teacher_hf_cfg = HFAutoConfig.from_pretrained(str(hydra_cfg.teacher_dir))
+            teacher_intermediate_size = getattr(teacher_hf_cfg, "intermediate_size", None)
+            teacher_num_heads = getattr(teacher_hf_cfg, "num_attention_heads", None)
+            teacher_kv_heads = (
+                getattr(teacher_hf_cfg, "num_key_value_heads", None) or teacher_num_heads
+            )
+
+            # ffn_sizes: pruning candidates with teacher size removed (for ffn/blk)
+            ffn_sizes: list = []
+            # all_ffn_sizes: full list including teacher size (for blk cartesian)
+            all_ffn_sizes: list = []
+            # kv_heads_list: pruning candidates with teacher kv removed (for attn/blk)
+            kv_heads_list: list = []
+            # all_kv_heads: full list including teacher kv (for blk cartesian)
+            all_kv_heads: list = []
+
+            if do_ffn or do_blk:
+                all_ffn_sizes = list(hydra_cfg.pruning.intermediate_size_list)
+                ffn_sizes = [s for s in all_ffn_sizes if s != teacher_intermediate_size]
+                if len(ffn_sizes) < len(all_ffn_sizes):
+                    mprint(
+                        f"auto_configs: skipped teacher intermediate_size={teacher_intermediate_size}"
+                        f" from ffn configs"
+                    )
+
+            if do_attn or do_blk:
+                n_heads_in_group_list = list(hydra_cfg.pruning.get("n_heads_in_group_list") or [])
+                if n_heads_in_group_list and teacher_num_heads:
+                    all_kv_heads = [teacher_num_heads // n for n in n_heads_in_group_list]
+                    kv_heads_list = [kv for kv in all_kv_heads if kv != teacher_kv_heads]
+                    if len(kv_heads_list) < len(all_kv_heads):
+                        mprint(
+                            f"auto_configs: skipped teacher kv_heads={teacher_kv_heads}"
+                            f" from attn configs"
+                        )
+                elif do_attn or do_blk:
+                    mprint(
+                        "auto_configs: pruning.n_heads_in_group_list is not set; "
+                        "skipping attn/blk auto_configs"
+                    )
+
+            generated: list = []
+
+            if do_ffn:
+                for size in ffn_sizes:
+                    generated.append(
+                        {
+                            "model_config_overrides": {
+                                "ffn": [{"intermediate_size": size}],
+                                "attention": [{"num_key_value_heads": None}],
+                            },
+                            "keys_to_learn": "subblock_ffn",
+                        }
+                    )
+
+            if do_attn:
+                for kv in kv_heads_list:
+                    generated.append(
+                        {
+                            "model_config_overrides": {
+                                "ffn": [{"intermediate_size": None}],
+                                "attention": [{"num_key_value_heads": kv}],
+                            },
+                            "keys_to_learn": "subblock_attention",
+                        }
+                    )
+
+            if do_blk and all_ffn_sizes and all_kv_heads:
+                # Cartesian product of ALL sizes × ALL kv_heads.
+                # Only skip the one combination where both equal the teacher's values.
+                for size in all_ffn_sizes:
+                    for kv in all_kv_heads:
+                        if size == teacher_intermediate_size and kv == teacher_kv_heads:
+                            continue
+                        generated.append(
+                            {
+                                "model_config_overrides": {
+                                    "ffn": [{"intermediate_size": size}],
+                                    "attention": [{"num_key_value_heads": kv}],
+                                },
+                                "keys_to_learn": "entire_block",
+                            }
+                        )
+
+            if generated:
+                mprint(
+                    f"auto_configs: generated {len(generated)} bypass configs "
+                    f"(ffn={do_ffn}, attn={do_attn}, blk={do_blk})"
+                )
+                configs_list = OmegaConf.create(generated)
 
     if not configs_list:
         # Single config mode — run once with whatever is in bypass already
@@ -102,6 +218,19 @@ def launch_bypass_distillation(hydra_cfg: DictConfig) -> None:
         hydra_cfg.bypass.token_count = 0
         hydra_cfg.bypass.best_val_loss = 1e9
         hydra_cfg.bypass.training.clipping_count = 0
+
+        # Resolve the experiment dir now (cheap) to check for a completion marker.
+        # set_experiment_id checks experiment_id is None before overwriting, so the
+        # call inside run_bypassed_training becomes a no-op.
+        set_experiment_id(hydra_cfg)
+        set_experiment_dir(hydra_cfg)
+        training_marker = Path(hydra_cfg.bypass.experiment_dir) / "training.complete"
+        if training_marker.exists():
+            mprint(
+                f"Bypass config {i + 1}/{len(configs_list)}: already completed "
+                f"({hydra_cfg.bypass.experiment_id}), skipping"
+            )
+            continue
 
         run_bypassed_training(hydra_cfg)
         mprint(f"Bypass config {i + 1}/{len(configs_list)} completed")
@@ -143,9 +272,7 @@ def train(
     ]
     # Indices of stitched modules owned by the current process
     owned_stitched_module_indices = [
-        i
-        for i, owner in enumerate(stitched_modules_process_ownership)
-        if owner == dist.rank()
+        i for i, owner in enumerate(stitched_modules_process_ownership) if owner == dist.rank()
     ]
     mprint(f"{global_stitched_modules_count=}")
     mprint(f"{num_stitched_modules_per_process=}")
@@ -165,7 +292,7 @@ def train(
             descriptor=descriptor,
             model=student_model,
             stitched_module_descriptors=stitched_module_descriptors,
-            checkpoint_dir=cfg.bypass.experiment_dir / subdir_name,
+            checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
             reference_checkpoint_dir=cfg.teacher_dir,
         )
 
@@ -185,9 +312,7 @@ def train(
     min_owned_index = min(owned_stitched_module_indices)
     max_owned_index = max(owned_stitched_module_indices)
     prev_rank: Optional[int] = (
-        None
-        if min_owned_index - 1 < 0
-        else stitched_modules_process_ownership[min_owned_index - 1]
+        None if min_owned_index - 1 < 0 else stitched_modules_process_ownership[min_owned_index - 1]
     )
     next_rank: Optional[int] = (
         None
@@ -197,7 +322,9 @@ def train(
 
     torch.cuda.synchronize()
 
-    mprint(f'Grad scaling status: {"enabled" if cfg.bypass.training.use_grad_scaling else "disabled"}')
+    mprint(
+        f"Grad scaling status: {'enabled' if cfg.bypass.training.use_grad_scaling else 'disabled'}"
+    )
 
     train_iterator = iter(train_dataloader)
 
@@ -231,7 +358,7 @@ def train(
                     descriptor=descriptor,
                     model=student_model,
                     stitched_module_descriptors=stitched_module_descriptors,
-                    checkpoint_dir=cfg.bypass.experiment_dir / subdir_name,
+                    checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
                     reference_checkpoint_dir=cfg.teacher_dir,
                 )
 
@@ -293,13 +420,11 @@ def train(
                 del stitched_module_output
                 grad_scaler.scale(stitched_module_loss).backward()
             else:
-                stitched_module_loss = torch.full(
-                    [1], fill_value=torch.nan, dtype=torch.float32
-                )
+                stitched_module_loss = torch.full([1], fill_value=torch.nan, dtype=torch.float32)
 
-            iter_stitched_module_losses[stitched_module_name] = (
-                stitched_module_loss.to("cpu").item()
-            )
+            iter_stitched_module_losses[stitched_module_name] = stitched_module_loss.to(
+                "cpu"
+            ).item()
 
             del stitched_module_loss
 
@@ -332,9 +457,7 @@ def train(
                                     clip_value=grad_clip,
                                 )
                         else:
-                            raise RuntimeError(
-                                f"Invalid {cfg.bypass.training.grad_clip_type}"
-                            )
+                            raise RuntimeError(f"Invalid {cfg.bypass.training.grad_clip_type}")
 
                     assert grad_scaler is not None
                     grad_scaler.step(optimizer)
@@ -378,7 +501,10 @@ def train(
         if dist.is_master():
             if cfg.bypass.model.model_overrides.save_interval_seconds is not None:
                 time_now = time.time()
-                if time_now - time_last_save >= cfg.bypass.model.model_overrides.save_interval_seconds:
+                if (
+                    time_now - time_last_save
+                    >= cfg.bypass.model.model_overrides.save_interval_seconds
+                ):
                     mprint(
                         f"Time to save! {cfg.bypass.model.model_overrides.save_interval_seconds=}, "
                         f"{time_last_save=}, {time_now=}"
@@ -412,9 +538,7 @@ def train(
                     for name, loss in losses.items():
                         losses_by_name[name].append(loss)
 
-                losses_by_name_avg = {
-                    name: mean(losses) for name, losses in losses_by_name.items()
-                }
+                losses_by_name_avg = {name: mean(losses) for name, losses in losses_by_name.items()}
 
                 # Update best losses tracking
                 for name, current_loss in losses_by_name_avg.items():
@@ -499,13 +623,11 @@ def train(
                         descriptor=descriptor,
                         model=student_model,
                         stitched_module_descriptors=stitched_module_descriptors,
-                        checkpoint_dir=cfg.bypass.experiment_dir / subdir_name,
+                        checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
                         reference_checkpoint_dir=cfg.teacher_dir,
                     )
                     if cfg.bypass.kill_after_first_save:
-                        raise RuntimeError(
-                            "Done saving checkpoint, kill_after_first_save=True"
-                        )
+                        raise RuntimeError("Done saving checkpoint, kill_after_first_save=True")
 
         # Checkpoint saving (step-based or time-based)
         if not is_accumulating and (
@@ -533,20 +655,16 @@ def train(
                     descriptor=descriptor,
                     model=student_model,
                     stitched_module_descriptors=stitched_module_descriptors,
-                    checkpoint_dir=cfg.bypass.experiment_dir / subdir_name,
+                    checkpoint_dir=Path(cfg.bypass.experiment_dir) / subdir_name,
                     reference_checkpoint_dir=cfg.teacher_dir,
                 )
 
                 if cfg.bypass.kill_after_first_save:
                     dist.barrier()
-                    raise RuntimeError(
-                        "Done saving checkpoint, kill_after_first_save=True"
-                    )
+                    raise RuntimeError("Done saving checkpoint, kill_after_first_save=True")
 
                 if cfg.bypass.model.model_overrides.delete_old_checkpoints and dist.is_master():
-                    existing_ckpt_paths = list(
-                        Path(cfg.bypass.experiment_dir).glob("iter-*")
-                    )
+                    existing_ckpt_paths = list(Path(cfg.bypass.experiment_dir).glob("iter-*"))
                     for old_ckpt_path in existing_ckpt_paths:
                         if old_ckpt_path.name != subdir_name:
                             shutil.rmtree(str(old_ckpt_path))
@@ -664,7 +782,7 @@ def run_bypassed_training(cfg: DictConfig):
         if cfg.bypass.training.warmup_steps is None:
             cfg.bypass.training.warmup_steps = 0
 
-        mprint(f'\n{format_global_config(cfg.bypass, "Bypass Configurations")}')
+        mprint(f"\n{format_global_config(cfg.bypass, 'Bypass Configurations')}")
         mprint(f"Max token count:  {cfg.bypass.training.max_token_count:,}")
 
         seed = cfg.bypass.seed
@@ -672,15 +790,13 @@ def run_bypassed_training(cfg: DictConfig):
 
         tokenizer = AutoTokenizer.from_pretrained(
             cfg.teacher_dir,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             token=True,
         )
 
         assert teacher_model_config is not None
 
-        mprint(
-            f"Load and shard model with: {owned_block_indexes=}, {cfg.teacher_dir=}"
-        )
+        mprint(f"Load and shard model with: {owned_block_indexes=}, {cfg.teacher_dir=}")
         teacher_model = load_and_shard_model(
             descriptor=descriptor,
             checkpoint_path=cfg.teacher_dir,
@@ -703,7 +819,9 @@ def run_bypassed_training(cfg: DictConfig):
         else:
             max_eval_samples = cfg.bypass.data.max_eval_samples
 
-        load_dataset_fn = load_streaming_fn if not cfg.bypass.data.load_from_disk else load_from_disk_fn
+        load_dataset_fn = (
+            load_streaming_fn if not cfg.bypass.data.load_from_disk else load_from_disk_fn
+        )
 
         train_dataloader = create_train_dataloader(
             seed=seed,
@@ -737,9 +855,7 @@ def run_bypassed_training(cfg: DictConfig):
                 load_dataset_fn=load_dataset_fn,
                 dataset_name=cfg.bypass.data.val_dataset_name,
                 keep_in_memory=cfg.bypass.data.keep_in_memory,
-                source_datasets_to_discard=cfg.bypass.get(
-                    "source_datasets_to_discard", tuple()
-                ),
+                source_datasets_to_discard=cfg.bypass.get("source_datasets_to_discard", tuple()),
                 bos_rate=cfg.bypass.data.bos_rate,
             )
 
@@ -777,9 +893,7 @@ def run_bypassed_training(cfg: DictConfig):
         elif cfg.bypass.find_last_ckpt_for_resume:
             _ckpt_dir = find_latest_run_dir(run_parent_dir=cfg.bypass.experiment_dir)
             if _ckpt_dir is None:
-                mprint(
-                    "Couldn't find any run dir for resume, assuming this is the first job"
-                )
+                mprint("Couldn't find any run dir for resume, assuming this is the first job")
             else:
                 mprint(
                     f"`cfg.bypass.find_last_ckpt_for_resume` is True. "
@@ -855,9 +969,11 @@ def run_bypassed_training(cfg: DictConfig):
         dist.barrier()
         mprint("Performing dummy runs on stitched modules:")
         torch.cuda.synchronize()
-        with torch.no_grad(), torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16
-        ), torch.device(device):
+        with (
+            torch.no_grad(),
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16),
+            torch.device(device),
+        ):
             input_ids = torch.ones(
                 (cfg.bypass.training.micro_batch_size, cfg.bypass.data.block_size),
                 dtype=torch.long,
@@ -922,20 +1038,40 @@ def run_bypassed_training(cfg: DictConfig):
 
     except Exception as e:
         print(traceback.format_exc(), file=sys.stderr)
-        if isinstance(e, SystemExit):
-            raise e
-        else:
-            sys.exit(1)
+        raise
 
     dist.barrier()
     if dist.is_master():
         mprint("Realizing bypass checkpoints")
         realize_bypass_checkpoints(cfg)
+        training_marker = Path(cfg.bypass.experiment_dir) / "training.complete"
+        training_marker.touch()
 
 
 def realize_bypass_checkpoints(cfg: DictConfig):
-    """Create symlinks from bypass checkpoint directories to the ckpts directory."""
-    checkpoint_dir = Path(cfg.bypass.experiment_dir) / "latest"
+    """Create symlinks from bypass checkpoint directories to the ckpts directory.
+
+    When ``cfg.bypass.realize_best_or_latest == "best"``, the symlink points to the
+    highest-iteration ``best-iter-*`` checkpoint (saved when validation loss improved).
+    Falls back to ``latest`` if no best checkpoint exists (e.g. validation was disabled).
+    When set to ``"latest"``, always uses the ``latest`` symlink (last saved checkpoint).
+    """
+    experiment_dir = Path(cfg.bypass.experiment_dir)
+    realize_mode = cfg.bypass.get("realize_best_or_latest", "latest")
+
+    checkpoint_dir_str = None
+    if realize_mode == "best":
+        checkpoint_dir_str = find_best_run_dir(experiment_dir)
+        if checkpoint_dir_str is None:
+            mprint(
+                "realize_best_or_latest='best' but no best checkpoint found "
+                "(validation may be disabled); falling back to latest"
+            )
+    if checkpoint_dir_str is None:
+        checkpoint_dir = experiment_dir / "latest"
+    else:
+        checkpoint_dir = Path(checkpoint_dir_str)
+
     if not checkpoint_dir.exists():
         mprint(f"Could not find checkpoint directory: {checkpoint_dir}")
         return

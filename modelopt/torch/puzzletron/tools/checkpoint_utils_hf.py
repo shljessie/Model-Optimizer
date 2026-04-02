@@ -376,6 +376,9 @@ def _copy_auto_map_code_files(model_config: PretrainedConfig, checkpoint_dir: Pa
     PretrainedConfig.save_pretrained() only copies the config class's own source file.
     This copies any additional files (e.g., modeling_*.py) also referenced in auto_map,
     which are required when loading the checkpoint with trust_remote_code=True.
+
+    Models that need this include NemotronH (nvidia/Minitron-*) and other models that
+    ship custom modeling code via the HuggingFace auto_map mechanism.
     """
     if not hasattr(model_config, "auto_map"):
         return
@@ -385,9 +388,15 @@ def _copy_auto_map_code_files(model_config: PretrainedConfig, checkpoint_dir: Pa
     # module file that needs to be present alongside config.json.
     source_dir = Path(inspect.getfile(type(model_config))).parent
 
-    module_files = {
-        f"{class_ref.split('.')[0]}.py" for class_ref in model_config.auto_map.values()
-    }
+    module_files = set()
+    for class_ref in model_config.auto_map.values():
+        # Normalize: lists/tuples carry multiple class refs — take the first
+        if isinstance(class_ref, (list, tuple)):
+            class_ref = class_ref[0]
+        # Strip repo qualifier: "repo_id--module.ClassName" → "module.ClassName"
+        if "--" in class_ref:
+            class_ref = class_ref.split("--", 1)[1]
+        module_files.add(f"{class_ref.split('.')[0]}.py")
 
     for filename in module_files:
         src = source_dir / filename

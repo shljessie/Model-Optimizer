@@ -139,21 +139,32 @@ def convert_puzzletron_model(model: nn.Module, config: PuzzletronConfig) -> Conv
     has_bypass = hydra_cfg.get("bypass", None) is not None
     N = _total_steps(hydra_cfg)
 
+    puzzle_dir = Path(config.puzzle_dir)
+
     # Step 2: Convert HuggingFace model to Puzzletron heterogeneous format
     hf_ckpt_teacher_dir = "ckpts/teacher"  # TODO: make it configurable
-    teacher_dir = Path(config.puzzle_dir) / hf_ckpt_teacher_dir
+    teacher_dir = puzzle_dir / hf_ckpt_teacher_dir
+    convert_marker = puzzle_dir / "convert.complete"
     if dist.is_master():
-        if (teacher_dir / "config.json").exists():
-            mprint(f"Puzzletron Progress 2/{N}: teacher checkpoint already exists, skipping conversion")
+        # Check durable marker first; fall back to artifact existence for backward compat
+        already_done = convert_marker.exists() or (teacher_dir / "config.json").exists()
+        if already_done:
+            mprint(
+                f"Puzzletron Progress 2/{N}: teacher checkpoint already exists, skipping conversion"
+            )
         else:
-            mprint(f"Puzzletron Progress 2/{N}: converting model to Puzzletron heterogeneous format (single-gpu)")
+            mprint(
+                f"Puzzletron Progress 2/{N}: converting model to Puzzletron heterogeneous format (single-gpu)"
+            )
 
             # Get descriptor and converter from the hydra config
             descriptor_name = hydra_cfg.descriptor
             descriptor = ModelDescriptorFactory.get(descriptor_name)
             converter = ConverterFactory.get(descriptor_name)
 
-            # Auto-download from HuggingFace if path doesn't exist locally
+            # Auto-download from HuggingFace if path doesn't exist locally.
+            # input_model_path is only used on rank 0 (conversion is single-process);
+            # other ranks wait at the dist.barrier() below and never read this variable.
             input_model_path = config.input_model_path
             if not Path(input_model_path).exists():
                 from huggingface_hub import snapshot_download
@@ -174,25 +185,44 @@ def convert_puzzletron_model(model: nn.Module, config: PuzzletronConfig) -> Conv
                 input_dir=Path(input_model_path),
                 output_dir=teacher_dir,
             )
+            convert_marker.touch()
     dist.barrier()
 
     # Step 3: Score pruning activations (distributed processing)
     activations_log_dir = Path(hydra_cfg.pruning.activations_log_dir)
-    if activations_log_dir.exists() and any(activations_log_dir.glob("rank_*.pth")):
-        mprint(f"Puzzletron Progress 3/{N}: pruning activation scores already exist, skipping scoring")
+    score_marker = puzzle_dir / "score_activations.complete"
+    # Check durable marker first; fall back to artifact existence for backward compat
+    already_scored = score_marker.exists() or (
+        activations_log_dir.exists() and any(activations_log_dir.glob("rank_*.pth"))
+    )
+    if already_scored:
+        mprint(
+            f"Puzzletron Progress 3/{N}: pruning activation scores already exist, skipping scoring"
+        )
         dist.barrier()
     else:
         mprint(f"Puzzletron Progress 3/{N}: scoring pruning activations (multi-gpu)")
         score_pruning_activations.launch_score_activations(hydra_cfg)
+        if dist.is_master():
+            score_marker.touch()
+        dist.barrier()
 
     # Step 4: Prune the model and save pruned checkpoints (single process)
     pruned_ckpts_dir = Path(hydra_cfg.pruning.pruned_ckpts_output_dir)
+    prune_marker = puzzle_dir / "prune.complete"
     if dist.is_master():
-        if pruned_ckpts_dir.exists() and any(pruned_ckpts_dir.iterdir()):
+        # Check durable marker first; fall back to artifact existence for backward compat
+        already_pruned = prune_marker.exists() or (
+            pruned_ckpts_dir.exists() and any(pruned_ckpts_dir.iterdir())
+        )
+        if already_pruned:
             mprint(f"Puzzletron Progress 4/{N}: pruned checkpoints already exist, skipping pruning")
         else:
-            mprint(f"Puzzletron Progress 4/{N}: pruning the model and saving pruned checkpoints (single-gpu)")
+            mprint(
+                f"Puzzletron Progress 4/{N}: pruning the model and saving pruned checkpoints (single-gpu)"
+            )
             pruning_ckpts.launch_prune_ckpt(hydra_cfg)
+            prune_marker.touch()
     dist.barrier()
 
     # Step 5: Bypass distillation (optional, distributed processing)
@@ -276,14 +306,19 @@ class PuzzletronSearcher(BaseSearcher):
         # Without bypass: library=5, scoring=6, mip=7  (out of 8)
         library_step = 6 if has_bypass else 5
         scoring_step = 7 if has_bypass else 6
-        mip_step     = 8 if has_bypass else 7
+        mip_step = 8 if has_bypass else 7
 
         # Build replacement library and subblock statistics (single process)
         puzzle_dir = Path(self.model.puzzle_dir)
         replacement_library_path = puzzle_dir / "replacement_library.json"
         subblock_stats_path = puzzle_dir / hydra_cfg.calc_subblock_stats.subblock_stats_filename
+        library_marker = puzzle_dir / "library.complete"
         if dist.is_master():
-            if replacement_library_path.exists() and subblock_stats_path.exists():
+            # Check durable marker first; fall back to artifact existence for backward compat
+            already_built = library_marker.exists() or (
+                replacement_library_path.exists() and subblock_stats_path.exists()
+            )
+            if already_built:
                 mprint(
                     f"Puzzletron Progress {library_step}/{N}: replacement library and subblock stats already exist, skipping"
                 )
@@ -292,6 +327,7 @@ class PuzzletronSearcher(BaseSearcher):
                     f"Puzzletron Progress {library_step}/{N}: building replacement library and subblock statistics (single-gpu)"
                 )
                 build_library_and_stats.launch_build_library_and_stats(hydra_cfg)
+                library_marker.touch()
         dist.barrier()
 
         # Calculate one block scores (distributed processing)

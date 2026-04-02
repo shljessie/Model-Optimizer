@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,8 +61,8 @@ TEACHER_INTERMEDIATE_SIZE = 512
 TEACHER_NUM_KV_HEADS = 8
 
 # Pruned sizes used in tests
-PRUNED_INTERMEDIATE_SIZE = 256   # half of teacher
-PRUNED_NUM_KV_HEADS = 4          # half of teacher
+PRUNED_INTERMEDIATE_SIZE = 256  # half of teacher
+PRUNED_NUM_KV_HEADS = 4  # half of teacher
 
 # Training budget: 128 tokens / (64 block * 1 mbs) = 2 steps — completes fast
 TRAINING_TOKENS = 128
@@ -72,6 +72,7 @@ BLOCK_SIZE = 64
 # ---------------------------------------------------------------------------
 # Helper: build the bypass config dict for injection into hydra_cfg
 # ---------------------------------------------------------------------------
+
 
 def _make_bypass_cfg_dict(
     intermediate_size: int = PRUNED_INTERMEDIATE_SIZE,
@@ -191,6 +192,7 @@ def _make_bypass_cfg_dict(
 # Helper: load hydra config and run pruning prerequisites
 # ---------------------------------------------------------------------------
 
+
 def _setup_hydra_cfg_and_pruning(
     project_root_path: Path,
     tmp_path: Path,
@@ -210,15 +212,13 @@ def _setup_hydra_cfg_and_pruning(
     5. Run ``pruning_ckpts`` (rank 0 only) then barrier.
     """
     set_seed(SEED)
-    dist.setup(timeout=timedelta(10))
+    dist.setup(timeout=timedelta(minutes=10))
 
     puzzle_dir, hf_checkpoint_path, dataset_path = setup_test_model_and_data(
         project_root_path, tmp_path, rank, HF_MODEL_NAME
     )
 
-    hydra_config_dir = str(
-        project_root_path / "tests/gpu/torch/puzzletron/resources/configs"
-    )
+    hydra_config_dir = str(project_root_path / "tests/gpu/torch/puzzletron/resources/configs")
 
     # Step 0: Convert HF checkpoint to AnyModel/DeciLM format.
     if rank == 0:
@@ -260,8 +260,8 @@ def test_bypass_ffn_pruning(project_root_path: Path, tmp_path: Path):
     """Bypass distillation with FFN pruned to intermediate_size=256.
 
     Verifies that after training:
-    - The experiment directory ``bypass/bypass_runs/bypass_ffn_256_heads_4`` exists.
-    - A symlink ``ckpts/bypass_ffn_256_heads_4`` pointing into the experiment dir
+    - The experiment directory ``bypass/bypass_runs/bypass_ffn256_kv4`` exists.
+    - A symlink ``ckpts/bypass_ffn256_kv4`` pointing into the experiment dir
       is created by ``realize_bypass_checkpoints``.
     """
     spawn_multiprocess_job(
@@ -286,7 +286,7 @@ def _test_bypass_ffn_pruning_job(
     )
 
     # Inject bypass config: prune FFN to 256, keep num_key_value_heads=4.
-    # experiment_id will be set dynamically to "bypass_ffn_256_heads_4".
+    # experiment_id will be set dynamically to "bypass_ffn256_kv4".
     bypass_cfg_dict = _make_bypass_cfg_dict(
         intermediate_size=PRUNED_INTERMEDIATE_SIZE,
         num_key_value_heads=PRUNED_NUM_KV_HEADS,
@@ -297,9 +297,7 @@ def _test_bypass_ffn_pruning_job(
     dist.barrier()
 
     if rank == 0:
-        expected_experiment_id = (
-            f"bypass_ffn_{PRUNED_INTERMEDIATE_SIZE}_heads_{PRUNED_NUM_KV_HEADS}"
-        )
+        expected_experiment_id = f"bypass_ffn{PRUNED_INTERMEDIATE_SIZE}_kv{PRUNED_NUM_KV_HEADS}"
         experiment_dir = puzzle_dir / "bypass/bypass_runs" / expected_experiment_id
         ckpt_symlink = puzzle_dir / "ckpts" / expected_experiment_id
 
@@ -321,7 +319,7 @@ def _test_bypass_ffn_pruning_job(
 def test_bypass_kv_head_compression(project_root_path: Path, tmp_path: Path):
     """Bypass distillation with KV heads reduced from 8 to 4, FFN kept at 512.
 
-    The experiment_id is ``bypass_ffn_512_heads_4`` because both FFN and attention
+    The experiment_id is ``bypass_ffn512_kv4`` because both FFN and attention
     overrides are specified (FFN is kept at teacher size, attention is halved).
     """
     spawn_multiprocess_job(
@@ -346,7 +344,7 @@ def _test_bypass_kv_head_compression_job(
     )
 
     # Keep FFN at teacher size (512) but halve KV heads (8 -> 4).
-    # experiment_id will be "bypass_ffn_512_heads_4".
+    # experiment_id will be "bypass_ffn512_kv4".
     bypass_cfg_dict = _make_bypass_cfg_dict(
         intermediate_size=TEACHER_INTERMEDIATE_SIZE,
         num_key_value_heads=PRUNED_NUM_KV_HEADS,
@@ -357,9 +355,7 @@ def _test_bypass_kv_head_compression_job(
     dist.barrier()
 
     if rank == 0:
-        expected_experiment_id = (
-            f"bypass_ffn_{TEACHER_INTERMEDIATE_SIZE}_heads_{PRUNED_NUM_KV_HEADS}"
-        )
+        expected_experiment_id = f"bypass_ffn{TEACHER_INTERMEDIATE_SIZE}_kv{PRUNED_NUM_KV_HEADS}"
         experiment_dir = puzzle_dir / "bypass/bypass_runs" / expected_experiment_id
         ckpt_symlink = puzzle_dir / "ckpts" / expected_experiment_id
 
@@ -381,8 +377,8 @@ def _test_bypass_kv_head_compression_job(
 def test_bypass_multi_config_sequential(project_root_path: Path, tmp_path: Path):
     """Bypass distillation sweep: two configs run sequentially via bypass.configs list.
 
-    Config 0: FFN=256, heads=4  -> experiment_id ``bypass_ffn_256_heads_4``
-    Config 1: FFN=512, heads=4  -> experiment_id ``bypass_ffn_512_heads_4``
+    Config 0: FFN=256, heads=4  -> experiment_id ``bypass_ffn256_kv4``
+    Config 1: FFN=512, heads=4  -> experiment_id ``bypass_ffn512_kv4``
 
     Both symlinks must exist after the sweep completes.
     """
@@ -436,8 +432,8 @@ def _test_bypass_multi_config_sequential_job(
 
     if rank == 0:
         expected_ids = [
-            f"bypass_ffn_{PRUNED_INTERMEDIATE_SIZE}_heads_{PRUNED_NUM_KV_HEADS}",
-            f"bypass_ffn_{TEACHER_INTERMEDIATE_SIZE}_heads_{PRUNED_NUM_KV_HEADS}",
+            f"bypass_ffn{PRUNED_INTERMEDIATE_SIZE}_kv{PRUNED_NUM_KV_HEADS}",
+            f"bypass_ffn{TEACHER_INTERMEDIATE_SIZE}_kv{PRUNED_NUM_KV_HEADS}",
         ]
         for experiment_id in expected_ids:
             experiment_dir = puzzle_dir / "bypass/bypass_runs" / experiment_id
@@ -496,9 +492,7 @@ def _test_bypass_checkpoint_contents_job(
     dist.barrier()
 
     if rank == 0:
-        expected_experiment_id = (
-            f"bypass_ffn_{PRUNED_INTERMEDIATE_SIZE}_heads_{PRUNED_NUM_KV_HEADS}"
-        )
+        expected_experiment_id = f"bypass_ffn{PRUNED_INTERMEDIATE_SIZE}_kv{PRUNED_NUM_KV_HEADS}"
         ckpt_symlink = puzzle_dir / "ckpts" / expected_experiment_id
 
         assert ckpt_symlink.exists() or ckpt_symlink.is_symlink(), (
@@ -522,5 +516,83 @@ def _test_bypass_checkpoint_contents_job(
 
     print(
         f"PYTEST SUMMARY: test_bypass_checkpoint_contents completed successfully. "
+        f"Puzzle directory: {puzzle_dir}"
+    )
+
+
+def test_bypass_checkpoint_resume(project_root_path: Path, tmp_path: Path):
+    """Verify that bypass distillation can resume from a previous checkpoint.
+
+    Runs bypass twice with the same experiment_id:
+    - First run: completes 2 training steps and saves a checkpoint.
+    - Second run: uses ``find_last_ckpt_for_resume=True`` to auto-detect the
+      saved checkpoint and resume from it.
+
+    Checks that the second run finds the checkpoint, loads it without error,
+    and produces a final checkpoint in the experiment directory.
+    """
+    spawn_multiprocess_job(
+        size=torch.cuda.device_count(),
+        job=partial(
+            _test_bypass_checkpoint_resume_job,
+            project_root_path,
+            tmp_path,
+        ),
+        backend="nccl",
+    )
+
+
+def _test_bypass_checkpoint_resume_job(
+    project_root_path: Path,
+    tmp_path: Path,
+    rank: int,
+    size: int,
+):
+    puzzle_dir, dataset_path, hydra_cfg = _setup_hydra_cfg_and_pruning(
+        project_root_path, tmp_path, rank, size
+    )
+
+    bypass_cfg_dict = _make_bypass_cfg_dict(
+        intermediate_size=PRUNED_INTERMEDIATE_SIZE,
+        num_key_value_heads=PRUNED_NUM_KV_HEADS,
+    )
+    OmegaConf.update(hydra_cfg, "bypass", bypass_cfg_dict, merge=True)
+
+    # --- First run: train and save a checkpoint. ---
+    bypass_distillation.launch_bypass_distillation(hydra_cfg)
+    dist.barrier()
+
+    expected_experiment_id = f"bypass_ffn{PRUNED_INTERMEDIATE_SIZE}_kv{PRUNED_NUM_KV_HEADS}"
+    experiment_dir = puzzle_dir / "bypass/bypass_runs" / expected_experiment_id
+
+    if rank == 0:
+        assert experiment_dir.exists(), (
+            f"First run should have created experiment directory: {experiment_dir}"
+        )
+
+    dist.barrier()
+
+    # --- Second run: resume from the checkpoint saved by the first run. ---
+    # Reset training counters so the second run starts fresh in terms of config,
+    # but find_last_ckpt_for_resume=True causes it to reload the saved state.
+    OmegaConf.update(hydra_cfg, "bypass.iter_num", 1, merge=True)
+    OmegaConf.update(hydra_cfg, "bypass.step_num", 1, merge=True)
+    OmegaConf.update(hydra_cfg, "bypass.token_count", 0, merge=True)
+    OmegaConf.update(hydra_cfg, "bypass.find_last_ckpt_for_resume", True, merge=True)
+
+    # The second run should not raise; it should load the checkpoint and complete.
+    bypass_distillation.launch_bypass_distillation(hydra_cfg)
+    dist.barrier()
+
+    if rank == 0:
+        ckpt_symlink = puzzle_dir / "ckpts" / expected_experiment_id
+        assert ckpt_symlink.exists() or ckpt_symlink.is_symlink(), (
+            f"Second (resume) run should produce a checkpoint symlink: {ckpt_symlink}"
+        )
+
+    dist.cleanup()
+
+    print(
+        f"PYTEST SUMMARY: test_bypass_checkpoint_resume completed successfully. "
         f"Puzzle directory: {puzzle_dir}"
     )

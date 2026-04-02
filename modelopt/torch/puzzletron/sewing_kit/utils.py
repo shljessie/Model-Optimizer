@@ -43,6 +43,8 @@ from torch import Tensor
 from torch._subclasses import FakeTensor, FakeTensorMode
 from typing_extensions import override
 
+from modelopt.torch.puzzletron.tools.kd_model import normalized_mse_loss
+
 Fn = TypeVar("Fn", bound=Callable)
 
 
@@ -438,23 +440,6 @@ def _get_group_kwarg_if_necessary() -> dict:
 Reduction = Literal["none", "mean", "sum"]
 
 
-def normalized_mse_loss(
-    input: torch.Tensor,
-    target: torch.Tensor,
-    reduction: Reduction = "mean",
-    epsilon: float = 1e-6,
-) -> torch.Tensor:
-    """MSE loss normalized by the variance of the target.
-
-    Dividing by the target's self-MSE makes the loss scale-invariant, so that
-    blocks whose activations have large magnitude do not dominate training.
-    """
-    loss = F.mse_loss(input, target, reduction=reduction) / F.mse_loss(
-        target, torch.zeros_like(target) + epsilon, reduction=reduction
-    )
-    return loss
-
-
 def vectorwise_normalized_mse_loss(
     input: torch.Tensor,
     target: torch.Tensor,
@@ -476,8 +461,8 @@ def batched_normalized_mse_loss(
     rather than normalizing across the full batch.
     """
     norm_dims = list(set(range(input.ndim)) - set(batch_dims))
-    norm_of_target_vectors = F.mse_loss(
-        target, torch.zeros_like(target) + epsilon, reduction="none"
-    ).mean(norm_dims)
+    norm_of_target_vectors = (
+        F.mse_loss(target, torch.zeros_like(target), reduction="none").mean(norm_dims) + epsilon
+    )
     loss = F.mse_loss(input, target, reduction="none").mean(norm_dims) / norm_of_target_vectors
     return loss.mean()

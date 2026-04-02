@@ -35,8 +35,8 @@ def normalized_mse_loss(
     reduction: Literal["none", "mean", "sum"] = "mean",
     epsilon: float = 1e-6,
 ) -> Tensor:
-    loss = F.mse_loss(input, target, reduction=reduction) / F.mse_loss(
-        target, torch.zeros_like(target) + epsilon, reduction=reduction
+    loss = F.mse_loss(input, target, reduction=reduction) / (
+        F.mse_loss(target, torch.zeros_like(target), reduction=reduction) + epsilon
     )
     return loss
 

@@ -19,7 +19,6 @@ from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Protocol, TypeVar
 
-import datasets
 import torch
 import torch.distributed
 from accelerate import Accelerator
@@ -28,6 +27,7 @@ from torch.utils.data._utils.collate import collate, default_collate_fn_map
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+import datasets
 from modelopt.torch.puzzletron.tools.logger import mprint
 from modelopt.torch.puzzletron.utils.data.dataset import ConstantLengthDataset
 

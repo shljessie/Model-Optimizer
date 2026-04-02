@@ -488,8 +488,15 @@ def create_child_state_dict(
     )
 
     # Phase 3: Copy remaining keys from original model
+    # Only copy keys that exist in the student model (expected_keys_and_shapes).
+    # When a layer type is removed (e.g. attention no_op), the teacher may have
+    # model-specific sub-parameters (e.g. Qwen3 q_norm/k_norm) that are absent
+    # from the student; those keys must be skipped here rather than copied and
+    # later rejected by the verification assert.
     copy_start_time = time.time()
-    keys_to_copy_from_orig_model = set(keys.values()) - ignored_keys
+    keys_to_copy_from_orig_model = (set(keys.values()) - ignored_keys) & set(
+        expected_keys_and_shapes.keys()
+    )
     for key in keys_to_copy_from_orig_model:
         # Memory optimization: avoid unnecessary copies
         tensor = original_state_dict[key]

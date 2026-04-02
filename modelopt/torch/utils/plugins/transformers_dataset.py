@@ -21,9 +21,9 @@ import os
 
 import torch
 import transformers
-from datasets import load_dataset
 from transformers.trainer_pt_utils import LabelSmoother
 
+from datasets import load_dataset
 from modelopt.torch.utils import print_rank_0
 
 REMOVE_THINK_CHAT_TEMPLATE = (

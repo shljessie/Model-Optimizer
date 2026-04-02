@@ -1,0 +1,164 @@
+# @package bypass
+# Bypass Distillation Configuration (shared across all models)
+# This config defines parameters for blockwise local distillation (BLD),
+# which trains alternative transformer block configurations using per-block
+# knowledge distillation from a teacher model.
+
+# Runtime Configuration
+dtype: "bf16"  # Model precision: bf16 for efficiency, fp32 for stability
+seed: 42       # Random seed for reproducibility
+
+# Experiment Tracking
+experiment_id:      # Unique identifier for this experiment. Will be dynamically set
+experiment_dir:     # Directory for this experiment. Will be dynamically set
+iter_num: 1         # Current iteration number
+step_num: 1         # Current step number within iteration
+token_count: 0      # Token count tracker (auto-updated during training)
+
+# Data Configuration
+data:
+  data_column: "messages"
+  block_size: 512                   # Sequence length (tokens per sample)
+  bos_rate: 0.5
+  fim_rate: 0
+  fim_spm_rate: 0
+  source_datasets_to_discard: []
+  load_from_disk: true              # Load preprocessed data from disk or from stream
+  keep_in_memory: false
+  val_dataset_name: valid
+  max_eval_samples: 4
+  eval_samples_per_process: null    # Samples per GPU during distributed eval (auto if null)
+  shuffle_train_data_seed: ${random_int:0,9999}     # Seed for shuffling train data
+
+# Training Configuration
+training:
+  learning_rate: 1e-4               # Initial learning rate
+  training_tokens: 1e+5             # Total training tokens (10K = sanity check; set 1e+9 for production)
+  micro_batch_size: 2
+  val_micro_batch_size: 1
+  warmup_ratio: 0.05
+  warmup_steps: ${warmup_steps:${.training_tokens},${..data.block_size},${.micro_batch_size},${.warmup_ratio}}
+  min_lr_factor: 1e-5
+  grad_accumulation_steps: 1
+  skip_first_batches: 0
+  weight_decay: 0.1
+  decay_lr: true
+  beta1: 0.9
+  beta2: 0.95
+  use_grad_scaling: false
+  grad_clip: 1.0
+  grad_clip_type: norm
+  clipping_count: 0
+  log_interval: 5
+  eval_interval: 5
+
+# Model Loading Configuration
+resume_checkpoint_path: null    # Path to resume training from checkpoint
+find_last_ckpt_for_resume: True   # Auto-resume by finding last checkpoint (bool)
+parameter_count: null
+init_checkpoint_path: null      # Path to initialize weights from
+
+model:
+  student_weights_dtype: "bf16"   # Student model weight precision
+
+  model_overrides:
+    delete_old_checkpoints: true     # Clean up old checkpoints to save disk space
+    save_interval_seconds: 12900     # Save checkpoint every ~3.5 hours
+    save_interval: 1e+9              # Save checkpoint every 1B steps (effectively disabled)
+    save_checkpoint_when_done: true  # Save final checkpoint when training completes
+
+  # Architecture modifications for student model (used when not overridden by configs: or auto_configs)
+  model_config_overrides:
+    ffn:
+      - intermediate_size:
+        no_op:                  # Disable FFN entirely (true/false)
+    attention:
+      - num_key_value_heads:       # Number of kv-heads (for GQA)
+        no_op:                  # Disable attention entirely (true/false)
+
+# Model Factory Configuration - Controls student model creation and initialization
+model_factory:
+  factory: bypass_factory_fn                 # Unified factory supporting all layer types
+  block_loss_func: normalized_mse_loss      # Loss function for comparing teacher/student blocks
+  gqa_init_mode: AverageKV                  # How to initialize K/V heads in GQA
+  mlp_init_mode: Truncate                   # MLP initialization
+  mlp_init_config:                          # Configuration for MLP initialization (if needed)
+    activations_log_dir: null               # Directory with activation statistics
+  linear_init_mode: FromTeacher             # How to initialize linear layers
+  submodule_for_loss_calculation: null      # Specific submodule for loss calc
+  keys_to_learn: null                       # What parameters to train. Computed dynamically.
+
+# Validation Configuration
+disable_initial_validate: false
+validate_teacher_model: true
+validate_student_model: true
+disable_validation: false
+best_val_loss: 1e+9
+
+# Performance Optimization
+compile: false                     # Use PyTorch compilation
+disable_fa2: false                 # Disable Flash Attention 2 (false = use FA2 if available)
+teacher_model_load_on_cpu: false
+
+# Checkpoint Management
+save_checkpoint_before_training: false   # Save initial checkpoint before training
+disable_checkpoint_save: false          # Disable all checkpoint saving
+save_best_ckpt: false                   # Save checkpoint when validation improves (disabled by default)
+kill_after_first_save: false           # Exit after first checkpoint save (for testing)
+realize_best_or_latest: "best"
+
+wandb_log: false
+wandb:
+  project:
+  entity:
+
+# Auto-generate bypass configurations from the pruning search space.
+# Reads pruning.intermediate_size_list (for ffn/blk) and pruning.n_heads_in_group_list (for attn/blk).
+# Teacher-size subblocks are excluded automatically (no redundant training).
+#
+#   attn: true  — one subblock_attention config per pruned kv-head count (teacher kv excluded)
+#   ffn: true   — one subblock_ffn config per pruned FFN size (teacher size excluded)
+#   blk: true   — cartesian product of ALL FFN sizes × ALL kv-head counts (entire_block);
+#                 only the single pair (teacher_ffn, teacher_kv) is skipped
+#
+# Set to false or omit any key to disable that variant.
+auto_configs:
+  attn: false   # train attention-only bypass for each KV-head reduction in pruning.n_heads_in_group_list
+  ffn: true   # uncomment to train FFN-only bypass for each size in pruning.intermediate_size_list
+  blk: false   # uncomment to train coupled (full-block) bypass for all (FFN size × KV heads) pairs
+
+# Explicit bypass configurations (alternative to auto_configs).
+# Each entry overrides model.model_config_overrides and optionally model_factory.keys_to_learn.
+# If both auto_configs and configs are set, configs takes precedence.
+# Uncomment and adapt one of the examples below:
+#
+# # Example: two FFN sizes, attention unchanged (decoupled FFN-only BLD)
+# configs:
+#   - model_config_overrides:
+#       ffn:
+#         - intermediate_size: 3072
+#         - intermediate_size: 5888
+#       attention:
+#         - num_key_value_heads: null
+#     keys_to_learn: subblock_ffn
+#
+# # Example: two KV-head reductions, FFN unchanged (decoupled attention-only BLD)
+# configs:
+#   - model_config_overrides:
+#       ffn:
+#         - intermediate_size: null
+#       attention:
+#         - num_key_value_heads: 4
+#         - num_key_value_heads: 2
+#     keys_to_learn: subblock_attention
+#
+# # Example: two coupled block configs (FFN + attention together, entire_block BLD)
+# configs:
+#   - model_config_overrides:
+#       ffn:
+#         - intermediate_size: 3072
+#         - intermediate_size: 5888
+#       attention:
+#         - num_key_value_heads: 4
+#         - num_key_value_heads: 2
+#     keys_to_learn: entire_block

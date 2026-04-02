@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,11 +31,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 import modelopt.torch.utils.distributed as dist
 from modelopt.torch.puzzletron.anymodel.model_descriptor import ModelDescriptor
-from modelopt.torch.puzzletron.pruning.pruning_utils import (
-    GQAInitMode,
-    LinearInitMode,
-    MlpInitMode,
-)
+from modelopt.torch.puzzletron.pruning.pruning_utils import GQAInitMode, LinearInitMode, MlpInitMode
 from modelopt.torch.puzzletron.sewing_kit import (
     ExternalTarget,
     FunctionTarget,
@@ -94,7 +90,9 @@ def default_factory(
 
 StitchedModelFactoryFn = type(default_factory)
 
-_SUBBLOCK_KEYS_TO_LEARN = frozenset({"subblock_ffn", "subblock_attention", "subblock_mamba", "entire_block"})
+_SUBBLOCK_KEYS_TO_LEARN = frozenset(
+    {"subblock_ffn", "subblock_attention", "subblock_mamba", "entire_block"}
+)
 
 
 def _set_keys_to_learn(
@@ -128,9 +126,7 @@ def _set_keys_to_learn(
                 if group_name.endswith("_attention")
             ]
             ffn_group_names = [
-                group_name
-                for group_name in weight_groups.keys()
-                if group_name.endswith("_ffn")
+                group_name for group_name in weight_groups.keys() if group_name.endswith("_ffn")
             ]
             if keys_to_learn == "subblock_attention":
                 group_names = attn_group_names
@@ -196,67 +192,27 @@ def _get_all_non_persistent_buffers_set(module: torch.nn.Module) -> set[str]:
     return all_non_persistent
 
 
-def bypass_factory_fn(
+def _initialize_student_model(
     teacher_model: PreTrainedModel,
     descriptor: Type[ModelDescriptor],
     cfg: DictConfig,
-    model_blocks_process_ownership: Sequence[int],
+    owned_block_indexes: set[int],
+    device: torch.device,
     student_model: Optional[PreTrainedModel] = None,
-) -> tuple[
-    PreTrainedModel,
-    StitchedModule,
-    StitchedModule,
-    StitchedModule,
-    OrderedDict[str, StitchedModuleDescriptor],
-    PretrainedConfig,
-]:
-    """Unified factory function for bypass (blockwise local) distillation.
+) -> tuple[PreTrainedModel, PretrainedConfig]:
+    """Create and initialise the student model, or extract its config if already provided.
 
-    Handles all layer types — FFN, attention (GQA/MHA), MoE experts, Mamba, and whole blocks —
-    through a single pipeline. Behavior is driven entirely by ``model_factory`` config fields:
-
-    - ``mlp_init_mode``: how student FFN / MoE weights are initialised
-        - ``"ExpertRemoval"``: select top-N experts from teacher (MoE models)
-        - ``"Truncate"`` / ``"PruneByActivationsLog"``: prune FFN channels (dense models)
-        - ``"CopyAsIs"``: copy weights unchanged (attention-only or Mamba-only runs)
-    - ``gqa_init_mode``: how attention KV heads are initialised (optional, default ``AverageKV``).
-      Irrelevant when the student has the same number of KV heads as the teacher.
-    - ``keys_to_learn``: which parameters to train.
-      Accepts ``"subblock_ffn"``, ``"subblock_attention"``, ``"entire_block"``, or a regex string.
-
-    The stitching logic (pipeline-parallel per-block KD) is architecture-agnostic and unchanged
-    regardless of which layer type is being distilled.
-
-    Args:
-        teacher_model: The teacher model to use for stitching.
-        descriptor: Model descriptor for layer naming and pruning mixin lookup.
-        cfg: The bypass config section.
-        model_blocks_process_ownership: Ownership mapping of model blocks to process ranks.
-        student_model: Optionally provided pre-built student model (skips initialisation).
+    If *student_model* is ``None``, builds a new model from *teacher_model* using the
+    pruning / init modes specified in *cfg* and loads the derived weight state dict.
+    Otherwise simply returns the provided model together with its config.
 
     Returns:
-        Tuple of (student_model, teacher_stitched, teacher_val_stitched,
-                  student_val_stitched, stitched_module_descriptors, student_config)
+        Tuple of ``(student_model, student_model_config)``.
     """
-    device = torch.device(f"cuda:{dist.local_rank()}")
-    model_config_overrides = cfg.model.model_config_overrides
-
-    block_loss_func = {
-        "normalized_mse_loss": normalized_mse_loss,
-        "vectorwise_normalized_mse_loss": vectorwise_normalized_mse_loss,
-        "batched_normalized_mse_loss": batched_normalized_mse_loss,
-    }[cfg.model_factory.block_loss_func]
-    mprint(f"{block_loss_func.__name__=}")
-
-    owned_block_indexes = set(
-        block_index
-        for block_index, owner_rank in enumerate(model_blocks_process_ownership)
-        if owner_rank == dist.rank()
-    )
-
-    # Initialize student_model
     if student_model is None:
         mprint("Creating student model from teacher model")
+
+        model_config_overrides = cfg.model.model_config_overrides
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             if isinstance(model_config_overrides, DictConfig):
@@ -270,7 +226,7 @@ def bypass_factory_fn(
             )
             student_model_config.use_cache = False
 
-            mprint(f"Student model config:\n {format_block_configs(student_model_config)}")
+            mprint(f"Student block configs:\n {format_block_configs(student_model_config)}")
 
             from modelopt.torch.puzzletron.anymodel.puzzformer import deci_x_patcher
 
@@ -339,9 +295,7 @@ def bypass_factory_fn(
 
         # GQA init mode is optional: only relevant when the student has fewer KV heads than
         # the teacher. Defaults to AverageKV and is a no-op when head counts are equal.
-        gqa_init_mode = GQAInitMode(
-            cfg.model_factory.get("gqa_init_mode", GQAInitMode.AverageKV)
-        )
+        gqa_init_mode = GQAInitMode(cfg.model_factory.get("gqa_init_mode", GQAInitMode.AverageKV))
 
         student_state_dict = create_child_state_dict(
             pruning_mixin=pruning_mixin,
@@ -372,6 +326,75 @@ def bypass_factory_fn(
     else:
         mprint("Student model provided explicitly, not using teacher model to instantiate")
         student_model_config = student_model.config
+
+    return student_model, student_model_config
+
+
+def bypass_factory_fn(
+    teacher_model: PreTrainedModel,
+    descriptor: Type[ModelDescriptor],
+    cfg: DictConfig,
+    model_blocks_process_ownership: Sequence[int],
+    student_model: Optional[PreTrainedModel] = None,
+) -> tuple[
+    PreTrainedModel,
+    StitchedModule,
+    StitchedModule,
+    StitchedModule,
+    OrderedDict[str, StitchedModuleDescriptor],
+    PretrainedConfig,
+]:
+    """Unified factory function for bypass (blockwise local) distillation.
+
+    Handles all layer types — FFN, attention (GQA/MHA), MoE experts, Mamba, and whole blocks —
+    through a single pipeline. Behavior is driven entirely by ``model_factory`` config fields:
+
+    - ``mlp_init_mode``: how student FFN / MoE weights are initialised
+        - ``"ExpertRemoval"``: select top-N experts from teacher (MoE models)
+        - ``"Truncate"`` / ``"PruneByActivationsLog"``: prune FFN channels (dense models)
+        - ``"CopyAsIs"``: copy weights unchanged (attention-only or Mamba-only runs)
+    - ``gqa_init_mode``: how attention KV heads are initialised (optional, default ``AverageKV``).
+      Irrelevant when the student has the same number of KV heads as the teacher.
+    - ``keys_to_learn``: which parameters to train.
+      Accepts ``"subblock_ffn"``, ``"subblock_attention"``, ``"entire_block"``, or a regex string.
+
+    The stitching logic (pipeline-parallel per-block KD) is architecture-agnostic and unchanged
+    regardless of which layer type is being distilled.
+
+    Args:
+        teacher_model: The teacher model to use for stitching.
+        descriptor: Model descriptor for layer naming and pruning mixin lookup.
+        cfg: The bypass config section.
+        model_blocks_process_ownership: Ownership mapping of model blocks to process ranks.
+        student_model: Optionally provided pre-built student model (skips initialisation).
+
+    Returns:
+        Tuple of (student_model, teacher_stitched, teacher_val_stitched,
+                  student_val_stitched, stitched_module_descriptors, student_config)
+    """
+    device = torch.device(f"cuda:{dist.local_rank()}")
+
+    block_loss_func = {
+        "normalized_mse_loss": normalized_mse_loss,
+        "vectorwise_normalized_mse_loss": vectorwise_normalized_mse_loss,
+        "batched_normalized_mse_loss": batched_normalized_mse_loss,
+    }[cfg.model_factory.block_loss_func]
+    mprint(f"{block_loss_func.__name__=}")
+
+    owned_block_indexes = set(
+        block_index
+        for block_index, owner_rank in enumerate(model_blocks_process_ownership)
+        if owner_rank == dist.rank()
+    )
+
+    student_model, student_model_config = _initialize_student_model(
+        teacher_model=teacher_model,
+        descriptor=descriptor,
+        cfg=cfg,
+        owned_block_indexes=owned_block_indexes,
+        device=device,
+        student_model=student_model,
+    )
 
     # Set up training parameters
     lm_config = descriptor.get_language_model_config(student_model_config)
@@ -510,6 +533,12 @@ def bypass_factory_fn(
             )
             student_stitched_module_name = f"block_{global_block_index}"
             student_submodule_target = ModuleTarget("student_submodule", module)
+            # CONTRACT: block_loss_func must accept exactly two keyword arguments:
+            #   input=  (student activations) and  target=  (teacher activations).
+            # The adapters below wire activations into those kwargs via InputArgs.
+            # All built-in loss functions (normalized_mse_loss, vectorwise_normalized_mse_loss,
+            # batched_normalized_mse_loss) satisfy this contract.  If you substitute a custom
+            # block_loss_func, ensure it accepts (input=..., target=...) as keyword arguments.
             student_stitched_module = (
                 Needle()
                 .stitch(
@@ -545,11 +574,6 @@ def bypass_factory_fn(
             )
 
             assert "learning_rate" in cfg.training
-            num_trainable_params = sum(
-                p.requires_grad and submodule_name in p_name
-                for p_name, p in student_stitched_module.named_parameters()
-                if "dummy_param" not in p_name  # exclude placeholder params
-            )
             # Do NOT enable dummy params: blocks with no real trainable parameters
             # (e.g. Mamba blocks during an attention-only bypass run) should produce
             # NaN loss so they are excluded from statistics — identical to the
@@ -568,10 +592,12 @@ def bypass_factory_fn(
             }
 
             trainable_params = {
-                p_name: p
-                for p_name, p in student_module_parameters.items()
-                if p.requires_grad
+                p_name: p for p_name, p in student_module_parameters.items() if p.requires_grad
             }
+            mprint(
+                f"Block {submodule_name}: {len(trainable_params)} trainable parameter tensors "
+                f"({sum(p.numel() for p in trainable_params.values()):,} params)"
+            )
 
             optimizer = (
                 AdamW(
@@ -611,7 +637,6 @@ def bypass_factory_fn(
         stitched_module_descriptors,
         student_model_config,
     )
-
 
 
 # Backward-compatible name aliases

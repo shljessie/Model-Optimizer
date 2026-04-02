@@ -15,10 +15,10 @@
 
 import os
 
-import datasets
 import fire
 import numpy as np
 
+import datasets
 from modelopt.torch.puzzletron.tools.logger import mprint
 
 

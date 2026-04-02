@@ -24,11 +24,15 @@ This module provides utilities for:
 # mypy: ignore-errors
 
 import json
+import logging
+import math
 from pathlib import Path
 from typing import Any
 
 import torch
 from omegaconf import DictConfig
+
+_logger = logging.getLogger(__name__)
 
 
 def handle_arg_string(arg):
@@ -332,9 +336,15 @@ def format_stitched_losses(
     if not losses_dict:
         return "❌ No losses found"
 
-    import math
-
-    # Filter out nan entries — these are no-op blocks (e.g. Mamba) with no trainable parameters
+    # Filter out nan entries. NaN is expected for no-op blocks (e.g. Mamba) that have no
+    # trainable parameters. For any other block, NaN signals divergence — warn loudly.
+    nan_keys = [k for k, v in losses_dict.items() if math.isnan(v)]
+    if nan_keys:
+        _logger.warning(
+            "NaN loss detected for block(s): %s. "
+            "Expected for no-op/skipped blocks (e.g. Mamba); indicates divergence otherwise.",
+            nan_keys,
+        )
     losses_dict = {k: v for k, v in losses_dict.items() if not math.isnan(v)}
     if best_steps_dict:
         best_steps_dict = {k: v for k, v in best_steps_dict.items() if k in losses_dict}

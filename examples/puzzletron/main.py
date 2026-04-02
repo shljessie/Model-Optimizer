@@ -40,8 +40,10 @@ import modelopt.torch.nas as mtn
 import modelopt.torch.puzzletron.mip.mip_and_realize_models as mip_and_realize_models
 import modelopt.torch.puzzletron.mip.sweep as sweep
 import modelopt.torch.utils.distributed as dist
-from modelopt.torch.puzzletron.nas.plugins.puzzletron_nas_plugin import PuzzletronModel
-from modelopt.torch.puzzletron.nas.plugins.puzzletron_nas_plugin import _total_steps
+from modelopt.torch.puzzletron.nas.plugins.puzzletron_nas_plugin import (
+    PuzzletronModel,
+    _total_steps,
+)
 from modelopt.torch.puzzletron.tools.hydra_utils import (
     initialize_hydra_config_for_dir,
     register_hydra_resolvers,
@@ -75,7 +77,7 @@ def run_full_puzzletron(hydra_config_path: str):
     Args:
         config_path: Path to the YAML configuration file
     """
-    dist.setup(timeout=timedelta(10))
+    dist.setup(timeout=timedelta(minutes=10))
 
     # Register Hydra custom resolvers (needed for config resolution)
     register_hydra_resolvers()
@@ -90,9 +92,9 @@ def run_full_puzzletron(hydra_config_path: str):
         config_name=hydra_config_name,
         overrides=[],
     )
-    N = _total_steps(hydra_cfg)
+    n = _total_steps(hydra_cfg)
 
-    mprint(f"Puzzletron Progress 1/{N}: starting puzzletron pipeline")
+    mprint(f"Puzzletron Progress 1/{n}: starting puzzletron pipeline")
 
     # Convert model (convert from HF to DeciLM, score pruning activations,
     # prune the model and save pruned checkpoints)
@@ -123,7 +125,7 @@ def run_full_puzzletron(hydra_config_path: str):
     )
 
     dist.cleanup()
-    mprint(f"Puzzletron Progress {N}/{N}: puzzletron pipeline completed (multi-gpu)")
+    mprint(f"Puzzletron Progress {n}/{n}: puzzletron pipeline completed (multi-gpu)")
 
 
 def run_mip_only(hydra_config_path: str):
@@ -135,7 +137,7 @@ def run_mip_only(hydra_config_path: str):
     Args:
         hydra_config_path: Path to the YAML configuration file
     """
-    dist.setup(timeout=timedelta(10))
+    dist.setup(timeout=timedelta(minutes=10))
 
     # Register Hydra custom resolvers (needed for config resolution)
     register_hydra_resolvers()
@@ -151,20 +153,23 @@ def run_mip_only(hydra_config_path: str):
         overrides=[],
     )
 
+    n = _total_steps(hydra_cfg)
+    mip_step = n - 1
+
     # Check if sweep mode is enabled
     if hasattr(hydra_cfg.mip, "sweep") and hydra_cfg.mip.sweep.get("enabled", False):
         mprint(
-            "Puzzletron Progress 7/8: running MIP sweep for multiple compression rates (multi-gpu)"
+            f"Puzzletron Progress {mip_step}/{n}: running MIP sweep for multiple compression rates (multi-gpu)"
         )
         sweep.run_mip_sweep(hydra_cfg)
     else:
         # mip_and_realize_models (distributed processing)
         # TODO: How to make it part of mnt.search() api, similarly to run_full_puzzletron() API
-        mprint("Puzzletron Progress 7/8: running MIP and realizing models (multi-gpu)")
+        mprint(f"Puzzletron Progress {mip_step}/{n}: running MIP and realizing models (multi-gpu)")
         mip_and_realize_models.launch_mip_and_realize_model(hydra_cfg)
 
     dist.cleanup()
-    mprint("Puzzletron Progress 8/8: puzzletron pipeline completed (multi-gpu)")
+    mprint(f"Puzzletron Progress {n}/{n}: puzzletron pipeline completed (multi-gpu)")
 
 
 def main():

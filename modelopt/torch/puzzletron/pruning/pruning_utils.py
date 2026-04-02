@@ -137,6 +137,7 @@ def _init_mlp_module(
     elif mlp_init_mode in (
         MlpInitMode.Truncate,
         MlpInitMode.PruneByActivationsLog,
+        MlpInitMode.MoEChannelPruning,
     ):
         assert original_intermediate_size >= new_intermediate_size, (
             f"({original_intermediate_size=}) < ({new_intermediate_size=}), can't be truncated."
@@ -150,7 +151,7 @@ def _init_mlp_module(
             )
             mlp_module_weight = truncated_weight
 
-        elif mlp_init_mode == MlpInitMode.PruneByActivationsLog:
+        elif mlp_init_mode in (MlpInitMode.PruneByActivationsLog, MlpInitMode.MoEChannelPruning):
             if pruned_filters is None:
                 filter_importance = _load_activations_log(
                     mlp_init_config, module_name=f"{mlp_prefix}.down_proj"

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +59,28 @@ def find_latest_run_dir(run_parent_dir: Union[str, Path]) -> str | None:
     return None
 
 
+def find_best_run_dir(run_parent_dir: Union[str, Path]) -> str | None:
+    """Find the best-validation checkpoint directory within a run parent directory.
+
+    Returns the ``best-iter-*`` directory with the highest iteration number that has a
+    ``saving_completed`` marker.  Falls back to ``None`` when no best checkpoint exists
+    (e.g. validation was disabled or no improvement was recorded).
+    """
+    run_parent_dir = Path(run_parent_dir)
+    best_dirs = [d for d in run_parent_dir.glob("best-iter-*") if d.is_dir()]
+    if not best_dirs:
+        return None
+
+    def get_iter_num(d):
+        m = re.search(r"iter-(\d+)", d.name)
+        return int(m.group(1)) if m else 0
+
+    for best_dir in sorted(best_dirs, key=get_iter_num, reverse=True):
+        if (best_dir / "saving_completed").exists():
+            return str(best_dir)
+    return None
+
+
 def load_local_state(
     stitched_module_descriptors: OrderedDict[str, StitchedModuleDescriptor],
     checkpoint_path: str | Path,
@@ -82,10 +104,10 @@ def load_local_state(
         state_dict_path = load_dir / "stitched" / f"{stitched_module_name}.state_dict.pth"
         if verbose:
             mprint(f"Loading state dict for module {stitched_module_name} from {state_dict_path}")
-        loaded_state_dict = torch.load(state_dict_path, map_location=device)
-        loaded_state_dict = {**stitched_module.state_dict(), **loaded_state_dict}
-
-        stitched_module.load_state_dict(loaded_state_dict)
+        loaded_state_dict = torch.load(state_dict_path, map_location=device, weights_only=True)
+        # Use strict=False so parameters absent in the checkpoint (e.g. newly added adapter
+        # keys not yet saved) retain their initialised values rather than raising an error.
+        stitched_module.load_state_dict(loaded_state_dict, strict=False)
         del loaded_state_dict
 
         if optimizer is not None:
@@ -96,7 +118,9 @@ def load_local_state(
                 mprint(
                     f"Loading optimizer state for module {stitched_module_name} from {optimizer_state_path}"
                 )
-            loaded_optimizer_state = torch.load(optimizer_state_path, map_location=device)
+            loaded_optimizer_state = torch.load(
+                optimizer_state_path, map_location=device, weights_only=True
+            )
             optimizer.load_state_dict(loaded_optimizer_state)
             del loaded_optimizer_state
 

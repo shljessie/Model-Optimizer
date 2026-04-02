@@ -18,10 +18,10 @@ import shutil
 from pathlib import Path
 
 import torch
-from datasets import Dataset, DatasetDict
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
 import modelopt.torch.utils.distributed as dist
+from datasets import Dataset, DatasetDict
 from modelopt.torch.puzzletron.tools.hydra_utils import register_hydra_resolvers
 
 
