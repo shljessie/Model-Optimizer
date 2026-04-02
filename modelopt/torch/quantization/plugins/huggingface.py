@@ -780,7 +780,12 @@ class _QuantQwen35MoeExperts(_QuantFunctionalMixin):
     """
 
     def _get_expert_idx_from_gate_up(self, weight: torch.Tensor) -> int:
-        """Recover expert index from a ``gate_up_proj`` weight slice's storage offset."""
+        """Recover expert index from a ``gate_up_proj`` weight slice's storage offset.
+
+        This relies on ``gate_up_proj[idx]`` returning a view into contiguous storage
+        (standard PyTorch indexing behaviour).  The invariant breaks if the tensor is
+        ``.contiguous()``-copied or redistributed by certain distributed wrappers.
+        """
         base_offset = self.gate_up_proj.storage_offset()
         stride = self.gate_up_proj.stride(0)
         if stride == 0:
@@ -801,6 +806,10 @@ class _QuantQwen35MoeExperts(_QuantFunctionalMixin):
     def functionals_to_replace(self):
         _orig_linear = torch.nn.functional.linear
 
+        # The toggle assumes the HF forward calls F.linear exactly twice per expert
+        # in strict alternation: first for gate_up_proj, then for down_proj.
+        # forward() resets the toggle before each call to super().forward(), so a
+        # stale state from a prior exception does not carry over across forward passes.
         def _quantized_linear(input, weight, bias=None):
             if self._down_proj_linear:
                 expert_idx = self._current_expert_idx

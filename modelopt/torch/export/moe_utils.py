@@ -43,7 +43,15 @@ def _export_qwen35_experts(module: nn.Module, dtype: torch.dtype) -> None:
     from modelopt.torch.export.unified_export_hf import _export_quantized_weight
 
     n = module.num_experts
-    expert_dim = module.intermediate_dim
+
+    # The attribute name was changed from `intermediate_size` to `intermediate_dim` in
+    # https://github.com/huggingface/transformers/commit/0642963ba13f2dae0596fe489415569e1d91fbda
+    if hasattr(module, "intermediate_size"):
+        expert_dim = module.intermediate_size
+    elif hasattr(module, "intermediate_dim"):
+        expert_dim = module.intermediate_dim
+    else:
+        raise AttributeError("Could not find intermediate dimension size in module")
 
     # 1. Amax fallback for uncalibrated expert input quantizers.
     #    Input amax depends on activations seen during calibration and can't be
