@@ -321,7 +321,7 @@ def _attn_fwd_body(
             if APPLY_SKIP_SOFTMAX:
                 # --- Skip-softmax: tile-level skipping ---
                 # V2.51: ALL rows must agree (unanimity).
-                # V3: majority_threshold rows must agree (majority vote).
+                # V3/V3.1: majority_threshold rows must agree (majority vote).
                 tile_row_max = tl.max(scores, 1)  # [BLOCK_M]
                 can_skip = tile_row_max < (row_max + skip_threshold_log2)
                 if APPLY_MAJORITY_VOTE:
@@ -354,29 +354,7 @@ def _attn_fwd_body(
                     acc = tl.dot(p.to(v.dtype), v, acc)
                     row_max = m_new
                 elif APPLY_SKIP_V25:
-                    # Pool-K: approximate per-row weights with 128 exp2 instead of 8192.
-                    # K is already in SRAM as [BLOCK_D, BLOCK_N] from BMM1.
-                    # k_mean = mean(K, dim=0) in token dim → [BLOCK_D]
-                    n_valid_kv = tl.minimum(seq_len_kv - kv_start, BLOCK_N).to(tl.float32)
-                    n_valid_kv = tl.maximum(n_valid_kv, 1.0)
-                    k_mean = tl.sum(k, 1) / n_valid_kv  # [BLOCK_D] (k is [BLOCK_D, BLOCK_N])
-
-                    # approx_score = Q @ k_mean * scale * BLOCK_N
-                    # The * BLOCK_N approximates sum_j(exp(q·k_j)) ≈ N * exp(q·mean(k))
-                    approx_score = tl.sum(q * k_mean[None, :], 1) * qk_scale  # [BLOCK_M]
-
-                    # V3 fix: use tile_row_max (actual max) instead of approx_score
-                    # for m_new. With majority vote, dissenting rows may have
-                    # tile_row_max > row_max; using approx_score would leave
-                    # row_max stale. Safe for unanimity too (tile_row_max < row_max
-                    # when all rows agree to skip, so max() = row_max either way).
-                    m_new = tl.maximum(row_max, tile_row_max)
-                    p_approx = tl.math.exp2(approx_score - m_new) * n_valid_kv  # [BLOCK_M], 128 exp2
-                    correction = tl.math.exp2(row_max - m_new)
-                    row_sum = row_sum * correction + p_approx
-                    acc = acc * correction[:, None]
-
-                    # Load fresh precomputed v_mean from L2 cache
+                    # Load fresh precomputed v_mean from L2 cache (shared by both tiers)
                     kv_tile_idx = kv_start // BLOCK_N
                     vm_ptr = (
                         Vmean_cache
@@ -387,8 +365,33 @@ def _attn_fwd_body(
                     )
                     fresh_v_mean = tl.load(vm_ptr, mask=d_mask, other=0.0)  # [BLOCK_D]
 
-                    acc += p_approx[:, None] * fresh_v_mean[None, :]
-                    row_max = m_new
+                    if APPLY_MAJORITY_VOTE and num_skip < BLOCK_M:
+                        # V3.1 GRAY ZONE: majority agrees but not 100%.
+                        # Exact P (8192 exp2) + v_mean. No V load, no BMM2.
+                        # Eliminates weight approximation error entirely.
+                        # Cost: ~64 cycles (SFU) vs ~2000 cycles saved (V load + BMM2).
+                        m_new = tl.maximum(row_max, tile_row_max)
+                        p = tl.math.exp2(scores - m_new[:, None])  # [BLOCK_M, BLOCK_N] exact
+                        l_new = tl.sum(p, 1)  # [BLOCK_M] exact per-row weight
+                        correction = tl.math.exp2(row_max - m_new)
+                        row_sum = row_sum * correction + l_new
+                        acc = acc * correction[:, None]
+                        acc += l_new[:, None] * fresh_v_mean[None, :]
+                        row_max = m_new
+                    else:
+                        # FULL SKIP (100% agreement or unanimity mode):
+                        # Pool-K approximate weights (128 exp2) + v_mean.
+                        n_valid_kv = tl.minimum(seq_len_kv - kv_start, BLOCK_N).to(tl.float32)
+                        n_valid_kv = tl.maximum(n_valid_kv, 1.0)
+                        k_mean = tl.sum(k, 1) / n_valid_kv  # [BLOCK_D]
+                        approx_score = tl.sum(q * k_mean[None, :], 1) * qk_scale  # [BLOCK_M]
+                        m_new = tl.maximum(row_max, tile_row_max)
+                        p_approx = tl.math.exp2(approx_score - m_new) * n_valid_kv  # [BLOCK_M]
+                        correction = tl.math.exp2(row_max - m_new)
+                        row_sum = row_sum * correction + p_approx
+                        acc = acc * correction[:, None]
+                        acc += p_approx[:, None] * fresh_v_mean[None, :]
+                        row_max = m_new
             else:
                 # --- Standard path: no skip check ---
                 m_new = tl.maximum(row_max, tl.max(scores, 1))
