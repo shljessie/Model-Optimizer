@@ -107,7 +107,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 
 class DFlashAttention(nn.Module):
-    """Attention with KV injection, matching SpecForge Qwen3DFlashAttention."""
+    """Attention with KV injection, using HF's attention dispatch for exact SpecForge parity."""
 
     def __init__(self, config, layer_idx):
         """Initialize DFlash attention with KV injection projections and QK-norm."""
@@ -119,17 +119,61 @@ class DFlashAttention(nn.Module):
         )
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim**-0.5
+        self.attention_dropout = getattr(config, "attention_dropout", 0.0)
         self.is_causal = False
 
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
+        attn_bias = getattr(config, "attention_bias", False)
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=attn_bias)
+        self.k_proj = nn.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, bias=attn_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, bias=attn_bias
+        )
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=attn_bias)
 
-        # QK norm (matches Qwen3DFlashAttention)
         self.q_norm = _NORM_CLS(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _NORM_CLS(self.head_dim, eps=config.rms_norm_eps)
+
+        # Resolve HF attention function matching SpecForge's dispatch
+        self._attn_fn = None
+        self.sliding_window = None
+
+    def _get_attn_fn(self):
+        """Lazily resolve the HF attention function."""
+        if self._attn_fn is not None:
+            return self._attn_fn
+        try:
+            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+            impl = getattr(self.config, "_attn_implementation", "eager")
+            if impl and impl != "eager" and impl in ALL_ATTENTION_FUNCTIONS:
+                self._attn_fn = ALL_ATTENTION_FUNCTIONS[impl]
+            else:
+                # Fall back to eager (manual matmul + softmax)
+                self._attn_fn = self._eager_attention
+        except (ImportError, AttributeError):
+            self._attn_fn = self._eager_attention
+        return self._attn_fn
+
+    def _eager_attention(self, module, q, k, v, attention_mask, **kwargs):
+        """Eager attention matching HF's eager_attention_forward."""
+        scaling = kwargs.get("scaling", self.scaling)
+        n_rep = self.num_key_value_groups
+        if n_rep > 1:
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+        attn_weights = torch.matmul(q, k.transpose(2, 3)) * scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            q.dtype
+        )
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
 
     def forward(self, hidden_states, target_hidden, position_embeddings, attention_mask=None):
         """Forward with KV injection: Q from noise, K/V from context+noise."""
@@ -137,15 +181,13 @@ class DFlashAttention(nn.Module):
         ctx_len = target_hidden.shape[1]
 
         # Q from noise only, with QK-norm
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
+        q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
 
         # K from context + noise, with QK-norm
         k_ctx = self.k_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim
-        )
+        k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         k = self.k_norm(k).transpose(1, 2)
 
         # V from context + noise (no norm)
@@ -153,24 +195,27 @@ class DFlashAttention(nn.Module):
         v_noise = self.v_proj(hidden_states)
         v = (
             torch.cat([v_ctx, v_noise], dim=1)
-            .view(bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim)
+            .view(bsz, ctx_len + q_len, -1, self.head_dim)
             .transpose(1, 2)
         )
 
-        # RoPE: applied to full 2L positions, Q gets last q_len, K gets all
+        # RoPE
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # GQA expand
-        if self.num_kv_heads != self.num_heads:
-            n_rep = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
-
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, is_causal=False, scale=self.scaling
+        # Use HF's attention dispatch (handles GQA internally)
+        attn_fn = self._get_attn_fn()
+        attn_output, _ = attn_fn(
+            self,
+            q,
+            k,
+            v,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+        attn_output = attn_output.reshape(bsz, q_len, -1)
         return self.o_proj(attn_output)
 
 
