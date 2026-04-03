@@ -151,13 +151,10 @@ class DFlashAttention(nn.Module):
             impl = getattr(self.config, "_attn_implementation", "eager")
             if impl and impl != "eager" and impl in ALL_ATTENTION_FUNCTIONS:
                 self._attn_fn = ALL_ATTENTION_FUNCTIONS[impl]
-                print(f"[DFlash] attn_fn resolved to: {impl} -> {self._attn_fn.__name__}")
             else:
                 self._attn_fn = self._eager_attention
-                print(f"[DFlash] attn_fn fallback to eager (impl={impl})")
-        except (ImportError, AttributeError) as e:
+        except (ImportError, AttributeError):
             self._attn_fn = self._eager_attention
-            print(f"[DFlash] attn_fn fallback to eager (error: {e})")
         return self._attn_fn
 
     def _eager_attention(self, module, q, k, v, attention_mask, **kwargs):
@@ -294,7 +291,9 @@ class DFlashModule(nn.Module):
         return self.norm(hidden_states)
 
 
-def create_dflash_attention_mask(seq_len, block_size, device, dtype):
+def create_dflash_attention_mask(
+    seq_len, block_size, device, dtype
+):  # Legacy: used for inference only
     """Create [L, 2L] attention mask matching SpecForge.
 
     Context (cols 0..L-1): Block B sees blocks 0..B-1 (strictly previous).
@@ -323,7 +322,7 @@ def create_dflash_attention_mask(seq_len, block_size, device, dtype):
     return full_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L, 2L]
 
 
-def create_dflash_loss_mask(seq_len, block_size, device):
+def create_dflash_loss_mask(seq_len, block_size, device):  # Legacy: used for inference only
     """Create loss mask: exclude Block 0 and block starts."""
     positions = torch.arange(seq_len, device=device)
     block_ids = positions // block_size
@@ -508,8 +507,6 @@ class HFDFlashModel(DFlashModel):
         _MLP_CLS, _NORM_CLS, _ROTARY_CLS, _rotate_half = _resolve_model_components(
             getattr(base_config, "model_type", "llama")
         )
-        print(f"DFlash: using {_MLP_CLS.__name__} from {base_config.model_type}")
-
         self.dflash_module = DFlashModule(self.dflash_config)
         self.dflash_module.to(self._base_model.dtype).to(
             next(self._base_model.layers[-1].parameters()).device
