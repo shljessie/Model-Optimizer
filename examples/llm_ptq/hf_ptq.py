@@ -53,6 +53,7 @@ import modelopt.torch.sparsity as mts
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import (
     export_hf_checkpoint,
+    export_hf_vllm_fq_checkpoint,
     export_speculative_decoding,
     export_tensorrt_llm_checkpoint,
     get_model_type,
@@ -104,6 +105,7 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "w4a8_nvfp4_fp8": mtq.W4A8_NVFP4_FP8_CFG,
     "w4a8_mxfp4_fp8": mtq.W4A8_MXFP4_FP8_CFG,
     "nvfp4_mlp_only": mtq.NVFP4_MLP_ONLY_CFG,
+    "nvfp4_experts_only": mtq.NVFP4_EXPERTS_ONLY_CFG,
     "nvfp4_omlp_only": mtq.NVFP4_OMLP_ONLY_CFG,
     "nvfp4_svdquant": mtq.NVFP4_SVDQUANT_DEFAULT_CFG,
     "mxfp8": mtq.MXFP8_DEFAULT_CFG,
@@ -272,10 +274,12 @@ def auto_quantize(
             "int4_awq",
             "nvfp4",
             "nvfp4_awq",
+            "nvfp4_mse",
             "w4a8_awq",
             "fp8_pb_wo",
             "w4a8_mxfp4_fp8",
             "nvfp4_mlp_only",
+            "nvfp4_experts_only",
             "nvfp4_omlp_only",
             "mxfp8",
         ]
@@ -422,7 +426,9 @@ def load_model(args: argparse.Namespace):
     elif is_nemotron_vl_model and args.calib_with_images:
         # For Nemotron VL image calibration, we need an AutoProcessor to build multimodal inputs.
         processor = AutoProcessor.from_pretrained(
-            args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code, padding_side="left"
+            args.pyt_ckpt_path,
+            trust_remote_code=args.trust_remote_code,
+            padding_side="left",
         )
 
         if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
@@ -678,16 +684,21 @@ def export_quantized(
 
             # Load any missing weights from non-standard safetensors (handled in get_model for non-low-memory mode)
             # Store the MTP layer prefixes on the model for later exclusion from quantization
-            mtp_layer_prefixes, mtp_state_dict = load_mtp_weights(full_model, args.pyt_ckpt_path)
+            if args.vllm_fakequant_export:
+                export_hf_vllm_fq_checkpoint(full_model, export_dir=export_path)
+            else:
+                mtp_layer_prefixes, mtp_state_dict = load_mtp_weights(
+                    full_model, args.pyt_ckpt_path
+                )
 
-            if mtp_layer_prefixes:
-                full_model._mtp_layer_prefixes = mtp_layer_prefixes
+                if mtp_layer_prefixes:
+                    full_model._mtp_layer_prefixes = mtp_layer_prefixes
 
-            export_hf_checkpoint(
-                full_model,
-                export_dir=export_path,
-                extra_state_dict=mtp_state_dict,
-            )
+                export_hf_checkpoint(
+                    full_model,
+                    export_dir=export_path,
+                    extra_state_dict=mtp_state_dict,
+                )
 
         # Restore default padding and export the tokenizer as well.
         if tokenizer is not None:
@@ -733,6 +744,11 @@ def pre_quantize(
         generated_ids_before_ptq = None
     elif model_type == "deepseek":
         # DeepSeek generation may go OOM, so we skip it
+        generated_ids_before_ptq = None
+    elif model_type == "nemotron_h":
+        # NemotronH (SSM/Mamba hybrid) modeling code does not work with accelerate's big model inference
+        # when multiple GPUs are used. So we skip generation for NemotronH models. The issue presents in
+        # the remote code and also in transformers library integration code from v5.3
         generated_ids_before_ptq = None
     elif is_nemotron_vl_model and tokenizer is not None:
         generated_ids_before_ptq = run_nemotron_vl_preview(
@@ -1214,6 +1230,13 @@ def parse_args() -> argparse.Namespace:
             "Only used for MOE models; used to reduce the number of experts calibrated during the forward pass. "
             "Does not impact non-MOE models."
         ),
+    )
+    parser.add_argument(
+        "--vllm_fakequant_export",
+        default=False,
+        action="store_true",
+        help="Export as vLLM fake-quant checkpoint (produces vllm_fq_modelopt_state.pth "
+        "for use with vllm_serve_fakequant.py).",
     )
 
     args = parser.parse_args()
