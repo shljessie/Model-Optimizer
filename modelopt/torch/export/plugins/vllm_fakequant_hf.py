@@ -105,11 +105,11 @@ def _process_weight(item: _WeightQuantWork) -> tuple[str, torch.Tensor, str | No
     Returns (sd_key, quantized_weight_on_cpu, inp_q_key_or_None).
     """
     w = item.weight
-    w_quant = item.quantizer(w.float()).to(w.dtype).cpu()
+    w_quant = item.quantizer(w.float()).to(w.dtype)
     if item.inp_q is not None:
         scale = item.inp_q._pre_quant_scale.squeeze().to(device=w_quant.device)
         w_quant = (w_quant * scale[None, :]).to(w_quant.dtype)
-    return item.sd_key, w_quant, item.inp_q_key
+    return item.sd_key, w_quant.cpu(), item.inp_q_key
 
 
 def _process_device_batch(items: list[_WeightQuantWork], device: torch.device):

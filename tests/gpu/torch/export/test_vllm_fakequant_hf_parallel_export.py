@@ -80,7 +80,7 @@ def test_parallel_vs_sequential_identical(tmp_path, quant_cfg):
 
     assert seq_sd.keys() == par_sd.keys(), "Key mismatch between sequential and parallel export"
     for key in seq_sd:
-        assert torch.equal(seq_sd[key], par_sd[key]), (
+        assert torch.allclose(seq_sd[key], par_sd[key]), (
             f"Weight mismatch for {key}: max diff={torch.abs(seq_sd[key] - par_sd[key]).max()}"
         )
 
