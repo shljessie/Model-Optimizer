@@ -153,6 +153,9 @@ class LanguageDataCollator:
         if self.tokenizer.chat_template is None:
             raise ValueError("No valid chat template!")
 
+        if self.answer_only_loss:
+            self._ensure_generation_tags()
+
     def _post_process_tokenizer(self):
         if self.tokenizer.pad_token_id is None:
             print_rank_0("The tokenizer has no pad_token_id, using eos_token_id instead.")
@@ -169,6 +172,102 @@ class LanguageDataCollator:
         # tokens are preserved for supervised learning.
         self.tokenizer.chat_template = self.tokenizer.chat_template.replace(
             REMOVE_THINK_CHAT_TEMPLATE, ""
+        )
+
+    # Simplified chat templates with {% generation %} tags for answer_only_loss.
+    # These drop complex features (tool_calls, thinking parsing) but correctly mark
+    # assistant content for loss masking. The training data should already contain
+    # the full assistant response including <think> blocks.
+    _GENERATION_TEMPLATES = {
+        "chatml": (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "{{ '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' }}"
+            "{% elif message['role'] == 'user' %}"
+            "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ '<|im_start|>assistant\n' }}{% generation %}{{ message['content'] }}"
+            "{% endgeneration %}{{ '<|im_end|>\n' }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+        ),
+        "llama3": (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "{{ '<|start_header_id|>system<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+            "{% elif message['role'] == 'user' %}"
+            "{{ '<|start_header_id|>user<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% generation %}"
+            "{{ message['content'] }}{% endgeneration %}{{ '<|eot_id|>' }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
+        ),
+    }
+
+    def _ensure_generation_tags(self):
+        """Ensure chat template has {% generation %} tags for answer_only_loss.
+
+        If the template already has generation tags, no action taken.
+        Otherwise, detect the template style and replace with a simplified
+        version that includes proper generation tags.
+        """
+        template = self.tokenizer.chat_template
+        if template is None:
+            return
+
+        if "{% generation %}" in template or "{%generation%}" in template:
+            return
+
+        # Detect template style and replace with generation-tagged version
+        old_template = template
+        if "<|im_start|>" in template and "<|im_end|>" in template:
+            style = "chatml"
+        elif "<|start_header_id|>" in template and "<|eot_id|>" in template:
+            style = "llama3"
+        else:
+            print_rank_0(
+                "WARNING: Cannot auto-inject {% generation %} tags for this chat template. "
+                "answer_only_loss will use regex fallback. Consider providing a template "
+                "with {% generation %} tags via the chat_template parameter."
+            )
+            return
+
+        new_template = self._GENERATION_TEMPLATES[style]
+        self.tokenizer.chat_template = new_template
+
+        # Verify
+        try:
+            test_msgs = [
+                [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            ]
+            result = self.tokenizer.apply_chat_template(
+                test_msgs,
+                return_dict=True,
+                return_assistant_tokens_mask=True,
+                padding=True,
+                return_tensors="pt",
+            )
+            mask = result.get("assistant_masks", None)
+            if mask is not None and mask.any():
+                print_rank_0(
+                    f"Replaced chat template with {style} generation-tagged version "
+                    f"for answer_only_loss."
+                )
+                return
+        except Exception:
+            pass
+
+        # Revert on failure
+        self.tokenizer.chat_template = old_template
+        print_rank_0(
+            f"WARNING: Failed to apply {style} generation template. "
+            "Using regex fallback for answer_only_loss."
         )
 
     def _process_chat_sample(self, examples: list):
