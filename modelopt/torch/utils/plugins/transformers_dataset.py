@@ -450,15 +450,18 @@ class LanguageDataCollator:
                 batch.append(text)
             else:
                 messages = example.get("messages", None)
-                if messages is None:
-                    conversations = example.get("conversations", None)
-                    if conversations is None:
-                        raise ValueError(
-                            "The sample must in either OpenAI messages format or ShareGPT conversations format."
-                        )
-                    else:
-                        messages = _sharegpt_to_openai_messages(conversations)
-                batch.append(messages)
+                conversations = example.get("conversations", None)
+                # Prefer whichever has an assistant turn for training
+                if messages and any(m.get("role") == "assistant" for m in messages):
+                    batch.append(messages)
+                elif conversations:
+                    batch.append(_sharegpt_to_openai_messages(conversations))
+                elif messages:
+                    batch.append(messages)
+                else:
+                    raise ValueError(
+                        "The sample must in either OpenAI messages format or ShareGPT conversations format."
+                    )
 
         return self._process_chat_sample(batch)
 
