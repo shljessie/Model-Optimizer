@@ -150,12 +150,13 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
     @field_validator("backend")
     @classmethod
     def validate_backend(cls, v):
-        """Validate backend is pytorch or triton."""
-        if v not in ("pytorch", "triton"):
+        """Validate backend is pytorch, triton, or diffusers_triton."""
+        if v not in ("pytorch", "triton", "diffusers_triton"):
             raise ValueError(
                 f"Invalid backend: {v}. Supported backends: 'pytorch' (requires "
                 f"attn_implementation='eager'), 'triton' (requires "
-                f"attn_implementation='modelopt_triton')."
+                f"attn_implementation='modelopt_triton'), 'diffusers_triton' (for diffusers "
+                f"models; calls the ModelOpt Triton kernel directly via WanAttnProcessor)."
             )
         return v
 

@@ -78,6 +78,7 @@ def _set_attn_implementation(model: nn.Module, config: SparseAttentionConfig) ->
             "supported. All sparse attention layers must use the same backend."
         )
 
+
     if "triton" in backends:
         from .kernels import register_triton_attention
 

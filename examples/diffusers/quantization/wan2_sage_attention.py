@@ -15,7 +15,7 @@
 
 """Wan2.2 Text-to-Video inference with SageAttention and FP8 attention quantization.
 
-Four attention kernel variants are supported via ``--kernel``:
+Attention kernel variants supported via ``--kernel``:
 
 ``sage1``
     ``sageattn`` — SageAttention v1. INT8 QK, FP16 PV. Ampere/Ada/Hopper.
@@ -43,6 +43,17 @@ Four attention kernel variants are supported via ``--kernel``:
     - Manual attention: Q@K^T → scale → mask → softmax → NVFP4_pertile(P) → P@V
     - No CUDA kernel required. Use to measure accuracy vs FP8.
 
+``triton-sparse`` (requires triton + modelopt)
+    ModelOpt Triton flash-attention kernel with N:M sparse softmax (2:4 by default).
+    Applied via ``mtsa.sparsify()`` to the WAN transformer using the ``diffusers_triton``
+    backend. For every 4 K positions, keeps top-2 attention scores; the other 2 are
+    set to -inf before softmax. Uses WanSparseAttentionModule from modelopt.
+
+``triton-skip`` (requires triton + modelopt)
+    ModelOpt Triton flash-attention kernel with skip-softmax tile pruning.
+    Tiles whose attention mass is below a threshold (default 0.1) are skipped entirely.
+    Applied via ``mtsa.sparsify()`` using the ``diffusers_triton`` backend.
+
 Requirements::
 
     pip install sageattention diffusers transformers accelerate ftfy
@@ -63,6 +74,12 @@ Usage::
 
     # Benchmark all kernels (timing only)
     python wan2_sage_attention.py --prompt "..." --benchmark
+
+    # ModelOpt Triton N:M sparse attention
+    python wan2_sage_attention.py --prompt "..." --kernel triton-sparse
+
+    # ModelOpt Triton skip-softmax attention
+    python wan2_sage_attention.py --prompt "..." --kernel triton-skip
 
     # Smaller 5B model (fits on a single 24 GB GPU)
     python wan2_sage_attention.py \\
@@ -92,7 +109,20 @@ KERNEL_NVFP4 = "nvfp4"
 KERNEL_SAGE1 = "sage1"
 KERNEL_SAGE2_FP16 = "sage2-fp16"
 KERNEL_SAGE2_FP8 = "sage2-fp8"
-KERNEL_CHOICES = [KERNEL_FP8, KERNEL_NVFP4, KERNEL_SAGE1, KERNEL_SAGE2_FP16, KERNEL_SAGE2_FP8]
+KERNEL_TRITON_SPARSE = "triton-sparse"
+KERNEL_TRITON_SKIP = "triton-skip"
+KERNEL_CHOICES = [
+    KERNEL_FP8,
+    KERNEL_NVFP4,
+    KERNEL_SAGE1,
+    KERNEL_SAGE2_FP16,
+    KERNEL_SAGE2_FP8,
+    KERNEL_TRITON_SPARSE,
+    KERNEL_TRITON_SKIP,
+]
+
+# Kernels that use mtsa.sparsify() instead of patching F.scaled_dot_product_attention
+_TRITON_MODELOPT_KERNELS = {KERNEL_TRITON_SPARSE, KERNEL_TRITON_SKIP}
 
 _KERNEL_DESCRIPTIONS = {
     KERNEL_FP8: "FP8 E4M3 QKV (Python-level, SA2-inspired smoothing, no CUDA kernel required)",
@@ -100,6 +130,8 @@ _KERNEL_DESCRIPTIONS = {
     KERNEL_SAGE1: "sageattn (SA1, INT8 QK + FP16 PV, auto-select)",
     KERNEL_SAGE2_FP16: "sageattn_qk_int8_pv_fp16_cuda (SA2, INT8 QK + FP16 PV, per-thread)",
     KERNEL_SAGE2_FP8: "sageattn_qk_int8_pv_fp8_cuda (SA2++, INT8 QK + FP8 PV, fp32+fp16 accum)",
+    KERNEL_TRITON_SPARSE: "ModelOpt Triton flash-attn + N:M sparse softmax (2:4) via mtsa.sparsify()",
+    KERNEL_TRITON_SKIP: "ModelOpt Triton flash-attn + skip-softmax tile pruning via mtsa.sparsify()",
 }
 
 # SageAttention CUDA kernel support by GPU compute capability:
@@ -164,22 +196,35 @@ def _detect_available_kernels() -> list[str]:
     try:
         import sageattention as _sa
     except ImportError:
-        return available
+        _sa = None
 
-    sm = _get_gpu_sm()
-    if sm is not None and sm not in _SUPPORTED_SM:
-        print(
-            f"[SageAttention] WARNING: GPU SM{sm} not officially supported by SA 2.2.0 "
-            f"(supported: SM{sorted(_SUPPORTED_SM)}). CUDA kernels may fail. "
-            "Try: TORCH_CUDA_ARCH_LIST='8.9+PTX' pip install --no-cache-dir sageattention"
-        )
+    if _sa is not None:
+        sm = _get_gpu_sm()
+        if sm is not None and sm not in _SUPPORTED_SM:
+            print(
+                f"[SageAttention] WARNING: GPU SM{sm} not officially supported by SA 2.2.0 "
+                f"(supported: SM{sorted(_SUPPORTED_SM)}). CUDA kernels may fail. "
+                "Try: TORCH_CUDA_ARCH_LIST='8.9+PTX' pip install --no-cache-dir sageattention"
+            )
 
-    if hasattr(_sa, "sageattn"):
-        available.append(KERNEL_SAGE1)
-    if hasattr(_sa, "sageattn_qk_int8_pv_fp16_cuda"):
-        available.append(KERNEL_SAGE2_FP16)
-    if hasattr(_sa, "sageattn_qk_int8_pv_fp8_cuda"):
-        available.append(KERNEL_SAGE2_FP8)
+        if hasattr(_sa, "sageattn"):
+            available.append(KERNEL_SAGE1)
+        if hasattr(_sa, "sageattn_qk_int8_pv_fp16_cuda"):
+            available.append(KERNEL_SAGE2_FP16)
+        if hasattr(_sa, "sageattn_qk_int8_pv_fp8_cuda"):
+            available.append(KERNEL_SAGE2_FP8)
+
+    # Triton ModelOpt kernels require: triton + modelopt sparse attention
+    try:
+        import triton  # noqa: F401
+
+        import modelopt.torch.sparsity.attention_sparsity  # noqa: F401
+
+        available.append(KERNEL_TRITON_SPARSE)
+        available.append(KERNEL_TRITON_SKIP)
+    except ImportError:
+        pass
+
     return available
 
 
@@ -461,6 +506,11 @@ def enable_attention_kernel(
 
     if kernel not in KERNEL_CHOICES:
         raise ValueError(f"Unknown kernel {kernel!r}. Choose from {KERNEL_CHOICES}")
+    if kernel in _TRITON_MODELOPT_KERNELS:
+        raise ValueError(
+            f"Kernel {kernel!r} cannot be activated via enable_attention_kernel(). "
+            "Use apply_triton_sparse_kernel(pipe.transformer, kernel) instead."
+        )
     if kernel not in AVAILABLE_KERNELS:
         raise RuntimeError(f"Kernel {kernel!r} is not available. Available: {AVAILABLE_KERNELS}")
 
@@ -494,6 +544,56 @@ def attention_kernel_ctx(kernel: str = KERNEL_FP8):
         yield
     finally:
         disable_attention_kernel()
+
+
+# ---------------------------------------------------------------------------
+# ModelOpt Triton sparse attention — applied via mtsa.sparsify()
+# ---------------------------------------------------------------------------
+
+_TRITON_SPARSE_CONFIG = {
+    "sparse_cfg": {
+        "*": {
+            "method": "triton_sparse_softmax",
+            "sparsity_n": 2,
+            "sparsity_m": 4,
+            "num_sink_tokens": 0,
+            "dense_window_size": 0,
+            "backend": "diffusers_triton",
+            "enable": True,
+        },
+        "default": {"enable": False},
+    }
+}
+
+_TRITON_SKIP_CONFIG = {
+    "sparse_cfg": {
+        "*": {
+            "method": "triton_skip_softmax",
+            "skip_softmax_threshold": 0.1,
+            "backend": "diffusers_triton",
+            "enable": True,
+        },
+        "default": {"enable": False},
+    }
+}
+
+
+def apply_triton_sparse_kernel(transformer: torch.nn.Module, kernel: str) -> None:
+    """Apply a ModelOpt Triton sparse attention kernel to the WAN transformer.
+
+    Calls ``mtsa.sparsify()`` with ``backend="diffusers_triton"``, which installs
+    a ``ModelOptWanAttnProcessor`` on every ``WanAttention`` module.  This modifies
+    the model in-place; call ``remove_triton_sparse_kernel`` to undo.
+
+    Args:
+        transformer: The ``pipe.transformer`` WAN model.
+        kernel: ``KERNEL_TRITON_SPARSE`` or ``KERNEL_TRITON_SKIP``.
+    """
+    import modelopt.torch.sparsity.attention_sparsity as mtsa
+
+    config = _TRITON_SPARSE_CONFIG if kernel == KERNEL_TRITON_SPARSE else _TRITON_SKIP_CONFIG
+    mtsa.sparsify(transformer, config)
+    print(f"[Attention] Applied {kernel}: {_KERNEL_DESCRIPTIONS[kernel]}")
 
 
 def print_kernel_stats() -> None:
@@ -721,7 +821,9 @@ def parse_args() -> argparse.Namespace:
             "nvfp4: Python-level NVFP4 E2M1 post-softmax P (SA3-inspired, per-tile); "
             "sage1: SA1 INT8+FP16; "
             "sage2-fp16: SA2 INT8+FP16; "
-            "sage2-fp8: SA2++ INT8+FP8"
+            "sage2-fp8: SA2++ INT8+FP8; "
+            "triton-sparse: ModelOpt Triton 2:4 N:M sparse softmax (requires triton + modelopt); "
+            "triton-skip: ModelOpt Triton skip-softmax tile pruning (requires triton + modelopt)"
         ),
     )
     parser.add_argument(
@@ -785,15 +887,21 @@ def main() -> None:
     nvfp4_tile = _parse_nvfp4_tile(args.nvfp4_tile)
     pipe = load_pipeline(args.model)
 
+    is_triton_kernel = args.kernel in _TRITON_MODELOPT_KERNELS
+
     if args.compare:
         # --- Baseline ---
         _, frames_base = run_inference(pipe, args, label="baseline")
 
         # --- Quantized ---
-        enable_attention_kernel(args.kernel, nvfp4_tile=nvfp4_tile)
+        if is_triton_kernel:
+            apply_triton_sparse_kernel(pipe.transformer, args.kernel)
+        else:
+            enable_attention_kernel(args.kernel, nvfp4_tile=nvfp4_tile)
         _, frames_quant = run_inference(pipe, args, label=args.kernel)
-        print_kernel_stats()
-        disable_attention_kernel()
+        if not is_triton_kernel:
+            print_kernel_stats()
+            disable_attention_kernel()
 
         # --- CLIP scores (per-video semantic alignment with prompt) ---
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -830,6 +938,12 @@ def main() -> None:
             if kernel not in AVAILABLE_KERNELS:
                 print(f"\n[{kernel}] Skipped — not available")
                 continue
+            if kernel in _TRITON_MODELOPT_KERNELS:
+                print(
+                    f"\n[{kernel}] Skipped in --benchmark (triton kernels modify the model "
+                    "in-place; run separately with --kernel {kernel})"
+                )
+                continue
             enable_attention_kernel(kernel, nvfp4_tile=nvfp4_tile)
             timing[kernel], _ = run_inference(pipe, args, label=kernel)
             print_kernel_stats()
@@ -841,6 +955,9 @@ def main() -> None:
         print(f"  {'-' * 40}")
         print(f"  {'baseline (SDPA)':<20} {t_base:>7.1f}s   {'1.00x':>8}")
         for kernel in KERNEL_CHOICES:
+            if kernel in _TRITON_MODELOPT_KERNELS:
+                print(f"  {kernel:<20} {'N/A':>8}   {'N/A':>8}  (run separately)")
+                continue
             if kernel not in timing:
                 print(f"  {kernel:<20} {'N/A':>8}   {'N/A':>8}  (not available)")
                 continue
@@ -850,6 +967,10 @@ def main() -> None:
 
     elif args.baseline:
         run_inference(pipe, args, label="baseline")
+
+    elif is_triton_kernel:
+        apply_triton_sparse_kernel(pipe.transformer, args.kernel)
+        run_inference(pipe, args, label=args.kernel)
 
     else:
         enable_attention_kernel(args.kernel, nvfp4_tile=nvfp4_tile)

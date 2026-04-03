@@ -30,6 +30,9 @@ def register_custom_model_plugins_on_the_fly(model):
 
 from . import huggingface  # noqa: E402
 
+with import_plugin("diffusers"):
+    from . import diffusers
+
 __all__ = [
     "CUSTOM_MODEL_PLUGINS",
     "register_custom_model_plugins_on_the_fly",
