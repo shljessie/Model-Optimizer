@@ -749,7 +749,7 @@ class HFDFlashModel(DFlashModel):
             decay = torch.exp(-(k - 1).clamp(min=0).float() / self.dflash_loss_decay_factor)
             weight_mask = weight_mask * decay
 
-        # Cross entropy
+        # Cross entropy or logit distillation
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
@@ -757,8 +757,22 @@ class HFDFlashModel(DFlashModel):
         valid_count = flat_weights.sum() + 1e-6
 
         if valid_count > 1.0:
-            loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-            loss = (loss_per_token * flat_weights).sum() / valid_count
+            if self.dflash_self_logit_distillation:
+                # Gather teacher logits at anchor+offset positions
+                base_logits = base_outputs.logits  # [B, seq, vocab]
+                teacher_logits = torch.gather(
+                    base_logits.unsqueeze(1).expand(-1, n_blocks, -1, -1),
+                    2,
+                    safe_label_indices.unsqueeze(-1).expand(-1, -1, -1, base_logits.size(-1)),
+                )  # [B, N, block_size, vocab]
+                flat_teacher = teacher_logits.reshape(-1, base_logits.size(-1)).detach()
+                target_soft = torch.softmax(flat_teacher, dim=-1)
+                draft_logsoft = torch.log_softmax(flat_logits, dim=-1)
+                kd_loss = -(target_soft * draft_logsoft).sum(dim=-1)
+                loss = (kd_loss * flat_weights).sum() / valid_count
+            else:
+                loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+                loss = (loss_per_token * flat_weights).sum() / valid_count
 
             with torch.no_grad():
                 preds = flat_logits.argmax(dim=-1)
