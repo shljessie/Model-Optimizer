@@ -125,8 +125,13 @@ if ckpt_files:
     for f in ckpt_files:
         state.update(load_file(f))
     dflash_keys = {k: v for k, v in state.items() if 'dflash_module' in k}
-    model.load_state_dict(dflash_keys, strict=False)
-    print(f'Loaded {len(dflash_keys)} DFlash weights from {len(ckpt_files)} file(s)')
+    if dflash_keys:
+        model.load_state_dict(dflash_keys, strict=False)
+        print(f'Loaded {len(dflash_keys)} DFlash weights (with prefix)')
+    else:
+        result = model.dflash_module.load_state_dict(state, strict=False)
+        loaded = len(state) - len(result.unexpected_keys)
+        print(f'Loaded {loaded} DFlash weights (no prefix), missing={len(result.missing_keys)}')
 else:
     print('WARNING: No checkpoint files found, using random weights')
 

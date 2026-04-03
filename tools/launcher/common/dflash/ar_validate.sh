@@ -30,6 +30,8 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source ${SCRIPT_DIR}/../service_utils.sh
 trap 'error_handler $0 $LINENO' ERR
 
+pip install --upgrade "transformers>=4.57" 2>&1 | tail -3
+
 DFLASH_BLOCK_SIZE=${DFLASH_BLOCK_SIZE:-16}
 DFLASH_NUM_LAYERS=${DFLASH_NUM_LAYERS:-5}
 NUM_SAMPLES=${NUM_SAMPLES:-20}
@@ -81,9 +83,16 @@ if ckpt_files:
     state = {}
     for f in ckpt_files:
         state.update(load_file(f))
+    # Try with dflash_module prefix first (ModelOpt format)
     dflash_keys = {k: v for k, v in state.items() if 'dflash_module' in k}
-    model.load_state_dict(dflash_keys, strict=False)
-    print(f'Loaded {len(dflash_keys)} DFlash weights from {len(ckpt_files)} file(s)')
+    if dflash_keys:
+        model.load_state_dict(dflash_keys, strict=False)
+        print(f'Loaded {len(dflash_keys)} DFlash weights (with prefix)')
+    else:
+        # No prefix — SpecForge format, load directly into dflash_module
+        result = model.dflash_module.load_state_dict(state, strict=False)
+        loaded = len(state) - len(result.unexpected_keys)
+        print(f'Loaded {loaded} DFlash weights (no prefix), missing={len(result.missing_keys)}')
 else:
     print('WARNING: No checkpoint files found, using random weights')
 

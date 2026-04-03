@@ -150,6 +150,14 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       DFLASH_MASK_TOKEN_ID="${1#*=}"
       ;;
+    --dflash_num_anchors*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      DFLASH_NUM_ANCHORS="${1#*=}"
+      ;;
+    --dflash_loss_decay_gamma*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      DFLASH_LOSS_DECAY_GAMMA="${1#*=}"
+      ;;
     *)
       >&2 printf "Error: Invalid argument ${1#*=}\n"
       exit 1
@@ -220,6 +228,12 @@ elif [[ "$MODE" == "dflash" ]]; then
   fi
   if [[ -n "$DFLASH_MASK_TOKEN_ID" ]]; then
     SPECULATIVE_ARGS="$SPECULATIVE_ARGS --dflash_mask_token_id $DFLASH_MASK_TOKEN_ID"
+  fi
+  if [[ -n "$DFLASH_NUM_ANCHORS" ]]; then
+    SPECULATIVE_ARGS="$SPECULATIVE_ARGS --dflash_num_anchors $DFLASH_NUM_ANCHORS"
+  fi
+  if [[ -n "$DFLASH_LOSS_DECAY_GAMMA" ]]; then
+    SPECULATIVE_ARGS="$SPECULATIVE_ARGS --dflash_loss_decay_gamma $DFLASH_LOSS_DECAY_GAMMA"
   fi
   # DFlash uses DDP instead of FSDP
   FSDP_ARGS="--ddp_find_unused_parameters True --ddp_timeout 1800"
