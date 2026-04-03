@@ -758,12 +758,15 @@ class HFDFlashModel(DFlashModel):
 
         if valid_count > 1.0:
             if self.dflash_self_logit_distillation:
-                # Gather teacher logits at anchor+offset positions
+                # Teacher logits at position p predict token p+1 (autoregressive).
+                # Draft position k predicts token at anchor+k (same position).
+                # So teacher logits for token anchor+k are at position anchor+k-1.
                 base_logits = base_outputs.logits  # [B, seq, vocab]
+                teacher_indices = (safe_label_indices - 1).clamp(min=0)
                 teacher_logits = torch.gather(
                     base_logits.unsqueeze(1).expand(-1, n_blocks, -1, -1),
                     2,
-                    safe_label_indices.unsqueeze(-1).expand(-1, -1, -1, base_logits.size(-1)),
+                    teacher_indices.unsqueeze(-1).expand(-1, -1, -1, base_logits.size(-1)),
                 )  # [B, N, block_size, vocab]
                 flat_teacher = teacher_logits.reshape(-1, base_logits.size(-1)).detach()
                 target_soft = torch.softmax(flat_teacher, dim=-1)
