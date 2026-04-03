@@ -706,9 +706,9 @@ class HFDFlashModel(DFlashModel):
 
         # Convert bool mask to float additive mask for SDPA
         dtype = target_hidden.dtype
-        attn_mask = torch.zeros(bsz, 1, q_len, kv_len, device=device, dtype=dtype)
+        attn_mask = torch.zeros(bsz, 1, q_len, kv_len, device=device, dtype=torch.float32)
         attn_mask.masked_fill_(~final_mask, torch.finfo(torch.float32).min)
-        attn_mask = attn_mask.to(dtype)
+        attn_mask = attn_mask.to(dtype=dtype)
 
         # 7. Draft forward
         hidden = self.dflash_module(
