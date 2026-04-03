@@ -336,6 +336,8 @@ class WanSparseAttentionModule(SparseAttentionModule):
             kw["dense_window_size"] = cfg.get("dense_window_size", 64)
         elif method == "triton_skip_softmax":
             kw["skip_softmax_threshold"] = cfg.get("skip_softmax_threshold", 0.1)
+        if cfg.get("quantize_p", False):
+            kw["quantize_p"] = True
         return kw
 
     def _update_processor(self) -> None:

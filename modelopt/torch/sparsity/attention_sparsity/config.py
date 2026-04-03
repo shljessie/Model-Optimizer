@@ -139,6 +139,17 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         ),
     )
 
+    quantize_p: bool = ModeloptField(
+        default=False,
+        title="NVFP4 P-matrix quantization.",
+        description=(
+            "If True, quantize the post-softmax p tile to NVFP4 E2M1 inside the "
+            "Triton kernel (per-tile max scaling, straight-through estimator in backward). "
+            "Only effective with the 'diffusers_triton' backend. "
+            "Can be combined with triton_sparse_softmax or triton_skip_softmax."
+        ),
+    )
+
     @field_validator("method")
     @classmethod
     def validate_method(cls, v):

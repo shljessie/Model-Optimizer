@@ -302,6 +302,34 @@ def _apply_mask(
 
 
 # ---------------------------------------------------------------------------
+# NVFP4 E2M1 per-tile P-matrix quantization helper
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quantize_p_nvfp4(p, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Quantize a post-softmax p tile to NVFP4 E2M1 (straight-through estimator).
+
+    P values are non-negative (softmax output). Per-tile scaling:
+    ``scale = max(p) / 6.0`` then boundary-compare to the 8 positive NVFP4
+    E2M1 levels {0, 0.5, 1, 1.5, 2, 3, 4, 6}.  The backward pass uses the
+    straight-through estimator (quantization not re-applied during backward).
+    """
+    p_max = tl.max(tl.max(p, 1), 0)  # per-tile scalar maximum
+    scale = tl.maximum(p_max, 1e-12) / 6.0  # NVFP4 max representable level = 6.0
+    p_scaled = p / scale  # normalize to [0, 6]
+    # Progressive boundary-compare: walk through NVFP4 rounding boundaries
+    # Boundaries: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
+    q = tl.full((BLOCK_M, BLOCK_N), 0.0, dtype=tl.float32)
+    q = tl.where(p_scaled >= 0.25, 0.5, q)
+    q = tl.where(p_scaled >= 0.75, 1.0, q)
+    q = tl.where(p_scaled >= 1.25, 1.5, q)
+    q = tl.where(p_scaled >= 1.75, 2.0, q)
+    q = tl.where(p_scaled >= 2.50, 3.0, q)
+    q = tl.where(p_scaled >= 3.50, 4.0, q)
+    q = tl.where(p_scaled >= 5.00, 6.0, q)
+    return q * scale  # dequantize back to original scale
+
+
+# ---------------------------------------------------------------------------
 # Forward kernel
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_FWD_CONFIGS, key=["N_CTX", "HEAD_DIM"])
@@ -341,6 +369,7 @@ def _attn_fwd(
     DENSE_WINDOW_SIZE: tl.constexpr = 64,  # Tokens near diagonal kept dense (absolute, BLOCK_N-independent)
     APPLY_SKIP_SOFTMAX: tl.constexpr = False,  # Skip KV tiles with negligible scores
     SKIP_THRESHOLD_LOG2: tl.constexpr = 0.0,  # log2(lambda) * sm_scale, pre-scaled for comparison on scaled scores
+    QUANTIZE_P: tl.constexpr = False,  # Quantize post-softmax p tile to NVFP4 E2M1 (per-tile, STE)
     IS_PAGED: tl.constexpr = False,  # Whether K/V are in paged cache
     K_cache=None,  # [num_blocks, page_size, num_kv_heads, head_dim] paged K
     V_cache=None,  # [num_blocks, page_size, num_kv_heads, head_dim] paged V
@@ -504,6 +533,8 @@ def _attn_fwd(
                         mask=((kv_start + kv_pos[:, None]) < seq_len_kv) & d_mask[None, :],
                         other=0.0,
                     )
+                if QUANTIZE_P:
+                    p = _quantize_p_nvfp4(p, BLOCK_M, BLOCK_N)
                 acc = tl.dot(p.to(v.dtype), v, acc)
                 row_max = m_new
             # else: tile skipped: no softmax computation, V load, and BMM2 computation
@@ -544,6 +575,8 @@ def _attn_fwd(
                     mask=((kv_start + kv_pos[:, None]) < seq_len_kv) & d_mask[None, :],
                     other=0.0,
                 )
+            if QUANTIZE_P:
+                p = _quantize_p_nvfp4(p, BLOCK_M, BLOCK_N)
             acc = tl.dot(p.to(v.dtype), v, acc)
             row_max = m_new
 
@@ -935,6 +968,7 @@ class _Attention(torch.autograd.Function):
         v_cache,
         block_table,
         page_size,
+        quantize_p,
     ):
         HEAD_DIM = q.shape[2]
         num_q_heads = q.shape[1]
@@ -1013,6 +1047,7 @@ class _Attention(torch.autograd.Function):
             DENSE_WINDOW_SIZE=dense_window_size,
             APPLY_SKIP_SOFTMAX=apply_skip,
             SKIP_THRESHOLD_LOG2=skip_threshold_log2,
+            QUANTIZE_P=quantize_p,
             IS_PAGED=is_paged,
             K_cache=k_cache,
             V_cache=v_cache,
@@ -1045,6 +1080,7 @@ class _Attention(torch.autograd.Function):
         ctx.dense_window_size = dense_window_size
         ctx.apply_skip = apply_skip
         ctx.skip_threshold_log2 = skip_threshold_log2
+        ctx.quantize_p = quantize_p
         return o
 
     @staticmethod
@@ -1175,6 +1211,7 @@ class _Attention(torch.autograd.Function):
             None,  # v_cache
             None,  # block_table
             None,  # page_size
+            None,  # quantize_p
         )
 
 
@@ -1196,6 +1233,7 @@ def attention(
     num_sink_tokens: int = 0,
     dense_window_size: int = 64,
     skip_softmax_threshold: float | None = None,
+    quantize_p: bool = False,
     k_cache: torch.Tensor | None = None,
     v_cache: torch.Tensor | None = None,
     block_table: torch.Tensor | None = None,
@@ -1231,6 +1269,9 @@ def attention(
             softmax contribution is negligible. Tiles are skipped entirely
             (no softmax, V load, or BMM2). The threshold is applied on
             unscaled scores. Set to ``None`` or ``0`` to disable.
+        quantize_p: If ``True``, quantize the post-softmax p tile to NVFP4
+            E2M1 before the p @ V matmul (per-tile max scaling, STE in
+            backward). Default ``False``.
         k_cache: Paged K cache [num_blocks, page_size, num_kv_heads, head_dim].
             When provided, K/V are read from paged cache via block_table
             instead of from contiguous k/v tensors.
@@ -1264,6 +1305,7 @@ def attention(
         v_cache,
         block_table,
         page_size,
+        quantize_p,
     )
 
 
