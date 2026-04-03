@@ -21,8 +21,8 @@ pipeline:
     args:
       - --data /hf-local/modelopt/Speculative-Decoding-Dataset-v1-Qwen3-8B/sample-100K.jsonl
       - --output_dir /scratchspace/dflash
-      - --num_epochs 3
-      - --lr 1e-4
+      - --num_epochs 1
+      - --lr 6e-4
       - --training_seq_len 512
       - --save_steps 500000
       - --log_steps 100

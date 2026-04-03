@@ -413,10 +413,9 @@ class LanguageDataCollator:
                     )
 
         if not batch:
-            raise ValueError(
-                "All samples in batch were skipped (no assistant turns). "
-                "Check that your training data contains assistant responses."
-            )
+            # All samples skipped — create a dummy batch with all-masked labels
+            # so the training step produces zero loss without crashing DDP
+            batch = [[{"role": "user", "content": ""}, {"role": "assistant", "content": ""}]]  # type: ignore[list-item]
 
         return self._process_chat_sample(batch)
 
