@@ -23,11 +23,22 @@ collect responses, and optionally save them to disk for downstream pipelines
 # ruff: noqa: D101, D102, D103, D107, F841, PLR1722
 import argparse
 import os
+import re
 
 from datasets import load_dataset
 from openai import OpenAI
 
 early_termination = False
+
+
+def _strip_thinking(content: str) -> str:
+    """Strip <think>...</think> blocks from assistant message content.
+
+    Used to clean intermediate assistant turns before they are appended to the
+    context for the next generation step.  Only the final assistant turn in a
+    multi-turn conversation should retain the full reasoning trace.
+    """
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 class LLM:
@@ -37,6 +48,7 @@ class LLM:
         self.generate(messages=[{"role": "user", "content": "Hello! /no_think"}], verbose=True)
 
     def generate(self, messages, verbose=False, **chat_template_kwargs):
+        global early_termination
         try:
             completion = self.client.chat.completions.create(
                 model=self.args.model,
@@ -90,37 +102,62 @@ def disable_thinking_column(data):
 
 
 def synthesize(data):
-    messages = data.get("conversations", None)
-    if messages is None:
-        messages = data.get("messages", None)
+    messages = data.get("conversations") or data.get("messages")
     if messages is None:
         raise ValueError(
-            "No conversations of messages in the data. Only OAI chat data is supported."
+            "No conversations or messages in the data. Only OAI chat data is supported."
         )
 
     # Handle generation specific kwargs.
     enable_thinking = data.get("enable_thinking", True)
 
     current_messages = []
+    last_full_message = None  # tracks the most recent generated response (unstripped)
 
     for msg in messages:
-        if msg["role"] == "system":
+        role = msg["role"]
+        if role == "system":
             current_messages.append(msg)
-        elif msg["role"] == "user":
+        elif role == "user":
             if not enable_thinking:
+                # Copy to avoid mutating the original dataset row.
+                msg = dict(msg)
                 msg["content"] = msg["content"] + " /no_think"
 
             current_messages.append(msg)
             new_message = llm.generate(current_messages, verbose=False)
             if new_message is None:
                 break
+
+            last_full_message = new_message
+
+            if enable_thinking:
+                # Append a thinking-stripped copy as context for the next turn.
+                # Multi-turn reasoning: only the *last* assistant turn should
+                # retain the full <think>...</think> trace; prior turns are
+                # already resolved and the trace would distract the model.
+                # The full trace is restored to the last turn after the loop.
+                stripped = {
+                    "role": "assistant",
+                    "content": _strip_thinking(new_message["content"]),
+                }
+                current_messages.append(stripped)
             else:
                 current_messages.append(new_message)
-        elif msg["role"] == "assistant":
-            # Original assistant messages are not used
+        elif role == "assistant":
+            # Original assistant messages are not used — the model generates fresh responses.
             pass
         else:
-            raise ValueError("unknown role: {}".format(msg["role"]))
+            # Skip unknown roles (e.g. tool) rather than raising; tool turns are
+            # part of agentic datasets but are not sent to the generation model.
+            pass
+
+    # Restore the full reasoning trace for the last generated assistant turn.
+    if enable_thinking and last_full_message is not None:
+        for i in range(len(current_messages) - 1, -1, -1):
+            if current_messages[i]["role"] == "assistant":
+                current_messages[i] = last_full_message
+                break
 
     return {"conversations": current_messages}
 
