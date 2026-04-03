@@ -197,7 +197,6 @@ if AttentionModuleMixin.__module__.startswith(diffusers.__name__):
                 return super().forward(*args, **kwargs)
 
     QuantModuleRegistry.register({FluxAttention: "FluxAttention"})(_QuantAttentionModuleMixin)
-    QuantModuleRegistry.register({WanAttention: "WanAttention"})(_QuantAttentionModuleMixin)
     QuantModuleRegistry.register({LTXAttention: "LTXAttention"})(_QuantAttentionModuleMixin)
     if Flux2Attention is not None:
         QuantModuleRegistry.register({Flux2Attention: "Flux2Attention"})(_QuantAttentionModuleMixin)
@@ -205,6 +204,184 @@ if AttentionModuleMixin.__module__.startswith(diffusers.__name__):
         QuantModuleRegistry.register({Flux2ParallelSelfAttention: "Flux2ParallelSelfAttention"})(
             _QuantAttentionModuleMixin
         )
+
+    def _apply_rotary_emb_wan(
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply rotary embeddings to WAN attention tensors."""
+        x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+        cos = freqs_cos[..., 0::2]
+        sin = freqs_sin[..., 1::2]
+        out = torch.empty_like(hidden_states)
+        out[..., 0::2] = x1 * cos - x2 * sin
+        out[..., 1::2] = x1 * sin + x2 * cos
+        return out.type_as(hidden_states)
+
+    class _QuantWanAttnProcessor:
+        """WAN attention processor that applies TensorQuantizer to the P-matrix.
+
+        Performs manual Q@K^T -> softmax -> softmax_quantizer -> @V so that the
+        post-softmax attention weights (P-matrix) can be quantized with any
+        TensorQuantizer configuration (e.g. NVFP4).
+
+        Also honours q_bmm_quantizer, k_bmm_quantizer, and v_bmm_quantizer
+        from the parent _QuantWanAttention module.
+        """
+
+        # Kept for diffusers compatibility checks.
+        _attention_backend = None
+
+        @staticmethod
+        def _prepare_qkv(
+            attn: "WanAttention",
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: torch.Tensor | None,
+            rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Project, norm, reshape, and apply rotary embeddings."""
+            enc = hidden_states if encoder_hidden_states is None else encoder_hidden_states
+
+            if attn.fused_projections:
+                if attn.cross_attention_dim_head is None:
+                    query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+                else:
+                    query = attn.to_q(hidden_states)
+                    key, value = attn.to_kv(enc).chunk(2, dim=-1)
+            else:
+                query = attn.to_q(hidden_states)
+                key = attn.to_k(enc)
+                value = attn.to_v(enc)
+
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
+
+            # Reshape to BSND: [B, S, heads, head_dim]
+            query = query.unflatten(2, (attn.heads, -1))
+            key = key.unflatten(2, (attn.heads, -1))
+            value = value.unflatten(2, (attn.heads, -1))
+
+            if rotary_emb is not None:
+                query = _apply_rotary_emb_wan(query, *rotary_emb)
+                key = _apply_rotary_emb_wan(key, *rotary_emb)
+
+            return query, key, value
+
+        def _attention(
+            self,
+            attn_module: "WanAttention",
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+        ) -> torch.Tensor:
+            """Quantized attention: Q@K^T -> softmax -> softmax_quantizer -> @V.
+
+            Args:
+                attn_module: The (quantized) WanAttention module holding quantizers.
+                query: ``[B, S, H, D]``
+                key:   ``[B, T, H, D]``
+                value: ``[B, T, H, D]``
+                attention_mask: Optional additive mask broadcastable to ``[B, S, H, T]``.
+
+            Returns:
+                Output ``[B, S, H*D]``.
+            """
+            head_dim = query.shape[-1]
+            scale = head_dim**-0.5
+
+            # Apply Q/K quantizers before the matmul.
+            q = attn_module.q_bmm_quantizer(query)
+            k = attn_module.k_bmm_quantizer(key)
+
+            # [B, S, H, D] x [B, T, H, D] -> [B, S, H, T]
+            attn_weights = torch.einsum("bshd,bthd->bsht", q, k) * scale
+
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+
+            # Quantize the P-matrix (post-softmax attention weights).
+            attn_weights = attn_module.softmax_quantizer(attn_weights)
+
+            # Apply V quantizer before the second matmul.
+            v = attn_module.v_bmm_quantizer(value)
+
+            # [B, S, H, T] x [B, T, H, D] -> [B, S, H, D]
+            out = torch.einsum("bsht,bthd->bshd", attn_weights, v)
+            return out.flatten(2, 3).type_as(query)
+
+        def __call__(
+            self,
+            attn: "WanAttention",
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: torch.Tensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ) -> torch.Tensor:
+            """Forward pass — replaces WanAttnProcessor.__call__."""
+            encoder_hidden_states_img = None
+            if attn.add_k_proj is not None:
+                # I2V: split image and text context (512 is WAN's hardcoded text length).
+                assert encoder_hidden_states is not None
+                image_context_length = encoder_hidden_states.shape[1] - 512
+                encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+                encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+
+            query, key, value = self._prepare_qkv(
+                attn, hidden_states, encoder_hidden_states, rotary_emb
+            )
+
+            # I2V image cross-attention.
+            hidden_states_img = None
+            if encoder_hidden_states_img is not None:
+                if attn.fused_projections:
+                    key_img, value_img = attn.to_added_kv(encoder_hidden_states_img).chunk(
+                        2, dim=-1
+                    )
+                else:
+                    key_img = attn.add_k_proj(encoder_hidden_states_img)
+                    value_img = attn.add_v_proj(encoder_hidden_states_img)
+                key_img = attn.norm_added_k(key_img)
+                key_img = key_img.unflatten(2, (attn.heads, -1))
+                value_img = value_img.unflatten(2, (attn.heads, -1))
+                hidden_states_img = self._attention(attn, query, key_img, value_img, None)
+
+            hidden_states = self._attention(attn, query, key, value, attention_mask)
+
+            if hidden_states_img is not None:
+                hidden_states = hidden_states + hidden_states_img
+
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
+            return hidden_states
+
+    class _QuantWanAttention(_QuantAttentionModuleMixin):
+        """Quantized WanAttention with P-matrix (post-softmax) quantization.
+
+        Installs ``_QuantWanAttnProcessor`` which performs manual attention
+        computation so that ``softmax_quantizer`` is applied to the attention
+        weights between softmax and the value matmul.  The standard
+        ``q_bmm_quantizer``, ``k_bmm_quantizer``, ``v_bmm_quantizer``, and
+        ``softmax_quantizer`` are all created by the parent ``_QuantAttention._setup()``.
+        """
+
+        def _setup(self) -> None:
+            """Set up quantizers and install the quantized attention processor."""
+            super()._setup()
+            self.set_processor(_QuantWanAttnProcessor())
+
+        def forward(self, *args, **kwargs):
+            """Forward without function-patching context (processor handles quantization)."""
+            # Skip _QuantFunctionalMixin's torch.bmm/F.sdpa patching — the
+            # _QuantWanAttnProcessor calls quantizers directly, so no context needed.
+            with attention_backend(AttentionBackendName.NATIVE):
+                # Jump past _QuantFunctionalMixin.forward() to WanAttention.forward()
+                return super(_QuantAttentionModuleMixin, self).forward(*args, **kwargs)
+
+    QuantModuleRegistry.register({WanAttention: "WanAttention"})(_QuantWanAttention)
 
 
 original_scaled_dot_product_attention = F.scaled_dot_product_attention

@@ -43,6 +43,13 @@ Attention kernel variants supported via ``--kernel``:
     - Manual attention: Q@K^T → scale → mask → softmax → NVFP4_pertile(P) → P@V
     - No CUDA kernel required. Use to measure accuracy vs FP8.
 
+``nvfp4-modelopt`` (requires modelopt)
+    ModelOpt NVFP4 E2M1 post-softmax P quantization via ``mtq.quantize()``.
+    Replaces each WanAttention module with a ``_QuantWanAttention`` that uses
+    ``TensorQuantizer`` with dynamic block-wise NVFP4 (block_size=16) on the P-matrix.
+    Uses the proper ModelOpt quantization framework (``NVFP4_WAN_SOFTMAX_CFG``).
+    Applied in-place to ``pipe.transformer``; use ``mtq.restore()`` to undo.
+
 ``triton-sparse`` (requires triton + modelopt)
     ModelOpt Triton flash-attention kernel with N:M sparse softmax (2:4 by default).
     Applied via ``mtsa.sparsify()`` to the WAN transformer using the ``diffusers_triton``
@@ -106,6 +113,7 @@ DEFAULT_NEGATIVE_PROMPT = "low quality, blurry, distorted, watermark, text, crop
 # Kernel choices
 KERNEL_FP8 = "fp8"
 KERNEL_NVFP4 = "nvfp4"
+KERNEL_NVFP4_MODELOPT = "nvfp4-modelopt"
 KERNEL_SAGE1 = "sage1"
 KERNEL_SAGE2_FP16 = "sage2-fp16"
 KERNEL_SAGE2_FP8 = "sage2-fp8"
@@ -114,6 +122,7 @@ KERNEL_TRITON_SKIP = "triton-skip"
 KERNEL_CHOICES = [
     KERNEL_FP8,
     KERNEL_NVFP4,
+    KERNEL_NVFP4_MODELOPT,
     KERNEL_SAGE1,
     KERNEL_SAGE2_FP16,
     KERNEL_SAGE2_FP8,
@@ -121,12 +130,15 @@ KERNEL_CHOICES = [
     KERNEL_TRITON_SKIP,
 ]
 
-# Kernels that use mtsa.sparsify() instead of patching F.scaled_dot_product_attention
+# Kernels that modify pipe.transformer in-place via ModelOpt APIs (not SDPA patching).
+_MODELOPT_KERNELS = {KERNEL_NVFP4_MODELOPT, KERNEL_TRITON_SPARSE, KERNEL_TRITON_SKIP}
+# Kept for backwards-compat; now a subset of _MODELOPT_KERNELS.
 _TRITON_MODELOPT_KERNELS = {KERNEL_TRITON_SPARSE, KERNEL_TRITON_SKIP}
 
 _KERNEL_DESCRIPTIONS = {
     KERNEL_FP8: "FP8 E4M3 QKV (Python-level, SA2-inspired smoothing, no CUDA kernel required)",
     KERNEL_NVFP4: "NVFP4 E2M1 post-softmax P per-tile (Python-level, SA3-faithful, 64x64 tiles)",
+    KERNEL_NVFP4_MODELOPT: "NVFP4 E2M1 post-softmax P via mtq.quantize() + TensorQuantizer (ModelOpt)",
     KERNEL_SAGE1: "sageattn (SA1, INT8 QK + FP16 PV, auto-select)",
     KERNEL_SAGE2_FP16: "sageattn_qk_int8_pv_fp16_cuda (SA2, INT8 QK + FP16 PV, per-thread)",
     KERNEL_SAGE2_FP8: "sageattn_qk_int8_pv_fp8_cuda (SA2++, INT8 QK + FP8 PV, fp32+fp16 accum)",
@@ -213,6 +225,14 @@ def _detect_available_kernels() -> list[str]:
             available.append(KERNEL_SAGE2_FP16)
         if hasattr(_sa, "sageattn_qk_int8_pv_fp8_cuda"):
             available.append(KERNEL_SAGE2_FP8)
+
+    # nvfp4-modelopt requires modelopt quantization + diffusers >= 0.35
+    try:
+        from modelopt.torch.quantization.config import NVFP4_WAN_SOFTMAX_CFG as _  # noqa: F401
+
+        available.append(KERNEL_NVFP4_MODELOPT)
+    except ImportError:
+        pass
 
     # Triton ModelOpt kernels require: triton + modelopt sparse attention
     try:
@@ -506,10 +526,10 @@ def enable_attention_kernel(
 
     if kernel not in KERNEL_CHOICES:
         raise ValueError(f"Unknown kernel {kernel!r}. Choose from {KERNEL_CHOICES}")
-    if kernel in _TRITON_MODELOPT_KERNELS:
+    if kernel in _MODELOPT_KERNELS:
         raise ValueError(
             f"Kernel {kernel!r} cannot be activated via enable_attention_kernel(). "
-            "Use apply_triton_sparse_kernel(pipe.transformer, kernel) instead."
+            "Use apply_nvfp4_modelopt_kernel() or apply_triton_sparse_kernel() instead."
         )
     if kernel not in AVAILABLE_KERNELS:
         raise RuntimeError(f"Kernel {kernel!r} is not available. Available: {AVAILABLE_KERNELS}")
@@ -576,6 +596,30 @@ _TRITON_SKIP_CONFIG = {
         "default": {"enable": False},
     }
 }
+
+
+def apply_nvfp4_modelopt_kernel(transformer: torch.nn.Module) -> None:
+    """Apply NVFP4 P-matrix quantization to the WAN transformer via ModelOpt.
+
+    Calls ``mtq.quantize()`` with ``NVFP4_WAN_SOFTMAX_CFG``, which replaces every
+    ``WanAttention`` module with a ``_QuantWanAttention`` that uses ``TensorQuantizer``
+    to quantize the post-softmax P-matrix to NVFP4 E2M1 with dynamic block_size=16
+    scaling.  Q, K, V stay in BF16.
+
+    Because NVFP4 block quantization is dynamic (scales computed at forward time from
+    the per-block amax), no calibration data is needed — ``mtq.quantize()`` is
+    sufficient.
+
+    Args:
+        transformer: The ``pipe.transformer`` WAN model (modified in-place).
+    """
+    import modelopt.torch.quantization as mtq
+    from modelopt.torch.quantization.config import NVFP4_WAN_SOFTMAX_CFG
+
+    mtq.quantize(transformer, NVFP4_WAN_SOFTMAX_CFG)
+    print(
+        f"[Attention] Applied {KERNEL_NVFP4_MODELOPT}: {_KERNEL_DESCRIPTIONS[KERNEL_NVFP4_MODELOPT]}"
+    )
 
 
 def apply_triton_sparse_kernel(transformer: torch.nn.Module, kernel: str) -> None:
@@ -819,6 +863,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "fp8: Python-level FP8 E4M3 (SA2 smoothing, no CUDA kernel, accuracy testing); "
             "nvfp4: Python-level NVFP4 E2M1 post-softmax P (SA3-inspired, per-tile); "
+            "nvfp4-modelopt: ModelOpt NVFP4 P-matrix via mtq.quantize() (requires modelopt); "
             "sage1: SA1 INT8+FP16; "
             "sage2-fp16: SA2 INT8+FP16; "
             "sage2-fp8: SA2++ INT8+FP8; "
@@ -887,19 +932,21 @@ def main() -> None:
     nvfp4_tile = _parse_nvfp4_tile(args.nvfp4_tile)
     pipe = load_pipeline(args.model)
 
-    is_triton_kernel = args.kernel in _TRITON_MODELOPT_KERNELS
+    is_modelopt_kernel = args.kernel in _MODELOPT_KERNELS
 
     if args.compare:
         # --- Baseline ---
         _, frames_base = run_inference(pipe, args, label="baseline")
 
         # --- Quantized ---
-        if is_triton_kernel:
+        if args.kernel == KERNEL_NVFP4_MODELOPT:
+            apply_nvfp4_modelopt_kernel(pipe.transformer)
+        elif args.kernel in _TRITON_MODELOPT_KERNELS:
             apply_triton_sparse_kernel(pipe.transformer, args.kernel)
         else:
             enable_attention_kernel(args.kernel, nvfp4_tile=nvfp4_tile)
         _, frames_quant = run_inference(pipe, args, label=args.kernel)
-        if not is_triton_kernel:
+        if not is_modelopt_kernel:
             print_kernel_stats()
             disable_attention_kernel()
 
@@ -938,10 +985,10 @@ def main() -> None:
             if kernel not in AVAILABLE_KERNELS:
                 print(f"\n[{kernel}] Skipped — not available")
                 continue
-            if kernel in _TRITON_MODELOPT_KERNELS:
+            if kernel in _MODELOPT_KERNELS:
                 print(
-                    f"\n[{kernel}] Skipped in --benchmark (triton kernels modify the model "
-                    "in-place; run separately with --kernel {kernel})"
+                    f"\n[{kernel}] Skipped in --benchmark (ModelOpt kernels modify the model "
+                    f"in-place; run separately with --kernel {kernel})"
                 )
                 continue
             enable_attention_kernel(kernel, nvfp4_tile=nvfp4_tile)
@@ -955,7 +1002,7 @@ def main() -> None:
         print(f"  {'-' * 40}")
         print(f"  {'baseline (SDPA)':<20} {t_base:>7.1f}s   {'1.00x':>8}")
         for kernel in KERNEL_CHOICES:
-            if kernel in _TRITON_MODELOPT_KERNELS:
+            if kernel in _MODELOPT_KERNELS:
                 print(f"  {kernel:<20} {'N/A':>8}   {'N/A':>8}  (run separately)")
                 continue
             if kernel not in timing:
@@ -968,7 +1015,11 @@ def main() -> None:
     elif args.baseline:
         run_inference(pipe, args, label="baseline")
 
-    elif is_triton_kernel:
+    elif args.kernel == KERNEL_NVFP4_MODELOPT:
+        apply_nvfp4_modelopt_kernel(pipe.transformer)
+        run_inference(pipe, args, label=args.kernel)
+
+    elif args.kernel in _TRITON_MODELOPT_KERNELS:
         apply_triton_sparse_kernel(pipe.transformer, args.kernel)
         run_inference(pipe, args, label=args.kernel)
 

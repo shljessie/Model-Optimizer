@@ -526,6 +526,20 @@ NVFP4_KV_CFG = {
     "algorithm": "max",
 }
 
+# Quantize only the post-softmax P-matrix for diffusers WAN attention modules.
+# Requires diffusers >= 0.35.0 and the _QuantWanAttention plugin to be active.
+NVFP4_WAN_SOFTMAX_CFG = {
+    "quant_cfg": {
+        "*softmax_quantizer": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "enable": True,
+        },
+        "default": {"enable": False},
+    },
+    "algorithm": "max",
+}
+
 # Moved from examples/diffusers/quantization/config.py to here
 NVFP4_FP8_MHA_CONFIG = {
     "quant_cfg": {
@@ -635,6 +649,7 @@ choices: set[str] = {
     "NVFP4_FP8_MHA_CONFIG",
     "NVFP4_KV_CFG",
     "NVFP4_KV_ROTATE_CFG",
+    "NVFP4_WAN_SOFTMAX_CFG",
     "W4A8_NVFP4_FP8_CFG",
     "NVFP4_SVDQUANT_DEFAULT_CFG",
     "W4A8_AWQ_BETA_CFG",
