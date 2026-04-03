@@ -259,8 +259,9 @@ class LanguageDataCollator:
                     break
 
             if not found:
-                # No assistant pattern found — keep all labels (don't mask)
-                pass
+                # No assistant pattern found — mask all labels to avoid
+                # training on system/user tokens which inflates accuracy
+                labels[batch_idx, :] = IGNORE_TOKEN_ID
 
         return labels
 
