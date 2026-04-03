@@ -34,7 +34,12 @@ import os
 from typing import Any
 
 from fakequant_worker import disable_compilation
-from vllm.attention.layer import Attention as VLLMAttention
+
+try:
+    from vllm.attention.layer import Attention as VLLMAttention  # vllm < 0.16
+except ModuleNotFoundError:
+    from vllm.model_executor.layers.attention import Attention as VLLMAttention  # vllm >= 0.16
+
 from vllm.v1.worker.gpu_worker import Worker as BaseWorker
 
 import modelopt.torch.sparsity.attention_sparsity as mtsa

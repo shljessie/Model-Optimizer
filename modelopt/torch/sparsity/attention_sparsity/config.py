@@ -538,6 +538,23 @@ SPARSE_SOFTMAX_DEFAULT = {
 }
 
 
+# 1:4 N:M sparse softmax configuration
+SPARSE_SOFTMAX_14 = {
+    "sparse_cfg": {
+        "*attn*": {
+            "method": "triton_sparse_softmax",
+            "sparsity_n": 1,
+            "sparsity_m": 4,
+            "num_sink_tokens": 0,
+            "dense_window_size": 64,
+            "backend": "triton",
+            "enable": True,
+        },
+        "default": {"enable": False},
+    },
+}
+
+
 # Default skip-softmax configuration for Triton kernel
 SKIP_SOFTMAX_TRITON_DEFAULT = {
     "sparse_cfg": {
@@ -557,6 +574,7 @@ __all__ = [
     "SKIP_SOFTMAX_DEFAULT",
     "SKIP_SOFTMAX_TRITON_DEFAULT",
     "SPARSE_SOFTMAX_DEFAULT",
+    "SPARSE_SOFTMAX_14",
     "CalibrationConfig",
     "FlashSkipSoftmaxConfig",
     "SparseAttentionAttributeConfig",
