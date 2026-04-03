@@ -243,44 +243,46 @@ class EagleTrainingPlot(TrainerCallback):
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
-        """Run AR validation periodically.
+        """Run AR validation periodically (single-GPU only).
 
-        Only rank 0 with CUDA device 0 runs validation and logs results.
-        All other ranks skip to avoid DDP deadlock — the validation uses
-        the unwrapped model with torch.no_grad() which doesn't trigger
-        collective ops. A barrier syncs all ranks afterward.
+        AR validation with DDP is not supported because pseudo_speculative_generate
+        runs only on rank 0 while other ranks deadlock waiting for collective ops.
+        When world_size > 1, AR validation is skipped with a one-time warning.
+        Use post-training AR validation instead (online_training.sh runs it after training).
         """
         if self.ar_validate_steps <= 0:
             return control
         if state.global_step % self.ar_validate_steps == 0 and state.global_step > 0:
-            # All ranks must participate to avoid DDP deadlock.
-            # Only rank 0 does real validation; others do a no-op.
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                if not hasattr(self, "_ar_ddp_warned"):
+                    self._ar_ddp_warned = True
+                    print_rank_0(
+                        "=== WARNING === AR validation during training is not supported with "
+                        "DDP (world_size > 1). Skipping. Use post-training AR validation."
+                    )
+                return control
+
             model = kwargs["model"]
             raw_model = model.module if hasattr(model, "module") else model
             was_training = raw_model.training
             raw_model.eval()
-
-            if is_master():
-                print_rank_0("Running AR validation...")
-                try:
-                    with torch.no_grad():
-                        ars = validate_ar(
-                            model=raw_model,
-                            tokenizer=kwargs["processing_class"],
-                            ds=load_dataset("/hf-local/HuggingFaceH4/mt_bench_prompts")["train"],
-                            device=torch.device("cuda", 0),
-                            num_samples=8,
-                        )
-                    print_rank_0(f"Step {state.global_step} AR: {sum(ars) / len(ars):.4f}")
-                    if wandb:
-                        wandb.log({"validate_ar": sum(ars) / len(ars)}, step=state.global_step)
-                except Exception as e:
-                    print_rank_0(f"AR validation failed: {e}")
-
+            print_rank_0("Running AR validation...")
+            try:
+                with torch.no_grad():
+                    ars = validate_ar(
+                        model=raw_model,
+                        tokenizer=kwargs["processing_class"],
+                        ds=load_dataset("/hf-local/HuggingFaceH4/mt_bench_prompts")["train"],
+                        device=next(raw_model.parameters()).device,
+                        num_samples=8,
+                    )
+                print_rank_0(f"Step {state.global_step} AR: {sum(ars) / len(ars):.4f}")
+                if wandb:
+                    wandb.log({"validate_ar": sum(ars) / len(ars)}, step=state.global_step)
+            except Exception as e:
+                print_rank_0(f"AR validation failed: {e}")
             if was_training:
                 raw_model.train()
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
         return control
 
 
