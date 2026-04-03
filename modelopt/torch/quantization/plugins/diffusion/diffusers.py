@@ -268,6 +268,10 @@ if AttentionModuleMixin.__module__.startswith(diffusers.__name__):
 
             return query, key, value
 
+        # Row-chunk size to avoid materialising the full S×T float32 matrix OOM
+        # on long video sequences (WAN2.2 can exceed 8k tokens).
+        _CHUNK = 512
+
         def _attention(
             self,
             attn_module: "WanAttention",
@@ -277,6 +281,9 @@ if AttentionModuleMixin.__module__.startswith(diffusers.__name__):
             attention_mask: torch.Tensor | None,
         ) -> torch.Tensor:
             """Quantized attention: Q@K^T -> softmax -> softmax_quantizer -> @V.
+
+            Processes query rows in chunks of ``_CHUNK`` to avoid materialising the
+            full S×T attention matrix in float32 (which OOMs for long video sequences).
 
             Args:
                 attn_module: The (quantized) WanAttention module holding quantizers.
@@ -291,26 +298,34 @@ if AttentionModuleMixin.__module__.startswith(diffusers.__name__):
             head_dim = query.shape[-1]
             scale = head_dim**-0.5
 
-            # Apply Q/K quantizers before the matmul.
+            # Apply Q/K/V quantizers once before the chunked loop.
             q = attn_module.q_bmm_quantizer(query)
             k = attn_module.k_bmm_quantizer(key)
-
-            # [B, S, H, D] x [B, T, H, D] -> [B, S, H, T]
-            attn_weights = torch.einsum("bshd,bthd->bsht", q, k) * scale
-
-            if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask
-
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-
-            # Quantize the P-matrix (post-softmax attention weights).
-            attn_weights = attn_module.softmax_quantizer(attn_weights)
-
-            # Apply V quantizer before the second matmul.
             v = attn_module.v_bmm_quantizer(value)
 
-            # [B, S, H, T] x [B, T, H, D] -> [B, S, H, D]
-            out = torch.einsum("bsht,bthd->bshd", attn_weights, v)
+            seq_q = q.shape[1]
+            out_chunks = []
+
+            for start in range(0, seq_q, self._CHUNK):
+                end = min(start + self._CHUNK, seq_q)
+                q_chunk = q[:, start:end]  # [B, chunk, H, D]
+
+                # [B, chunk, H, D] x [B, T, H, D] -> [B, chunk, H, T]
+                w_chunk = torch.einsum("bshd,bthd->bsht", q_chunk, k) * scale
+
+                if attention_mask is not None:
+                    # mask shape: [B, 1, S, T] or [B, H, S, T] — slice along S dim
+                    w_chunk = w_chunk + attention_mask[..., start:end, :]
+
+                w_chunk = F.softmax(w_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
+
+                # Quantize the P-matrix chunk (post-softmax attention weights).
+                w_chunk = attn_module.softmax_quantizer(w_chunk)
+
+                # [B, chunk, H, T] x [B, T, H, D] -> [B, chunk, H, D]
+                out_chunks.append(torch.einsum("bsht,bthd->bshd", w_chunk, v))
+
+            out = torch.cat(out_chunks, dim=1)  # [B, S, H, D]
             return out.flatten(2, 3).type_as(query)
 
         def __call__(
