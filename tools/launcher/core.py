@@ -157,6 +157,8 @@ class SandboxPipeline:
     task_4: SandboxTask4 = None
     tasks: list[SandboxTask] = None
 
+    assets: list[str] = None  # HF repo paths (relative to hf_local) to verify before submission
+
     test_level: int = 0
     allow_to_fail: bool = False
     skip: bool = False
