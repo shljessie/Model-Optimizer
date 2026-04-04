@@ -81,6 +81,7 @@ class LLM:
 
             if "Connection error" in str(e):
                 early_termination = True
+                raise  # propagate so datasets.map() halts the shard
 
             new_message = None
 
@@ -159,12 +160,15 @@ def synthesize(data):
                 current_messages.append(stripped)
             else:
                 current_messages.append(new_message)
+        elif role == "developer":
+            # Map developer-role messages to system per OpenAI schema conventions.
+            current_messages.append({"role": "system", "content": msg["content"]})
         elif role == "assistant":
             # Original assistant messages are not used — the model generates fresh responses.
             pass
         else:
-            # Skip unknown roles (e.g. tool) rather than raising; tool turns are
-            # part of agentic datasets but are not sent to the generation model.
+            # Skip unknown roles (e.g. tool) — agentic datasets include tool turns
+            # that are not sent to the generation model.
             pass
 
     # Restore the full reasoning trace for the last generated assistant turn.

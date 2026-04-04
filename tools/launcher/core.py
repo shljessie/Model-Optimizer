@@ -254,7 +254,7 @@ def build_slurm_executor(
 
     tunnel = run.SSHTunnel(
         host=slurm_config.host,
-        user=getattr(slurm_config, "user", None) or (getpass.getuser() if user is None else user),
+        user=user or getattr(slurm_config, "user", None) or getpass.getuser(),
         port=slurm_config.port,
         job_dir=job_dir,
         identity=identity,
