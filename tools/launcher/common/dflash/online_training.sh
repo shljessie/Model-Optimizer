@@ -91,19 +91,27 @@ echo "Source: ${OUTPUT_DIR}"
 echo "Export: ${EXPORT_DIR}"
 
 CUDA_VISIBLE_DEVICES=0 python3 -c "
+import torch
 import modelopt.torch.opt as mto
 from modelopt.torch.export import export_speculative_decoding
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
 
 mto.enable_huggingface_checkpointing()
-with patch_transformers5_params_loading():
-    model = load_vlm_or_llm('${OUTPUT_DIR}', torch_dtype='auto', device_map='cpu', trust_remote_code=True)
-model.eval()
-import torch
-with torch.inference_mode():
-    export_speculative_decoding(model, export_dir='${EXPORT_DIR}')
-print('Export complete')
-" || echo "WARNING: Export failed, continuing with AR validation"
+try:
+    with patch_transformers5_params_loading():
+        model = load_vlm_or_llm(
+            '${OUTPUT_DIR}',
+            torch_dtype=torch.bfloat16,
+            device_map={'': 'cpu'},
+            trust_remote_code=True,
+        )
+    model.eval()
+    with torch.inference_mode():
+        export_speculative_decoding(model, export_dir='${EXPORT_DIR}')
+    print('Export complete')
+except Exception as e:
+    print(f'Export failed: {e}')
+" || echo "WARNING: Export script failed, continuing with AR validation"
 
 echo ""
 echo "Export contents:"
