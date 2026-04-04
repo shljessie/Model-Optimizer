@@ -112,30 +112,10 @@ echo "=== Exporting DFlash checkpoint ==="
 echo "Source: ${OUTPUT_DIR}"
 echo "Export: ${EXPORT_DIR}"
 
-CUDA_VISIBLE_DEVICES=0 python3 -c "
-import torch
-import modelopt.torch.opt as mto
-from modelopt.torch.export import export_speculative_decoding
-from transformers import AutoModelForCausalLM
-
-mto.enable_huggingface_checkpointing()
-try:
-    model = AutoModelForCausalLM.from_pretrained(
-        '${OUTPUT_DIR}',
-        torch_dtype=torch.bfloat16,
-        device_map='cpu',
-        low_cpu_mem_usage=False,
-        trust_remote_code=True,
-    )
-    model.eval()
-    with torch.inference_mode():
-        export_speculative_decoding(model, export_dir='${EXPORT_DIR}')
-    print('Export complete')
-except Exception as e:
-    import traceback
-    traceback.print_exc()
-    print(f'Export failed: {e}')
-" || echo "WARNING: Export script failed, continuing with AR validation"
+python3 modules/Model-Optimizer/examples/speculative_decoding/scripts/export_hf_checkpoint.py \
+    --model_path ${OUTPUT_DIR} \
+    --export_path ${EXPORT_DIR} \
+    || echo "WARNING: Export failed, continuing with AR validation"
 
 echo ""
 echo "Export contents:"
