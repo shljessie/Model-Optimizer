@@ -72,10 +72,37 @@ if [ "${NUM_AR_SAMPLES}" = "0" ]; then
 fi
 
 if [ -z "$OUTPUT_DIR" ]; then
-    echo "WARNING: --output_dir not found in args, skipping AR validation"
+    echo "WARNING: --output_dir not found in args, skipping export and AR validation"
     exit 0
 fi
 
+# Step 2: Export checkpoint to z-lab HF format
+EXPORT_DIR=${OUTPUT_DIR}/export
+echo ""
+echo "=== Exporting DFlash checkpoint ==="
+echo "Source: ${OUTPUT_DIR}"
+echo "Export: ${EXPORT_DIR}"
+
+CUDA_VISIBLE_DEVICES=0 python3 -c "
+import modelopt.torch.opt as mto
+from modelopt.torch.export import export_speculative_decoding
+from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
+
+mto.enable_huggingface_checkpointing()
+with patch_transformers5_params_loading():
+    model = load_vlm_or_llm('${OUTPUT_DIR}', torch_dtype='auto', device_map='cpu', trust_remote_code=True)
+model.eval()
+import torch
+with torch.inference_mode():
+    export_speculative_decoding(model, export_dir='${EXPORT_DIR}')
+print('Export complete')
+" || echo "WARNING: Export failed, continuing with AR validation"
+
+echo ""
+echo "Export contents:"
+ls -la ${EXPORT_DIR}/ 2>/dev/null || echo "No export dir"
+
+# Step 3: AR Validation
 # Build mask_token_id config
 if [ -n "$DFLASH_MASK_TOKEN_ID" ]; then
     MASK_ARG="'mask_token_id': ${DFLASH_MASK_TOKEN_ID},"
@@ -86,7 +113,14 @@ fi
 echo ""
 echo "=== DFlash AR Validation ==="
 echo "Target model: ${HF_MODEL_CKPT}"
-echo "DFlash checkpoint: ${OUTPUT_DIR}"
+# Prefer exported checkpoint (no prefix), fall back to training output (with prefix)
+if [ -f "${EXPORT_DIR}/model.safetensors" ]; then
+    AR_CKPT=${EXPORT_DIR}
+    echo "Using exported checkpoint: ${AR_CKPT}"
+else
+    AR_CKPT=${OUTPUT_DIR}
+    echo "Using training checkpoint: ${AR_CKPT}"
+fi
 echo "Block size: ${DFLASH_BLOCK_SIZE}"
 echo "Draft layers: ${DFLASH_NUM_LAYERS}"
 echo "Samples: ${NUM_AR_SAMPLES}"
@@ -119,7 +153,7 @@ mtsp.convert(model, [('dflash', config)])
 # Load trained DFlash weights
 import glob
 from safetensors.torch import load_file
-ckpt_files = sorted(glob.glob('${OUTPUT_DIR}/model*.safetensors'))
+ckpt_files = sorted(glob.glob('${AR_CKPT}/model*.safetensors'))
 if ckpt_files:
     state = {}
     for f in ckpt_files:

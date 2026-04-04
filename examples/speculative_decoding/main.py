@@ -223,7 +223,10 @@ def train():
     if checkpoint:
         with patch_transformers5_params_loading():
             model = load_vlm_or_llm(
-                checkpoint, torch_dtype="auto", trust_remote_code=model_args.trust_remote_code
+                checkpoint,
+                torch_dtype="auto",
+                device_map="cpu",
+                trust_remote_code=model_args.trust_remote_code,
             )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             checkpoint, trust_remote_code=model_args.trust_remote_code
