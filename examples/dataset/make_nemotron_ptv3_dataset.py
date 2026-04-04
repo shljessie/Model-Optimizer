@@ -85,7 +85,7 @@ from typing import Any
 import yaml
 from datasets import concatenate_datasets, load_dataset
 
-from _specdec_aug import has_tool_turns, load_augmentations, make_augment_fn, normalize_messages, strip_assistant_turns
+from conversation_utils import has_tool_turns, load_augmentations, make_augment_fn, normalize_messages, strip_assistant_turns
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"
@@ -269,6 +269,10 @@ def main() -> None:
 
     if non_augmentable is not None:
         parts_to_combine.append(non_augmentable)
+
+    if not parts_to_combine:
+        logger.warning("No data to combine — all rows were filtered out. Exiting.")
+        return
 
     combined = concatenate_datasets(parts_to_combine)
     logger.info("Combined (pre-shuffle): %d rows", len(combined))

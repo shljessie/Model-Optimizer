@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-Shared augmentation utilities for Nemotron speculative-decoding dataset scripts.
+Shared conversation manipulation and augmentation utilities for dataset preparation.
 
 Imported by make_nemotron_ptv2_dataset.py and make_nemotron_ptv3_dataset.py.
 
@@ -24,10 +24,10 @@ training data for the speculative-decoding draft model.
 
 Conversation format
 -------------------
-Each conversation is kept as a full message list (system + user + assistant turns)
-with only the *last* assistant turn stripped — that is the response the target model
-will generate.  All prior assistant turns are preserved so the model has the full
-multi-turn context it needs to produce a coherent next response.
+Each conversation is stripped down to a skeleton of system + user turns only — all
+assistant turns are removed.  The downstream generation pipeline (query.py) feeds this
+skeleton to the target model turn-by-turn, appending each generated response before
+sending the next user turn, so the model produces coherent multi-turn continuations.
 
 Augmentations are applied only to the *last* user message (the new prompt), not to
 earlier user turns that are already part of the established context.
@@ -152,6 +152,8 @@ def strip_assistant_turns(example: dict[str, Any], idx: int) -> dict[str, Any]:
     Rows with no user turns are returned empty and filtered out by the caller.
     """
     messages = [m for m in example["messages"] if m["role"] in ("system", "user")]
+    if not any(m["role"] == "user" for m in messages):
+        return {"messages": []}
     return {"messages": messages}
 
 

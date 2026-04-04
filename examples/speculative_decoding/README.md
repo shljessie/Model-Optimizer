@@ -48,7 +48,7 @@ pip install -r requirements.txt
 We support a range of input datasets. In this example, we will use the [UltraChat-200k](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) dataset.
 
 ```bash
-python prepare_input_conversations/make_dataset.py -f prepare_input_conversations/example_data_config.yaml --full-conversations
+python ../dataset/make_dataset.py -f ../dataset/example_data_config.yaml --full-conversations
 ```
 
 See [other-datasets](#other-datasets) section for other dataset options and instruction for user-provided data.
@@ -203,7 +203,7 @@ See more details on deployment of quantized model to TRTLLM [here](../llm_ptq/RE
 
 ### Other Datasets
 
-In addition to the default dataset, we support adding several other commonly used datasets in `prepare_input_conversations/make_dataset.py`:
+In addition to the default dataset, we support adding several other commonly used datasets in `../dataset/make_dataset.py`:
 
 - MTBench (for debugging)
 - ShareGPT
@@ -232,10 +232,10 @@ For large-scale training we provide dedicated scripts for NVIDIA's Nemotron Post
 
 ```bash
 # Synthetic data generation (~3.3M rows):
-python prepare_input_conversations/make_nemotron_ptv2_dataset.py --output-dir /tmp/ptv2_gen
+python ../dataset/make_nemotron_ptv2_dataset.py --output-dir /tmp/ptv2_gen
 
 # Direct SFT training mix (~1.9M rows):
-python prepare_input_conversations/make_nemotron_ptv2_dataset.py --mode train --output-dir /tmp/ptv2_train
+python ../dataset/make_nemotron_ptv2_dataset.py --mode train --output-dir /tmp/ptv2_train
 ```
 
 Covers: `stem`, `chat`, `math`, `code` + 5 multilingual splits (ja/de/it/es/fr, capped at 100K each).
@@ -244,19 +244,19 @@ Covers: `stem`, `chat`, `math`, `code` + 5 multilingual splits (ja/de/it/es/fr, 
 
 ```bash
 # Synthetic data generation (~3.4M rows):
-python prepare_input_conversations/make_nemotron_ptv3_dataset.py --output-dir /tmp/ptv3_gen
+python ../dataset/make_nemotron_ptv3_dataset.py --output-dir /tmp/ptv3_gen
 
 # Direct SFT training mix (~3.9M rows, includes agentic/tool-use datasets):
-python prepare_input_conversations/make_nemotron_ptv3_dataset.py --mode train --output-dir /tmp/ptv3_train
+python ../dataset/make_nemotron_ptv3_dataset.py --mode train --output-dir /tmp/ptv3_train
 ```
 
-Covers: math, code, science, instruction-following, agentic/tool-use, safety, finance, and multilingual data. The dataset mix and per-split row caps are configurable via `prepare_input_conversations/nemotron_ptv3_datasets.yaml`.
+Covers: math, code, science, instruction-following, agentic/tool-use, safety, finance, and multilingual data. The dataset mix and per-split row caps are configurable via `../dataset/nemotron_ptv3_datasets.yaml`.
 
-**Augmentation** (generate mode only) is controlled by `prepare_input_conversations/augmentations.yaml`. By default it includes 12 language-redirect variants and several style/format hints. The `/no_think` system-prompt variant is disabled by default (enable it for models that support it, e.g. Qwen3):
+**Augmentation** (generate mode only) is controlled by `../dataset/augmentations.yaml`. By default it includes 12 language-redirect variants and several style/format hints. The `/no_think` system-prompt variant is disabled by default (enable it for models that support it, e.g. Qwen3):
 
 ```bash
 # Custom augmentation config:
-python prepare_input_conversations/make_nemotron_ptv2_dataset.py \
+python ../dataset/make_nemotron_ptv2_dataset.py \
     --augmentations-config my_augs.yaml --output-dir /tmp/ptv2_gen
 ```
 

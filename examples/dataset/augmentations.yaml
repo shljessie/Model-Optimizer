@@ -1,4 +1,4 @@
-# Augmentation specs for make_nemotron_ptv2_dataset.py
+# Augmentation specs for make_nemotron_ptv2_dataset.py and make_nemotron_ptv3_dataset.py
 #
 # Each entry defines one augmentation variant applied cyclically across the dataset.
 # The augmented copy is the same size as the source — each row gets exactly one variant.

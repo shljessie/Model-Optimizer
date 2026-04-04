@@ -61,7 +61,7 @@ from pathlib import Path
 
 from datasets import concatenate_datasets, load_dataset
 
-from _specdec_aug import (
+from conversation_utils import (
     has_tool_turns,
     load_augmentations,
     make_augment_fn,
