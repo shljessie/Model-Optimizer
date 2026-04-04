@@ -20,7 +20,7 @@ collect responses, and optionally save them to disk for downstream pipelines
 (e.g., EAGLE3 data synthesis).
 """
 
-# ruff: noqa: D101, D102, D103, D107, F841, PLR1722
+# ruff: noqa: D101, D102, D103, D107, PLR1722
 import argparse
 import os
 import re
@@ -103,7 +103,9 @@ parser.add_argument(
 )
 parser.add_argument("--num-proc", type=int, default=32, help="number of processes (concurrency).")
 parser.add_argument("--temperature", type=float, default=0.0, help="temperature.")
-parser.add_argument("--max-tokens", type=int, default=None, help="maximum tokens to generate per response.")
+parser.add_argument(
+    "--max-tokens", type=int, default=None, help="maximum tokens to generate per response."
+)
 args = parser.parse_args()
 
 llm = LLM(args)

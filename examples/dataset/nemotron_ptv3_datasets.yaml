@@ -5,7 +5,7 @@
 #
 #   repo_id        — HuggingFace repo ID or local path.
 #   splits         — List of splits to load.  All splits are concatenated before capping.
-#   cap_per_split  — Maximum rows taken from each split (null = no cap).
+#   cap_per_split  — Maximum rows taken from each split (omit or leave empty = no cap).
 #   augment        — Whether to include this dataset in the augmented copy.
 #                    Set to false for already-multilingual splits so language-redirect
 #                    augmentations are not applied on top of existing non-English content.
@@ -53,14 +53,14 @@ datasets:
   - repo_id: nvidia/Nemotron-SWE-v1
     splits:
       - r2e_gym
-    cap_per_split: null
+    cap_per_split:
     augment: true
 
   - repo_id: nvidia/Nemotron-SFT-SWE-v2
     splits:
       - agentless
       - openhands_swe
-    cap_per_split: null
+    cap_per_split:
     augment: true
 
   # Competitive-Programming-v1 has ~3.93M rows across 6 splits (cpp ×2, python ×2,
@@ -94,7 +94,7 @@ datasets:
       - question_tool
       - agent_skills
       - agent_skills_question_tool
-    cap_per_split: null
+    cap_per_split:
     augment: true
 
   # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ datasets:
     splits:
       - MCQ
       - RQA
-    cap_per_split: null    # ~226 K total
+    cap_per_split:         # ~226 K total
     augment: true
 
   # ---------------------------------------------------------------------------
@@ -116,14 +116,14 @@ datasets:
     splits:
       - chat_if
       - structured_outputs
-    cap_per_split: null    # ~288 K total
+    cap_per_split:         # ~288 K total
     augment: true
 
   - repo_id: nvidia/Nemotron-SFT-Instruction-Following-Chat-v2
     splits:
       - reasoning_off
       - reasoning_on
-    cap_per_split: null
+    cap_per_split:
     augment: true
 
   # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ datasets:
     splits:
       - interactive_agent
       - tool_calling
-    cap_per_split: null
+    cap_per_split:
     augment: true
 
   - repo_id: nvidia/Nemotron-SFT-Agentic-v2
@@ -142,7 +142,7 @@ datasets:
       - interactive_agent
       - search
       - tool_calling
-    cap_per_split: null
+    cap_per_split:
     augment: true
 
   # ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ datasets:
   - repo_id: nvidia/Nemotron-SFT-Safety-v1
     splits:
       - train
-    cap_per_split: null    # ~45 K
+    cap_per_split:         # ~45 K
     augment: true
 
   # ---------------------------------------------------------------------------
