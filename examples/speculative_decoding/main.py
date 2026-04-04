@@ -221,15 +221,19 @@ def train():
     use_offline_training = data_args.offline_data_path is not None
 
     if checkpoint:
+        # Load model from output_dir (top-level save) rather than checkpoint subdir
+        # to avoid meta tensor errors. The checkpoint path is passed to
+        # trainer.train(resume_from_checkpoint=...) for optimizer/step resume.
+        model_load_path = training_args.output_dir
         with patch_transformers5_params_loading():
             model = load_vlm_or_llm(
-                checkpoint,
+                model_load_path,
                 torch_dtype="auto",
                 device_map="cpu",
                 trust_remote_code=model_args.trust_remote_code,
             )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            checkpoint, trust_remote_code=model_args.trust_remote_code
+            model_load_path, trust_remote_code=model_args.trust_remote_code
         )
     else:
         # To avoid OOM for large models, we load and convert model on CPU first.
