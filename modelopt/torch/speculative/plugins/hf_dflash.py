@@ -543,6 +543,12 @@ class HFDFlashModel(DFlashModel):
         self._original_forward_cls = original_cls
         print(f"DFlash: using {original_cls.__name__}.forward as base forward")
 
+    def get_exporter(self):
+        """Get the exporter for the DFlash draft model."""
+        from modelopt.torch.export.plugins.hf_spec_export import DFlashExporter
+
+        return DFlashExporter(self)
+
     def _base_forward(self, **kwargs):
         """Call the original model's forward, bypassing DFlash wrapper."""
         return self._original_forward_cls.forward(self, **kwargs)
