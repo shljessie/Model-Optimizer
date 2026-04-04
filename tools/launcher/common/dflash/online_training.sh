@@ -38,6 +38,13 @@ export PATH=$PATH:/workspace/.local/bin
 
 trap 'error_handler $0 $LINENO' ERR
 
+# Auto-detect head node IP for multi-node training
+if [ -n "$SLURM_NODELIST" ] && [ -z "$HEAD_NODE_IP" ]; then
+    HEAD_NODE_IP=$(scontrol show hostnames "$SLURM_NODELIST" | head -1)
+    export HEAD_NODE_IP
+    echo "Auto-detected HEAD_NODE_IP: ${HEAD_NODE_IP}"
+fi
+
 # Parse DFlash-specific args from the command line for AR validation
 DFLASH_BLOCK_SIZE=16
 DFLASH_NUM_LAYERS=5
