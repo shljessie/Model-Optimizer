@@ -94,6 +94,18 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       NUM_TTT_STEPS="${1#*=}"
       ;;
+    --warmup_steps*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      WARMUP_STEPS="${1#*=}"
+      ;;
+    --decay_steps*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      DECAY_STEPS="${1#*=}"
+      ;;
+    --hpo_trials*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      HPO_TRIALS="${1#*=}"
+      ;;
     --cp_size*)
       if [[ "$1" != *=* ]]; then shift; fi
       CP_SIZE="${1#*=}"
@@ -105,6 +117,10 @@ while [ $# -gt 0 ]; do
     --log_steps*)
       if [[ "$1" != *=* ]]; then shift; fi
       LOG_STEPS="${1#*=}"
+      ;;
+    --max_grad_norm*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      MAX_GRAD_NORM="${1#*=}"
       ;;
     --draft_vocab_cache*)
       if [[ "$1" != *=* ]]; then shift; fi
@@ -130,6 +146,10 @@ while [ $# -gt 0 ]; do
       if [[ "$1" != *=* ]]; then shift; fi
       DISABLE_TORCH_COMPILE="${1#*=}"
       ;;
+    --init_from_checkpoint*)
+      if [[ "$1" != *=* ]]; then shift; fi
+      INIT_FROM_CHECKPOINT="${1#*=}"
+      ;;
     --tensorboard*)
       if [[ "$1" != *=* ]]; then shift; fi
       ENABLE_TENSORBOARD="${1#*=}"
@@ -150,7 +170,7 @@ GPU_PER_NODE=${GPU_PER_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader
 TOTAL_GPU=$((NUM_NODES * GPU_PER_NODE))
 echo "Total GPUs: $TOTAL_GPU (NUM_NODES: $NUM_NODES, GPU_PER_NODE: $GPU_PER_NODE)"
 # Calculate save_steps
-DEFAULT_SAVE_STEPS=$((8192 / TOTAL_GPU))
+DEFAULT_SAVE_STEPS=$((2048 / TOTAL_GPU))
 
 MODEL=${MODEL:-"TinyLlama/TinyLlama-1.1B-Chat-v1.0"}
 MODE=${MODE:-"eagle3"}
@@ -177,8 +197,13 @@ DRAFT_VOCAB_CACHE=${DRAFT_VOCAB_CACHE:-""}
 MIX_HIDDEN_STATES=${MIX_HIDDEN_STATES:-"False"}
 DISABLE_TORCH_COMPILE=${DISABLE_TORCH_COMPILE:-"False"}
 NUM_TTT_STEPS=${NUM_TTT_STEPS:-3}
+WARMUP_STEPS=${WARMUP_STEPS:-200}
+DECAY_STEPS=${DECAY_STEPS:-1000}
+HPO_TRIALS=${HPO_TRIALS:-0}
 BUCKET_GRANULARITY=${BUCKET_GRANULARITY:-512}
 ENABLE_TENSORBOARD=${ENABLE_TENSORBOARD:-"False"}
+INIT_FROM_CHECKPOINT=${INIT_FROM_CHECKPOINT:-""}
+MAX_GRAD_NORM=${MAX_GRAD_NORM:-10.0}
 
 if [[ "$MODE" == "eagle3" ]]; then
   if [[ -n "$EAGLE_CONFIG" ]]; then
@@ -238,6 +263,12 @@ else
   MULTI_NODE_ARGS=""
 fi
 
+if [[ "$INIT_FROM_CHECKPOINT" != "" ]]; then
+  INIT_CKPT_ARGS="--init_from_checkpoint $INIT_FROM_CHECKPOINT"
+else
+  INIT_CKPT_ARGS=""
+fi
+
 if [[ "$ENABLE_TENSORBOARD" != "False" ]]; then
   OBSERVABILITY_ARGS="--report_to tensorboard"
 else
@@ -265,9 +296,10 @@ CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 ${SCRIPT_DIR}/mai
     --save_total_limit 3 \
     --learning_rate $LR \
     --weight_decay 0.0 \
-    --warmup_steps 1000 \
+    --warmup_steps $WARMUP_STEPS \
+    --hpo_trials $HPO_TRIALS \
     --lr_scheduler_type warmup_stable_decay \
-    --lr_scheduler_kwargs '{\"num_decay_steps\": 10000}' \
+    --lr_scheduler_kwargs '{\"num_decay_steps\": '$DECAY_STEPS'}' \
     --logging_steps $LOG_STEPS \
     --tf32 True \
     --data_path $DATA \
@@ -276,11 +308,13 @@ CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 ${SCRIPT_DIR}/mai
     --ar_validate_steps $AR_VALIDATE_STEPS \
     --mix_hidden_states $MIX_HIDDEN_STATES \
     --disable_torch_compile $DISABLE_TORCH_COMPILE \
+    --max_grad_norm $MAX_GRAD_NORM \
     $DRAFT_VOCAB_CACHE_ARGS \
     $VLM_ARGS \
     $OFFLINE_TRAINING_ARGS \
     $SPECULATIVE_ARGS \
     $FSDP_ARGS \
+    $INIT_CKPT_ARGS \
     --cp_size $CP_SIZE \
     --dp_shard_size $DP_SHARD_SIZE \
     --num_ttt_steps $NUM_TTT_STEPS \
@@ -288,6 +322,7 @@ CMD="accelerate launch $MULTI_NODE_ARGS --mixed_precision bf16 ${SCRIPT_DIR}/mai
     $OBSERVABILITY_ARGS \
     --vllm_url http://localhost:8046,http://localhost:8047 \
     --dataloader_num_workers 8 --dataloader_prefetch_factor 2 \
+    --weight_decay 0.1 --adam_beta1 0.9 --adam_beta2 0.95 \
 "
 
     # --vllm_url http://localhost:8040,http://localhost:8041,http://localhost:8042,http://localhost:8043,http://localhost:8044,http://localhost:8045,http://localhost:8046,http://localhost:8047 \

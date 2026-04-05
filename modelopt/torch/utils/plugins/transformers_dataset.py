@@ -131,6 +131,10 @@ def _get_bucket_size(seq_len: int, max_len: int, granularity: int) -> int:
     """Round seq_len up to the nearest multiple of granularity, capped at max_len."""
     if granularity <= 0:
         return max_len
+    if seq_len > 16384:
+        granularity = 16384
+    if seq_len > 65536:
+        granularity = 32768
     return min(((seq_len + granularity - 1) // granularity) * granularity, max_len)
 
 

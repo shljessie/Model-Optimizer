@@ -46,12 +46,20 @@ def make_causal_mask(
     dtype: torch.dtype,
     device: torch.device,
     past_key_values_length: int = 0,
+    sliding_window: int | None = None,
 ):
     """Make causal mask used for bi-directional self-attention."""
     bsz, tgt_len = input_ids_shape
     mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
     mask_cond = torch.arange(mask.size(-1), device=device)
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+
+    if sliding_window is not None:
+        mask.masked_fill_(
+            mask_cond < (mask_cond - sliding_window + 1).view(mask.size(-1), 1),
+            torch.finfo(dtype).min,
+        )
+
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:

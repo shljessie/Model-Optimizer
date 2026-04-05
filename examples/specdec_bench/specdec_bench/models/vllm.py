@@ -81,6 +81,8 @@ class VLLMModel(Model):
             skip_tokenizer_init=False,
             async_scheduling=kwargs.get("async_scheduling", True),
             enforce_eager=False,
+            gpu_memory_utilization=kwargs.get("gpu_memory_utilization", 0.5),
+            enable_flashinfer_autotune=False,
         )
         self.model = AsyncLLM.from_engine_args(engine_args)
         self.sampling_kwargs = sampling_kwargs

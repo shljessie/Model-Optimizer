@@ -43,7 +43,7 @@ LLAMA_EAGLE_SINGLE_LAYER = {
         "layers.0.post_attention_layernorm",
         "norm",
         "fc",
-        "fc_input_norm",
+        "input_norm",
     },
     "optional": {"d2t", "lm_head"},
 }
@@ -65,7 +65,7 @@ KIMIK2_EAGLE_SINGLE_LAYER = {
         "layers.0.post_attention_layernorm",
         "norm",
         "fc",
-        "fc_input_norm",
+        "input_norm",
     },
     "optional": {
         "d2t",
@@ -123,7 +123,7 @@ class EagleExporter(SpeculativeDecodingExporter):
                 "layers.0.input_layernorm",
                 "norm",
                 "fc",
-                "fc_input_norm",
+                "input_norm",
             }:
                 assert f"{key}.weight".replace("layers.0", f"layers.{i}") in export_sd, (
                     f"Missing required key: {key}.weight"
@@ -147,6 +147,10 @@ class EagleExporter(SpeculativeDecodingExporter):
             if "eagle_module" in key:
                 export_key = key.replace("eagle_module.", "")
                 export_sd[export_key] = full_state_dict[key].clone()
+        # Rename fc_input_norm -> input_norm for deployment format
+        if "fc_input_norm.weight" in export_sd:
+            export_sd["input_norm.weight"] = export_sd.pop("fc_input_norm.weight")
+
         # Use base model's lm head if draft model doesn't have one
         if "lm_head.weight" not in export_sd:
             export_sd["lm_head.weight"] = full_state_dict["lm_head.weight"]

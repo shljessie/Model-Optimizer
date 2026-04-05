@@ -75,15 +75,38 @@ Category coverage breakdown:
 - - eagle_training_data/pretrain/sft-swe-v2-agentless-4k.jsonl
 - ✅ Chat / Instruction Following
 - - eagle_training_data/pretrain/sft-if-chat-4k.jsonl
-- ❌ Creative Writing
-- - Could select from one of https://huggingface.co/collections/Crownelius/creative-writing-datasets, but unsure about legal. Will rely on 
 - ✅ Multilingual
-- - eagle_training_data/pretrain/sft-swe-v2-agentless-4k.jsonl
+- - eagle_training_data/pretrain/sft-multilingual-v1-4k.jsonl
 
 Total number of samples: 2697247
 
 ![](./gpt-oss-eagle3-pretrain-dataset-mix.png)
 
-### Post-Train/RL Datasets
+Issue: nvidia/Nemotron-Competitive-Programming-v1 samples are not valid. Will just have to hope there's enough coding in the rest
 
-- TODO: **nvidia/HelpSteer3**
+### Long-Context Datasets
+
+Avoiding SDG for now. Sampling from datasets with a focus on the long-ctx ones. Target size is 200k samples.
+
+- ✅ Math
+✅ - - eagle_training_data/long_context/math-v2-low.jsonl (5k samples)
+✅ - - eagle_training_data/long_context/math-v2-medium.jsonl (15k samples)
+✅ - - eagle_training_data/long_context/math-v2-high.jsonl (15k samples)
+- ✅ Coding
+✅ - - eagle_training_data/long_context/competitive-coding-v1-cpp.jsonl (25k samples)
+✅ - - eagle_training_data/long_context/competitive-coding-v1-python.jsonl (35k samples)
+✅ - - eagle_training_data/long_context/competitive-coding-v1-infinibyte.jsonl (10k samples)
+- ✅ Science
+✅ - - eagle_training_data/long_context/science-v1.jsonl (10k samples)
+- ✅ Tool-Calling
+✅ - - eagle_training_data/long_context/sft-agentic-v2-tool-calling.jsonl (6k samples)
+- ✅ Structured Outputs
+✅ - - eagle_training_data/long_context/if-chat-v1-structured_outputs.jsonl (2k samples)
+- ✅ Agentic (Assistant / SWE)
+✅ - - eagle_training_data/long_context/sft-agentic-v2-interactive.jsonl (15k samples)
+✅ - - eagle_training_data/long_context/sft-agentic-v2-search.jsonl (6k samples)
+✅ - - eagle_training_data/long_context/sft-swe-v2-agentless.jsonl (20k samples)
+- ✅ Chat / Instruction Following
+✅ - - eagle_training_data/long_context/sft-if-chat.jsonl (15k samples)
+- ✅ Multilingual
+✅ - - eagle_training_data/long_context/sft-multilingual-v1.jsonl (10k samples)

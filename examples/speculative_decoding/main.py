@@ -55,6 +55,12 @@ from modelopt.torch.speculative.utils import (
 )
 from modelopt.torch.utils import print_rank_0
 
+import logging
+
+# Silence "Some weights of the model checkpoint were not used" warnings
+# from transformers/modeling_utils.py:5525 (expected when loading with num_hidden_layers=0)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+
 torch.manual_seed(0)
 mto.enable_huggingface_checkpointing()
 
@@ -134,6 +140,16 @@ class TrainingArguments(transformers.TrainingArguments):
             )
         },
     )
+    hpo_trials: int = field(
+        default=0, metadata={"help": "Number of Optuna HPO trials. 0 = normal training."}
+    )
+    init_from_checkpoint: str | None = field(
+        default=None,
+        metadata={
+            "help": "Path to a checkpoint to initialize model weights from (without resuming "
+            "optimizer/scheduler state). Useful for fine-tuning a trained model on new data."
+        },
+    )
 
 
 @dataclass
@@ -196,12 +212,39 @@ def train():
         print_rank_0(f"Last checkpoint detected: {last_checkpoint}")
 
     checkpoint = training_args.resume_from_checkpoint or last_checkpoint
+    # init_from_checkpoint loads weights only (no optimizer/scheduler resume)
+    init_ckpt = training_args.init_from_checkpoint
 
     use_offline_training = data_args.offline_data_path is not None
     use_remote_online = data_args.vllm_url is not None
     use_offline_forward = use_offline_training or use_remote_online
 
-    if checkpoint:
+    hpo_mode = training_args.hpo_trials > 0
+
+    if hpo_mode and not checkpoint:
+        # HPO mode: load tokenizer only; model_init handles model creation per trial
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            model_max_length=training_args.training_seq_len,
+            trust_remote_code=True,
+        )
+        model = None
+    elif init_ckpt:
+        print_rank_0(f"Initializing model weights from {init_ckpt} (fresh training state)")
+        _, model = load_vlm_or_llm_with_kwargs(
+            init_ckpt, torch_dtype="auto", trust_remote_code=True, _attn_implementation = "flash_attention_2"
+        )
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            init_ckpt, trust_remote_code=True
+        )
+        checkpoint = None  # ensure we don't resume optimizer state
+        # Override training hyperparams from CLI (checkpoint may have different values)
+        model.eagle_ttt_steps = eagle_args.num_ttt_steps
+        model.eagle_mix_hidden_states = eagle_args.mix_hidden_states
+        model.eagle_use_torch_compile = not eagle_args.disable_torch_compile
+        if model.eagle_use_torch_compile:
+            model._activate_torch_compile()
+    elif checkpoint:
         with patch_transformers5_params_loading():
             _, model = load_vlm_or_llm_with_kwargs(
                 checkpoint, torch_dtype="auto", trust_remote_code=True
@@ -276,7 +319,9 @@ def train():
 
     callbacks = []
     tb_writer = None
-    if "tensorboard" in training_args.report_to:
+    if "tensorboard" in training_args.report_to and not hpo_mode:
+        # Custom TensorBoard writer for normal training only. In HPO mode, the
+        # built-in TensorBoardCallback handles per-trial subdirs via state.trial_name.
         log_dir = training_args.output_dir
         tb_writer = SummaryWriter(log_dir=log_dir)
         if isinstance(training_args.report_to, list):
@@ -284,33 +329,141 @@ def train():
         else:
             training_args.report_to = "none"
         callbacks.append(TensorBoardCallback(tb_writer=tb_writer))
-    callbacks.append(
-        EagleTrainingPlot(
-            training_args.ar_validate_steps,
-            tb_writer=tb_writer,
-            estimate_ar=training_args.estimate_ar,
+    if not hpo_mode:
+        callbacks.append(
+            EagleTrainingPlot(
+                training_args.ar_validate_steps,
+                tb_writer=tb_writer,
+                estimate_ar=training_args.estimate_ar,
+            )
         )
-    )
 
-    trainer = EagleTrainerWithAccLog(
-        model=model,
-        processing_class=tokenizer,
-        args=training_args,
-        callbacks=callbacks,
-        **data_module,
-    )
+    if hpo_mode:
+        # Split training data 95/5 for a stable eval_loss objective
+        full_dataset = data_module["train_dataset"]
+        eval_size = max(1, len(full_dataset) // 20)
+        train_ds, eval_ds = torch.utils.data.random_split(
+            full_dataset, [len(full_dataset) - eval_size, eval_size]
+        )
+        data_module["train_dataset"] = train_ds
+        data_module["eval_dataset"] = eval_ds
+        training_args.eval_strategy = "epoch"
 
-    # Manually enable this to return loss in eval
-    trainer.can_return_loss = True
-    # Make sure label_smoother is None
-    assert trainer.label_smoother is None, (
-        "label_smoother is not supported in speculative decoding!"
-    )
+        # TensorBoard: the built-in TensorBoardCallback is broken for HPO —
+        # state.trial_name is never set by _hp_search_setup, so all trials write
+        # to the same frozen logging_dir. Disable built-in and use a per-trial callback.
+        if "tensorboard" in training_args.report_to:
+            if isinstance(training_args.report_to, list):
+                training_args.report_to.remove("tensorboard")
+            else:
+                training_args.report_to = "none"
 
-    print_rank_0("Start training...")
-    trainer.train(resume_from_checkpoint=checkpoint)
-    trainer.save_state()
-    trainer.save_model(training_args.output_dir)
+            class HPOTensorBoardCallback(transformers.TrainerCallback):
+                def __init__(self, base_log_dir):
+                    self.base_log_dir = base_log_dir
+                    self.writer = None
+                    self.trial_count = 0
+
+                def on_train_begin(self, args, state, control, **kwargs):
+                    trial_name = getattr(state, "trial_name", None) or f"run-{self.trial_count}"
+                    self.writer = SummaryWriter(
+                        log_dir=os.path.join(self.base_log_dir, trial_name)
+                    )
+                    self.trial_count += 1
+
+                def on_log(self, args, state, control, logs=None, **kwargs):
+                    if self.writer is None or logs is None:
+                        return
+                    for k, v in logs.items():
+                        if isinstance(v, (int, float)):
+                            self.writer.add_scalar(k, v, state.global_step)
+                    self.writer.flush()
+
+                def on_train_end(self, args, state, control, **kwargs):
+                    if self.writer:
+                        self.writer.flush()
+                        self.writer.close()
+                        self.writer = None
+
+            callbacks.append(HPOTensorBoardCallback(training_args.output_dir))
+
+        def model_init(trial):
+            offline_kwargs = {"num_hidden_layers": 0} if use_offline_forward else {}
+            model_cfg, m = load_vlm_or_llm_with_kwargs(
+                model_args.model_name_or_path,
+                torch_dtype="auto",
+                device_map="cpu",
+                trust_remote_code=True,
+                **offline_kwargs,
+            )
+            if use_offline_forward:
+                m.config.num_orig_hidden_layers = model_cfg.num_hidden_layers
+            custom_config = (
+                json.load(open(eagle_args.eagle_config)) if eagle_args.eagle_config else {}
+            )
+            eagle_cfg = {
+                "eagle_decoder_type": eagle_args.eagle_decoder_type,
+                "eagle_offline": use_offline_forward,
+                "eagle_mix_hidden_states": eagle_args.mix_hidden_states,
+                "eagle_use_torch_compile": not eagle_args.disable_torch_compile,
+                "eagle_ttt_steps": eagle_args.num_ttt_steps,
+                "eagle_architecture_config": custom_config,
+            }
+            mtsp.convert(m, [("eagle", eagle_cfg)])
+            return m
+
+        def hp_space(trial):
+            return {
+                "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
+                "warmup_steps": trial.suggest_int("warmup_steps", 50, 500, step=50),
+                "per_device_train_batch_size": trial.suggest_categorical(
+                    "per_device_train_batch_size", [1, 2, 4, 8]
+                ),
+            }
+
+        trainer = EagleTrainerWithAccLog(
+            model=None,
+            model_init=model_init,
+            processing_class=tokenizer,
+            args=training_args,
+            callbacks=callbacks,
+            **data_module,
+        )
+        trainer.can_return_loss = True
+
+        optuna_db = os.path.join(training_args.output_dir, "optuna_study.db")
+        print_rank_0(f"Starting Optuna HPO with {training_args.hpo_trials} trials (db: {optuna_db})")
+        best = trainer.hyperparameter_search(
+            direction="minimize",
+            backend="optuna",
+            hp_space=hp_space,
+            n_trials=training_args.hpo_trials,
+            compute_objective=lambda metrics: metrics["eval_loss"],
+            study_name="eagle_hpo",
+            storage=f"sqlite:///{optuna_db}",
+            load_if_exists=True,
+        )
+        print_rank_0(f"Best trial: {best}")
+    else:
+        trainer = EagleTrainerWithAccLog(
+            model=model,
+            processing_class=tokenizer,
+            args=training_args,
+            callbacks=callbacks,
+            **data_module,
+        )
+
+        # Manually enable this to return loss in eval
+        trainer.can_return_loss = True
+        # Make sure label_smoother is None
+        assert trainer.label_smoother is None, (
+            "label_smoother is not supported in speculative decoding!"
+        )
+
+        print_rank_0("Start training...")
+        trainer.train(resume_from_checkpoint=checkpoint)
+        trainer.save_state()
+        trainer.save_model(training_args.output_dir)
 
 
 if __name__ == "__main__":

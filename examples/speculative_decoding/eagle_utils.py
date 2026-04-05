@@ -52,6 +52,7 @@ except ImportError:
     wandb = None
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+_MEMORY_PROFILE = False
 
 
 def _load_and_cleanup_hidden_states(path: str) -> dict[str, torch.Tensor]:
@@ -317,15 +318,32 @@ class EagleTrainerWithAccLog(Trainer):
         super().__init__(*args, **kwargs)
         self.model_accepts_loss_kwargs = False
 
+    def evaluate(self, *args, **kwargs):
+        """During HPO with no eval dataset, return train_loss as eval_loss."""
+        if self.eval_dataset is None and getattr(self, "hp_search_backend", None) is not None:
+            for entry in reversed(self.state.log_history):
+                if "loss" in entry:
+                    return {"eval_loss": entry["loss"]}
+            return {"eval_loss": float("inf")}
+        return super().evaluate(*args, **kwargs)
+
     def compute_loss(self, *args, **kwargs):
         """Override compute_loss to save train accs in trainer state."""
         if not hasattr(self.state, "training_accs"):
             self.state.training_accs = []
+            self._local_step = 0
+        self._local_step += 1
+        if _MEMORY_PROFILE and self._local_step == 4:
+            torch.cuda.memory._record_memory_history()
         kwargs.pop("num_items_in_batch", None)
         return_outputs = kwargs.pop("return_outputs", False)
         loss, outputs = super().compute_loss(*args, return_outputs=True, **kwargs)
         if hasattr(outputs, "train_acc"):
             self.state.training_accs.append(outputs.train_acc)
+        if _MEMORY_PROFILE and self._local_step == 8:
+            torch.cuda.memory._dump_snapshot("/tmp/claude-0/mem_snapshot.pickle")
+            torch.cuda.memory._record_memory_history(enabled=None)
+            raise RuntimeError("Memory snapshot saved to /tmp/claude-0/mem_snapshot.pickle")
         return (loss, outputs) if return_outputs else loss
 
 
@@ -390,10 +408,14 @@ class EagleTrainingPlot(TrainerCallback):
             if self.estimate_ar:
                 self.tb_writer.add_scalar(f"{mode_id}/estimated_ar", est_ar, state.global_step)
 
-    def on_log(self, args, state, control, **kwargs):
+    def on_log(self, args, state, control, logs=None, **kwargs):
         """Log training acc and estimate AR during log step."""
         if not hasattr(state, "training_accs") or len(state.training_accs) == 0:
             self.last_seen_step = state.global_step
+            return control
+
+        # Skip when eval metrics are being logged — on_evaluate handles eval separately
+        if logs and any(k.startswith("eval_") for k in logs):
             return control
 
         if state.global_step != self.last_seen_step:
