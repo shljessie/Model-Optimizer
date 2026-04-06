@@ -138,6 +138,18 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         ),
     )
 
+    enable_v32: bool = ModeloptField(
+        default=False,
+        title="Enable V3.2 compression-branch skip path.",
+        description=(
+            "When True, skipped tiles use a mini softmax over all tiles' precomputed "
+            "k_mean vectors with properly normalized weights to blend v_mean vectors "
+            "(compression-branch style, inspired by VSA). This replaces the per-tile "
+            "pool-K + v_mean approximation of V2.5/V3. "
+            "Requires enable_v25=True. Only used by triton_skip_softmax_diffusion."
+        ),
+    )
+
     enable_lite_attention: bool = ModeloptField(
         default=False,
         title="Enable LiteAttention simulation.",

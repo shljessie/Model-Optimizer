@@ -60,6 +60,7 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
         self.is_causal = config.get("is_causal", False)
         self.enable_v25 = config.get("enable_v25", False)
         self.enable_v3 = config.get("enable_v3", False)
+        self.enable_v32 = config.get("enable_v32", False)
         self.majority_pct = config.get("majority_pct", 0.9)
         self.enable_lite_attention = config.get("enable_lite_attention", False)
         self.lite_threshold = config.get("lite_threshold", -5.0)
@@ -291,6 +292,7 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
                         threshold=threshold if not use_lite else None,
                         normalize_by_seqlen=normalize,
                         enable_v25=self.enable_v25,
+                        enable_v32=self.enable_v32,
                         majority_pct=self.majority_pct if self.enable_v3 else 0.0,
                         sparsity_counters=counters,
                     )
@@ -310,6 +312,7 @@ class TritonSkipSoftmaxDiffusion(SparseAttentionMethod):
                         threshold=threshold if not use_lite else None,
                         normalize_by_seqlen=normalize,
                         enable_v25=self.enable_v25,
+                        enable_v32=self.enable_v32,
                         majority_pct=self.majority_pct if self.enable_v3 else 0.0,
                         lite_threshold=self.lite_threshold if use_lite else None,
                         sparsity_counters=counters,

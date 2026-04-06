@@ -39,6 +39,7 @@ def set_ltx_triton_context(
     threshold: float | None = None,
     normalize_by_seqlen: bool = False,
     enable_v25: bool = False,
+    enable_v32: bool = False,
     majority_pct: float = 0.0,
     lite_threshold: float | None = None,
     sparsity_counters: "torch.Tensor | None" = None,
@@ -53,11 +54,14 @@ def set_ltx_triton_context(
     _thread_local.threshold = threshold
     _thread_local.normalize_by_seqlen = normalize_by_seqlen
     _thread_local.enable_v25 = enable_v25
+    _thread_local.enable_v32 = enable_v32
     _thread_local.majority_pct = majority_pct
     _thread_local.lite_threshold = lite_threshold
     _thread_local.sparsity_counters = sparsity_counters
     if not enable_v25:
         _thread_local.v_mean_cache = None
+    if not enable_v32:
+        _thread_local.k_mean_cache = None
     # Initialize lite state only if not already set
     if lite_threshold is not None and not hasattr(_thread_local, "_lite_layer_masks"):
         _thread_local._lite_layer_masks = {}
@@ -76,9 +80,11 @@ def clear_ltx_triton_context() -> None:
     _thread_local.threshold = None
     _thread_local.normalize_by_seqlen = False
     _thread_local.enable_v25 = False
+    _thread_local.enable_v32 = False
     _thread_local.majority_pct = 0.0
     _thread_local.sparsity_counters = None
     _thread_local.v_mean_cache = None
+    _thread_local.k_mean_cache = None
     # lite_threshold is preserved — set/cleared by set_ltx_triton_context only
     # _lite_layer_masks, _lite_step, _lite_call_idx persist across calls
 
@@ -251,6 +257,22 @@ def _ltx_triton_attention(
                 )
 
             kw["v_mean_cache"] = _thread_local.v_mean_cache
+
+        # V3.2: lazy-allocate k_mean_cache alongside v_mean_cache
+        if getattr(_thread_local, "enable_v32", False):
+            import triton
+
+            BLOCK_N = 64
+            n_kt = math.ceil(seq_k / BLOCK_N)
+            BLOCK_D = triton.next_power_of_2(dim_head)
+
+            km = getattr(_thread_local, "k_mean_cache", None)
+            if km is None or km.shape != (b, heads, n_kt, BLOCK_D):
+                _thread_local.k_mean_cache = torch.zeros(
+                    b, heads, n_kt, BLOCK_D, device=device, dtype=torch.float32
+                )
+
+            kw["k_mean_cache"] = _thread_local.k_mean_cache
 
         # V3: majority vote
         majority_pct = getattr(_thread_local, "majority_pct", 0.0)

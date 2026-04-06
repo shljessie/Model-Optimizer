@@ -149,6 +149,17 @@ def parse_args() -> argparse.Namespace:
         default=0.9,
         help="Fraction of rows that must agree to skip (0.0-1.0). Default 0.9 (90%%)",
     )
+
+    # V3.2 compression-branch skip path
+    parser.add_argument(
+        "--enable-v32",
+        action="store_true",
+        help=(
+            "Enable V3.2 compression-branch skip path. Skipped tiles use a mini "
+            "softmax over precomputed k_mean vectors for properly normalized weights "
+            "(better quality than pool-K, inspired by VSA). Implies --enable-v3."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -206,8 +217,14 @@ def build_sparse_config(args: argparse.Namespace) -> dict:
         "enable": True,
     }
 
+    # V3.2: compression-branch skip path (implies V3)
+    if getattr(args, "enable_v32", False):
+        attn_cfg["enable_v25"] = True
+        attn_cfg["enable_v3"] = True
+        attn_cfg["enable_v32"] = True
+        attn_cfg["majority_pct"] = getattr(args, "majority_pct", 0.9)
     # V3: majority-vote skip decision
-    if getattr(args, "enable_v3", False):
+    elif getattr(args, "enable_v3", False):
         attn_cfg["enable_v25"] = True  # V3 requires V2.5 pool-K approximation
         attn_cfg["enable_v3"] = True
         attn_cfg["majority_pct"] = getattr(args, "majority_pct", 0.9)

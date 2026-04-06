@@ -146,12 +146,6 @@ class _LTX2SparseAttention(SparseAttentionModule):
         """Setup the VSA wrapper with trainable gate_compress."""
         super()._setup()
 
-        # Only add gate_compress for VSA methods (non-VSA methods like
-        # Sparse24Triton don't need it).
-        method = getattr(self, "_sparse_method_instance", None)
-        if method is not None and not hasattr(method, "block_size_3d"):
-            return
-
         # Check if we need to add gate_compress projection
         if not hasattr(self, "to_gate_compress"):
             to_q = self.to_q

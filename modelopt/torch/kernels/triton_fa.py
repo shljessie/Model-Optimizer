@@ -137,6 +137,98 @@ def _precompute_vmean(
 
 
 # ---------------------------------------------------------------------------
+# KV-mean precomputation kernel (for V3.2 compression-branch skip path)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _precompute_kv_mean(
+    K,  # [total_kv, num_kv_heads, head_dim]
+    V,  # [total_kv, num_kv_heads, head_dim]
+    Kmean,  # [batch, num_kv_heads, num_kv_tiles, BLOCK_D] output
+    Vmean,  # [batch, num_kv_heads, num_kv_tiles, BLOCK_D] output
+    b_start_loc_k,  # [batch] start offset of each KV sequence
+    b_seq_len_k,  # [batch] length of each KV sequence
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_km_b,
+    stride_km_h,
+    stride_km_t,
+    stride_vm_b,
+    stride_vm_h,
+    stride_vm_t,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Precompute mean of K and V vectors per KV tile.
+
+    Grid: (batch, num_kv_heads, num_kv_tiles)
+    Each thread block computes mean(K[tile]) and mean(V[tile]) → [BLOCK_D] each.
+    More efficient than two separate kernels since K and V share the same tile mask.
+    """
+    batch_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    tile_kv = tl.program_id(2)
+
+    seq_len_kv = tl.load(b_seq_len_k + batch_idx)
+    kv_offset = tl.load(b_start_loc_k + batch_idx)
+
+    kv_start = tile_kv * BLOCK_N
+    if kv_start >= seq_len_kv:
+        return
+
+    kv_pos = tl.arange(0, BLOCK_N)
+    dim_pos = tl.arange(0, BLOCK_D)
+    d_mask = dim_pos < HEAD_DIM
+    kv_mask = (kv_start + kv_pos) < seq_len_kv
+
+    # Load K tile [BLOCK_N, BLOCK_D]
+    k_ptrs = (
+        (kv_offset + kv_start + kv_pos[:, None]) * stride_kbs
+        + kv_head_idx * stride_kh
+        + dim_pos[None, :]
+    )
+    k = tl.load(K + k_ptrs, mask=kv_mask[:, None] & d_mask[None, :], other=0.0)
+
+    # Load V tile [BLOCK_N, BLOCK_D]
+    v_ptrs = (
+        (kv_offset + kv_start + kv_pos[:, None]) * stride_vbs
+        + kv_head_idx * stride_vh
+        + dim_pos[None, :]
+    )
+    v = tl.load(V + v_ptrs, mask=kv_mask[:, None] & d_mask[None, :], other=0.0)
+
+    # Count valid tokens for correct mean
+    n_valid = tl.sum(kv_mask.to(tl.float32))
+    n_valid = tl.maximum(n_valid, 1.0)  # avoid div by zero
+
+    # mean(K, dim=0) → [BLOCK_D], mean(V, dim=0) → [BLOCK_D]
+    k_mean = tl.sum(k.to(tl.float32), 0) / n_valid
+    v_mean = tl.sum(v.to(tl.float32), 0) / n_valid
+
+    # Store k_mean
+    km_ptr = (
+        Kmean
+        + batch_idx * stride_km_b
+        + kv_head_idx * stride_km_h
+        + tile_kv * stride_km_t
+        + dim_pos
+    )
+    tl.store(km_ptr, k_mean, mask=d_mask)
+
+    # Store v_mean
+    vm_ptr = (
+        Vmean
+        + batch_idx * stride_vm_b
+        + kv_head_idx * stride_vm_h
+        + tile_kv * stride_vm_t
+        + dim_pos
+    )
+    tl.store(vm_ptr, v_mean, mask=d_mask)
+
+
+# ---------------------------------------------------------------------------
 # Forward kernel body (shared by autotuned and fixed-config paths)
 # ---------------------------------------------------------------------------
 @triton.jit
@@ -180,6 +272,13 @@ def _attn_fwd_body(
     stride_vm_b=0,  # Vmean_cache strides
     stride_vm_h=0,
     stride_vm_t=0,
+    # --- V3.2 compression-branch parameters (optional) ---
+    APPLY_SKIP_V32: tl.constexpr = False,  # Compression-branch skip: mini-softmax over k_mean
+    Kmean_cache=None,  # [batch, num_kv_heads, num_kv_tiles, BLOCK_D] float32 (precomputed)
+    stride_km_b=0,  # Kmean_cache strides
+    stride_km_h=0,
+    stride_km_t=0,
+    MAX_KV_TILES: tl.constexpr = 128,  # Upper bound on num KV tiles (for static skip_mask sizing)
     # --- Runtime sparsity measurement (optional) ---
     MEASURE_SPARSITY: tl.constexpr = False,  # Count skipped vs total tiles via atomic adds
     Sparsity_counters=None,  # [2] int64: [0]=total tiles, [1]=skipped tiles
@@ -230,6 +329,12 @@ def _attn_fwd_body(
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
     kv_bound = seq_len_kv if not IS_CAUSAL else tl.minimum((tile_q + 1) * BLOCK_M, seq_len_kv)
+
+    # --- V3.2: skip mask to track which tiles are deferred to compression pass ---
+    if APPLY_SKIP_V32:
+        # 1 = skipped (deferred), 0 = kept (exact). Static size for Triton constexpr.
+        skip_mask = tl.zeros([MAX_KV_TILES], dtype=tl.int32)
+        num_kv_tiles = tl.cdiv(seq_len_kv, BLOCK_N)
 
     # --- Main loop: iterate over KV tiles ---
     for kv_start in range(0, kv_bound, BLOCK_N):
@@ -378,6 +483,16 @@ def _attn_fwd_body(
                         acc = acc * correction[:, None]
                         acc += l_new[:, None] * fresh_v_mean[None, :]
                         row_max = m_new
+                    elif APPLY_SKIP_V32:
+                        # V3.2: DEFER to compression pass. Record tile, update row_max only.
+                        # The compression pass after the main loop will compute a proper
+                        # mini-softmax over all deferred tiles' k_mean/v_mean.
+                        kv_tile_idx_v32 = kv_start // BLOCK_N
+                        skip_mask = tl.where(
+                            tl.arange(0, MAX_KV_TILES) == kv_tile_idx_v32, 1, skip_mask
+                        )
+                        # Still update row_max to prevent cascading staleness (V3 fix)
+                        row_max = tl.maximum(row_max, tile_row_max)
                     else:
                         # FULL SKIP (100% agreement or unanimity mode):
                         # Pool-K approximate weights (128 exp2) + v_mean.
@@ -409,6 +524,72 @@ def _attn_fwd_body(
                 )
                 acc = tl.dot(p.to(v.dtype), v, acc)
                 row_max = m_new
+
+    # --- V3.2: Compression pass over deferred (skipped) tiles ---
+    # Mini-softmax: softmax(Q @ K_mean^T) @ V_mean for skipped tiles only,
+    # then merge with the main loop's kept-tile results via two-chunk online softmax.
+    if APPLY_SKIP_V32:
+        # Compression pass accumulators (independent online softmax)
+        comp_row_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        comp_row_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+        comp_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
+        # Loop over KV tiles — process only the skipped ones
+        for t_idx in range(0, MAX_KV_TILES):
+            if t_idx < num_kv_tiles:
+                # Check if this tile was skipped
+                is_skipped = tl.sum(
+                    tl.where(tl.arange(0, MAX_KV_TILES) == t_idx, skip_mask, 0)
+                )
+                if is_skipped > 0:
+                    # Load precomputed k_mean [BLOCK_D]
+                    km_ptr = (
+                        Kmean_cache
+                        + batch_idx * stride_km_b
+                        + kv_head_idx * stride_km_h
+                        + t_idx * stride_km_t
+                        + dim_pos
+                    )
+                    km = tl.load(km_ptr, mask=d_mask, other=0.0)  # [BLOCK_D]
+
+                    # Load precomputed v_mean [BLOCK_D]
+                    vm_ptr = (
+                        Vmean_cache
+                        + batch_idx * stride_vm_b
+                        + kv_head_idx * stride_vm_h
+                        + t_idx * stride_vm_t
+                        + dim_pos
+                    )
+                    vm = tl.load(vm_ptr, mask=d_mask, other=0.0)  # [BLOCK_D]
+
+                    # Score: Q @ k_mean → [BLOCK_M] (one score per query row)
+                    comp_score = tl.sum(q * km[None, :], 1) * qk_scale  # [BLOCK_M]
+
+                    # Online softmax update for compression pass
+                    n_valid_kv = tl.minimum(seq_len_kv - t_idx * BLOCK_N, BLOCK_N).to(
+                        tl.float32
+                    )
+                    n_valid_kv = tl.maximum(n_valid_kv, 1.0)
+                    m_new = tl.maximum(comp_row_max, comp_score)
+                    p_tile = tl.math.exp2(comp_score - m_new) * n_valid_kv  # [BLOCK_M]
+                    correction = tl.math.exp2(comp_row_max - m_new)
+                    comp_row_sum = comp_row_sum * correction + p_tile
+                    comp_acc = comp_acc * correction[:, None]
+                    comp_acc += p_tile[:, None] * vm[None, :]
+                    comp_row_max = m_new
+
+        # --- Merge main loop (kept tiles) and compression pass (skipped tiles) ---
+        # Two-chunk online softmax merge formula:
+        #   m = max(row_max_A, row_max_B)
+        #   row_sum = row_sum_A * exp2(row_max_A - m) + row_sum_B * exp2(row_max_B - m)
+        #   acc = acc_A * exp2(row_max_A - m) + acc_B * exp2(row_max_B - m)
+        #   output = acc / row_sum
+        m_merged = tl.maximum(row_max, comp_row_max)
+        corr_main = tl.math.exp2(row_max - m_merged)
+        corr_comp = tl.math.exp2(comp_row_max - m_merged)
+        row_sum = row_sum * corr_main + comp_row_sum * corr_comp
+        acc = acc * corr_main[:, None] + comp_acc * corr_comp[:, None]
+        row_max = m_merged
 
     # --- Final normalization: output = acc / row_sum ---
     acc = acc / row_sum[:, None]
@@ -1107,6 +1288,127 @@ def _attention_v25_forward(
     return o
 
 
+def _attention_v32_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    max_input_len: int,
+    is_causal: bool,
+    sm_scale: float,
+    b_start_loc_k: torch.Tensor,
+    b_seq_len_k: torch.Tensor,
+    max_input_len_k: int,
+    skip_threshold_log2: float,
+    k_mean_cache: torch.Tensor,
+    v_mean_cache: torch.Tensor,
+    majority_pct: float = 0.0,
+    sparsity_counters: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """V3.2 forward: compression-branch-style skip path.
+
+    Skipped tiles are deferred to a post-loop mini-softmax over precomputed
+    k_mean/v_mean vectors, giving properly normalized attention-weighted output
+    instead of per-tile-independent pool-K approximation.
+
+    No autograd — forward-only inference optimization.
+    """
+    HEAD_DIM = q.shape[2]
+    num_q_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    kv_group_num = num_q_heads // num_kv_heads
+    batch = b_seq_len.shape[0]
+    qk_scale = sm_scale * LOG2E
+    BLOCK_D = triton.next_power_of_2(HEAD_DIM)
+    BLOCK_M = 128
+    BLOCK_N = 64
+
+    o = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], num_q_heads, device=q.device, dtype=torch.float32)
+
+    # Precompute both k_mean and v_mean for all KV tiles
+    num_kv_tiles = triton.cdiv(max_input_len_k, BLOCK_N)
+    _precompute_kv_mean[(batch, num_kv_heads, num_kv_tiles)](
+        k,
+        v,
+        k_mean_cache,
+        v_mean_cache,
+        b_start_loc_k,
+        b_seq_len_k,
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        k_mean_cache.stride(0),
+        k_mean_cache.stride(1),
+        k_mean_cache.stride(2),
+        v_mean_cache.stride(0),
+        v_mean_cache.stride(1),
+        v_mean_cache.stride(2),
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        HEAD_DIM=HEAD_DIM,
+    )
+
+    # MAX_KV_TILES must be a constexpr >= actual num_kv_tiles.
+    # Round up to next power of 2 for efficient static allocation.
+    MAX_KV_TILES = triton.next_power_of_2(num_kv_tiles)
+
+    grid = (batch, num_q_heads, triton.cdiv(max_input_len, BLOCK_M))
+
+    _attn_fwd_body[grid](
+        q,
+        k,
+        v,
+        qk_scale,
+        b_start_loc,
+        b_seq_len,
+        b_start_loc_k,
+        b_seq_len_k,
+        o,
+        lse,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o.stride(0),
+        o.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        N_CTX=max_input_len,
+        kv_group_num=kv_group_num,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+        BLOCK_N=BLOCK_N,
+        IS_CAUSAL=is_causal,
+        HEAD_DIM=HEAD_DIM,
+        STORE_LSE=False,
+        APPLY_SKIP_SOFTMAX=True,
+        skip_threshold_log2=skip_threshold_log2,
+        APPLY_MAJORITY_VOTE=majority_pct > 0,
+        majority_threshold=int(majority_pct * BLOCK_M) if majority_pct > 0 else 0,
+        APPLY_SKIP_V25=True,
+        Vmean_cache=v_mean_cache,
+        stride_vm_b=v_mean_cache.stride(0),
+        stride_vm_h=v_mean_cache.stride(1),
+        stride_vm_t=v_mean_cache.stride(2),
+        APPLY_SKIP_V32=True,
+        Kmean_cache=k_mean_cache,
+        stride_km_b=k_mean_cache.stride(0),
+        stride_km_h=k_mean_cache.stride(1),
+        stride_km_t=k_mean_cache.stride(2),
+        MAX_KV_TILES=MAX_KV_TILES,
+        MEASURE_SPARSITY=sparsity_counters is not None,
+        Sparsity_counters=sparsity_counters,
+        num_warps=4,
+        num_stages=1,
+    )
+    return o
+
+
 def _attention_lite_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1212,6 +1514,7 @@ def attention(
     skip_softmax_threshold: float | None = None,
     skip_softmax_normalize_by_seqlen: bool = False,
     v_mean_cache: torch.Tensor | None = None,
+    k_mean_cache: torch.Tensor | None = None,
     majority_pct: float = 0.0,
     sparsity_counters: torch.Tensor | None = None,
     lite_attention_threshold: float | None = None,
@@ -1237,10 +1540,12 @@ def attention(
         skip_softmax_normalize_by_seqlen: When True (diffusion mode), converts
             threshold via ``-threshold * log2(seq_k)`` for sequence-length
             invariance. When False (LLM mode), uses ``log2(threshold)``.
-        v_mean_cache: V2.5 precomputed per-tile mean V vector. Shape
+        v_mean_cache: V2.5/V3.2 precomputed per-tile mean V vector. Shape
             ``[batch, num_kv_heads, num_kv_tiles, head_dim_padded]``.
-            Populated by a precompute kernel before attention. Skipped tiles
-            use pool-K approximate weight + this fresh v_mean.
+        k_mean_cache: V3.2 precomputed per-tile mean K vector. Shape
+            ``[batch, num_kv_heads, num_kv_tiles, head_dim_padded]``.
+            When provided alongside v_mean_cache, enables V3.2
+            compression-branch skip path (mini-softmax over k_mean/v_mean).
         sparsity_counters: Optional ``[2]`` int64 tensor for runtime sparsity
             measurement. ``[0]`` accumulates total tile evaluations, ``[1]``
             accumulates skipped tiles. Updated via atomic adds in the kernel.
@@ -1285,12 +1590,12 @@ def attention(
             lite_attention_skip_write,
         )
 
-    # --- V2.5 path ---
+    # --- V3.2 / V2.5 path ---
     apply_skip = skip_softmax_threshold is not None and skip_softmax_threshold > 0.0
-    use_v25 = apply_skip and v_mean_cache is not None
+    use_v32 = apply_skip and v_mean_cache is not None and k_mean_cache is not None
+    use_v25 = apply_skip and v_mean_cache is not None and not use_v32
 
-    if use_v25:
-        # V2.5 path: no autograd, fixed block sizes, cache read/write
+    if use_v32 or use_v25:
         if b_seq_len_k is None:
             b_seq_len_k = b_seq_len
             b_start_loc_k = b_start_loc
@@ -1303,6 +1608,26 @@ def attention(
             skip_threshold_log2 = -skip_softmax_threshold * math.log2(max_input_len_k)
         else:
             skip_threshold_log2 = math.log2(skip_softmax_threshold)
+
+        if use_v32:
+            return _attention_v32_forward(
+                q,
+                k,
+                v,
+                b_start_loc,
+                b_seq_len,
+                max_input_len,
+                is_causal,
+                sm_scale,
+                b_start_loc_k,
+                b_seq_len_k,
+                max_input_len_k,
+                skip_threshold_log2,
+                k_mean_cache,
+                v_mean_cache,
+                majority_pct=majority_pct,
+                sparsity_counters=sparsity_counters,
+            )
 
         return _attention_v25_forward(
             q,
