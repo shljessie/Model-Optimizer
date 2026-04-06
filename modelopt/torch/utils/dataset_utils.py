@@ -218,6 +218,7 @@ def get_dataset_samples(
     apply_chat_template: bool = False,
     tokenizer: "PreTrainedTokenizerBase | None" = None,
     split: str | list[str] | None = None,
+    skip_samples: int = 0,
 ) -> list[str]:
     """Load a portion of a dataset with the dataset name and a given size.
 
@@ -240,6 +241,9 @@ def get_dataset_samples(
         split: Override the split(s) to load.  Accepts a single split name or a list.
             If ``None``, uses the splits defined in ``SUPPORTED_DATASET_CONFIG`` for
             registered datasets, or ``["train"]`` for unregistered datasets.
+        skip_samples: Number of samples to skip from the beginning of each split
+            before collecting.  The skip count is applied **per split**, so
+            ``skip_samples=128`` with 4 splits skips 128 from each split.
 
     Returns:
         Samples: The list of samples.
@@ -306,12 +310,16 @@ def get_dataset_samples(
 
     samples: list[str] = []
     for dataset, n in zip(dataset_splits, num_per_split):
+        collected = 0
         for i, sample in enumerate(dataset):
-            if i >= n:
+            if i < skip_samples:
+                continue
+            if collected >= n:
                 break
             text = _preprocess(sample)
             if text:
                 samples.append(text)
+                collected += 1
 
     return samples
 
@@ -340,6 +348,7 @@ def get_dataset_dataloader(
     device: torch.device | None = None,
     include_labels: bool = False,
     apply_chat_template: bool = False,
+    skip_samples: int = 0,
 ) -> DataLoader:
     """Get a dataloader with the dataset name and tokenizer of the target model.
 
@@ -354,6 +363,8 @@ def get_dataset_dataloader(
         include_labels: Whether to include labels in the dataloader.
         apply_chat_template: Whether to apply the chat template to the samples
             (if supported by the dataset).
+        skip_samples: Number of samples to skip per split before collecting
+            (see :func:`get_dataset_samples`).
 
     Returns:
         An instance of dataloader.
@@ -380,7 +391,11 @@ def get_dataset_dataloader(
     all_samples = []
     for ds_name, num_sample in zip(dataset_name, num_samples):
         samples = get_dataset_samples(
-            ds_name, num_sample, apply_chat_template=apply_chat_template, tokenizer=tokenizer
+            ds_name,
+            num_sample,
+            apply_chat_template=apply_chat_template,
+            tokenizer=tokenizer,
+            skip_samples=skip_samples,
         )
         all_samples.extend(samples)
 

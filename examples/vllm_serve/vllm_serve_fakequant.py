@@ -76,6 +76,7 @@ additional_env_vars = {
     "QUANT_CFG",
     "AMAX_FILE_PATH",
     "KV_QUANT_CFG",
+    "SKIP_FOLD_WEIGHT",
 }
 
 RayDistributedExecutor.ADDITIONAL_ENV_VARS.update(additional_env_vars)

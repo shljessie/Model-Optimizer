@@ -61,6 +61,7 @@ from modelopt.torch.export import (
     save_expert_token_count_table,
 )
 from modelopt.torch.export.model_utils import get_language_model_from_vl, is_multimodal_model
+from modelopt.torch.export.plugins.vllm_fakequant_hf import export_hf_vllm_fq_checkpoint
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg, need_calibration
 from modelopt.torch.quantization.metrics_backup import (
     ActivationMSELogger,
@@ -245,6 +246,91 @@ def make_calib_dataloader(
             include_labels=include_labels,
         )
     return calib_dataloader, first_text_speech_dataset
+
+
+def make_mse_holdout_dataloader(
+    args: argparse.Namespace,
+    tokenizer: PreTrainedTokenizerBase,
+    device: torch.device,
+) -> DataLoader:
+    """Create a hold-out dataloader for activation MSE from the same dataset as calibration.
+
+    Samples are drawn from the same dataset/splits but starting *after* the calibration
+    region, so there is zero overlap.  The skip count per split equals
+    ``calib_size // num_splits`` (matching how ``get_dataset_samples`` divides samples).
+    """
+    from modelopt.torch.utils.dataset_utils import SUPPORTED_DATASET_CONFIG
+
+    dataset_names = args.dataset
+    calib_sizes = args.calib_size
+    n_mse = getattr(args, "activation_mse_max_samples", 16)
+
+    # Compute per-split skip: calib samples per dataset / number of splits for that dataset
+    skip_per_dataset = []
+    for ds_name, cs in zip(dataset_names, calib_sizes):
+        if ds_name in SUPPORTED_DATASET_CONFIG:
+            n_splits = len(SUPPORTED_DATASET_CONFIG[ds_name]["config"].get("split", [None]))
+        else:
+            n_splits = 1
+        skip_per_dataset.append(cs // max(n_splits, 1))
+
+    # Use the max skip across datasets (all datasets share the same skip_samples param)
+    skip = max(skip_per_dataset)
+
+    # Number of hold-out samples per dataset, proportional to calib_size
+    total_calib = sum(calib_sizes)
+    holdout_sizes = [max(1, int(n_mse * cs / total_calib)) for cs in calib_sizes]
+    # Ensure we get exactly n_mse total
+    holdout_sizes[-1] = n_mse - sum(holdout_sizes[:-1])
+
+    print(
+        f"Creating MSE hold-out dataloader: skip_per_split={skip}, "
+        f"holdout_sizes={dict(zip(dataset_names, holdout_sizes))}"
+    )
+
+    holdout_dataloader = get_dataset_dataloader(
+        dataset_name=dataset_names,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        num_samples=holdout_sizes,
+        device=device,
+        skip_samples=skip,
+    )
+    return holdout_dataloader
+
+
+def verify_no_overlap(
+    calib_dataloader: DataLoader,
+    holdout_dataloader: DataLoader,
+) -> None:
+    """Verify that calibration and hold-out dataloaders have no overlapping samples.
+
+    Compares SHA-256 hashes of each row of input_ids across both dataloaders.
+    Raises AssertionError if any overlap is found.
+    """
+    import hashlib
+
+    def _collect_hashes(dataloader: DataLoader) -> set[str]:
+        hashes = set()
+        for batch in dataloader:
+            ids = batch["input_ids"] if isinstance(batch, dict) else batch
+            for row in ids:
+                h = hashlib.sha256(row.cpu().numpy().tobytes()).hexdigest()
+                hashes.add(h)
+        return hashes
+
+    calib_hashes = _collect_hashes(calib_dataloader)
+    holdout_hashes = _collect_hashes(holdout_dataloader)
+    overlap = calib_hashes & holdout_hashes
+
+    assert len(overlap) == 0, (
+        f"Found {len(overlap)} overlapping samples between calibration and MSE hold-out data! "
+        f"This invalidates the MSE measurement. Check dataset/calib_size configuration."
+    )
+    print(
+        f"[MSE hold-out] Overlap check passed: "
+        f"{len(calib_hashes)} calib vs {len(holdout_hashes)} hold-out, 0 overlap."
+    )
 
 
 def auto_quantize(
@@ -692,11 +778,17 @@ def export_quantized(
             if mtp_layer_prefixes:
                 full_model._mtp_layer_prefixes = mtp_layer_prefixes
 
-            export_hf_checkpoint(
-                full_model,
-                export_dir=export_path,
-                extra_state_dict=mtp_state_dict,
-            )
+            if args.vllm_fakequant_export:
+                export_hf_vllm_fq_checkpoint(
+                    full_model,
+                    export_dir=export_path,
+                )
+            else:
+                export_hf_checkpoint(
+                    full_model,
+                    export_dir=export_path,
+                    extra_state_dict=mtp_state_dict,
+                )
 
         # Restore default padding and export the tokenizer as well.
         if tokenizer is not None:
@@ -998,7 +1090,7 @@ def quantize_main(
             mse_save_dir = getattr(args, "activation_mse_save_dir", None)
             mse_input_path = getattr(args, "activation_mse_input_path", None)
 
-            # Resolve MSE input data: frozen file (raw text or tokenized) or live dataloader
+            # Resolve MSE input data: frozen file (raw text or tokenized), or hold-out set
             mse_data = None
             if mse_input_path is not None:
                 if mse_input_path.endswith(".json"):
@@ -1014,9 +1106,13 @@ def quantize_main(
                         assert tokenizer is not None, (
                             "--activation_mse_input_path with .json requires a tokenizer to decode"
                         )
-                        print(f"Creating MSE input data .json file: {mse_input_path}")
+                        print(
+                            f"Creating MSE input data .json file from hold-out set: {mse_input_path}"
+                        )
+                        holdout_dl = make_mse_holdout_dataloader(args, tokenizer, device)
+                        verify_no_overlap(calib_dataloader, holdout_dl)
                         texts = ActivationMSELogger.materialize_raw_text(
-                            calib_dataloader,
+                            holdout_dl,
                             mse_input_path,
                             tokenizer=tokenizer,
                             max_samples=n_mse,
@@ -1030,10 +1126,15 @@ def quantize_main(
                     if os.path.isfile(mse_input_path):
                         print(f"Loading MSE input data from existing .pt file: {mse_input_path}")
                         mse_data = ActivationMSELogger.load_data(mse_input_path)
+                        verify_no_overlap(calib_dataloader, mse_data)
                     else:
-                        print(f"Creating MSE input data .pt file: {mse_input_path}")
+                        print(
+                            f"Creating MSE input data .pt file from hold-out set: {mse_input_path}"
+                        )
+                        holdout_dl = make_mse_holdout_dataloader(args, tokenizer, device)
+                        verify_no_overlap(calib_dataloader, holdout_dl)
                         mse_data = ActivationMSELogger.materialize_data(
-                            calib_dataloader,
+                            holdout_dl,
                             mse_input_path,
                             max_samples=n_mse,
                         )
@@ -1043,7 +1144,11 @@ def quantize_main(
                     )
 
             if mse_data is None:
-                mse_data = calib_dataloader
+                # Default: create a hold-out set from the same dataset, skipping
+                # the calibration region to avoid overlap.
+                print("Creating MSE hold-out dataloader (non-overlapping with calibration)...")
+                mse_data = make_mse_holdout_dataloader(args, tokenizer, device)
+                verify_no_overlap(calib_dataloader, mse_data)
 
             mse_logger = ActivationMSELogger(max_samples=n_mse, save_dir=mse_save_dir)
             print(f"Collecting original (unquantized) activations for MSE over {n_mse} samples...")
@@ -1104,12 +1209,16 @@ def quantize_main(
     # Plugin-registered configs (e.g. PSX LUTS from modelopt-internal) are not exportable
     # via the standard TRT-LLM / HF export paths. Fall back to save_pretrained().
     if args.qformat not in QUANT_CFG_CHOICES and hasattr(mtq, args.qformat):
-        print(
-            f"qformat '{args.qformat}' is a plugin-registered config and is not exportable "
-            f"via the standard export pipeline. Saving with save_pretrained() instead."
-        )
         export_path = args.export_path
-        full_model.save_pretrained(export_path)
+        if args.vllm_fakequant_export:
+            print(f"Exporting vLLM fakequant checkpoint (bf16 weights + amax) to: {export_path}")
+            export_hf_vllm_fq_checkpoint(full_model, export_dir=export_path)
+        else:
+            print(
+                f"qformat '{args.qformat}' is a plugin-registered config and is not exportable "
+                f"via the standard export pipeline. Saving with save_pretrained() instead."
+            )
+            full_model.save_pretrained(export_path)
         if tokenizer is not None:
             tokenizer.save_pretrained(export_path)
         print(f"Quantized model saved to: {export_path}")
@@ -1176,6 +1285,16 @@ def parse_args() -> argparse.Namespace:
         default=512,
     )
     parser.add_argument("--export_path", default="exported_model")
+    parser.add_argument(
+        "--vllm_fakequant_export",
+        action="store_true",
+        default=False,
+        help=(
+            "Export bf16 weights and amax values separately for vLLM fakequant serving. "
+            "Produces a standard HF checkpoint with GPTQ-adjusted weights plus a "
+            "quant_amax.pth file that can be loaded via AMAX_FILE_PATH in vllm_serve_fakequant.py."
+        ),
+    )
     parser.add_argument(
         "--dataset",
         help=(

@@ -1632,6 +1632,7 @@ def gptq(
     forward_loop: ForwardLoop,
     percdamp: float = 0.01,
     block_size: int = 128,
+    skip_layers: list[int] | None = None,
 ):
     """GPTQ quantization.
 
@@ -1886,6 +1887,7 @@ def gptq(
                 encode_path += "/"
             quant_block_size = extra_args.get("block_sizes", 16)
             scale_type = extra_args.get("scale_type", "e4m3")
+            print(f"[GPTQ psx_luts] quant_block_size={quant_block_size}, scale_type={scale_type}")
 
             # Load the vector LUT codebook
             import luts
@@ -1900,6 +1902,7 @@ def gptq(
 
             values = values.to(torch.float)
             vector_size = values.shape[1]
+            print(f"[GPTQ psx_luts] vector_size={vector_size}, codebook_shape={values.shape}")
             assert self.weight is not None and self.h_inv is not None
             out_features, num_cols = self.weight.shape
 
@@ -1969,6 +1972,29 @@ def gptq(
 
     max_calibrate(model, forward_loop=forward_loop)
     _promote_nvfp4_static_quantizers(model)
+
+    # Skip GPTQ weight update for specified layers — fold weights via QDQ instead.
+    layer_idx = getattr(model, "_seq_calib_layer_idx", None)
+    if skip_layers and layer_idx is not None and layer_idx in skip_layers:
+        print_rank_0(
+            f"[Layer {layer_idx}] In skip_layers {skip_layers} → using RTN path (no GPTQ weight update)"
+        )
+        rtn_count = 0
+        for name, module in model.named_modules():
+            if is_quantized_linear(module) and module.weight_quantizer.is_enabled:
+                wq = module.weight_quantizer
+                with torch.no_grad():
+                    module.weight.data = wq(module.weight).to(module.weight.dtype)
+                backend = getattr(wq, "backend", None)
+                if backend == "psx_luts":
+                    wq.disable()
+                rtn_count += 1
+                print_rank_0(f"  [RTN] {name} — QDQ-folded (backend={backend})")
+        print_rank_0(f"[Layer {layer_idx}] RTN path complete: {rtn_count} layers folded via QDQ")
+        return
+
+    if layer_idx is not None:
+        print_rank_0(f"[Layer {layer_idx}] Not in skip_layers → using GPTQ path")
 
     quantized_layers = [
         (n, m)

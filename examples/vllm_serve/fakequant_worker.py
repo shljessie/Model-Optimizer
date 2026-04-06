@@ -152,6 +152,7 @@ quant_config: dict[str, Any] = {
     "quant_cfg": os.environ.get("QUANT_CFG", None),
     "kv_quant_cfg": os.environ.get("KV_QUANT_CFG", None),
     "amax_file_path": os.environ.get("AMAX_FILE_PATH", None),
+    "skip_fold_weight": os.environ.get("SKIP_FOLD_WEIGHT", "0") == "1",
 }
 
 
@@ -329,7 +330,14 @@ def _fakequant_run_prolog_worker(self) -> None:
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         mtq.print_quant_summary(model)
 
-    mtq.fold_weight(model)
+    if quant_config["skip_fold_weight"]:
+        print("Skipping fold_weight (weights already quantized, e.g. from GPTQ export)")
+        for name, module in model.named_modules():
+            if name.endswith("weight_quantizer"):
+                module.disable()
+    else:
+        mtq.fold_weight(model)
+
     for name, module in model.named_modules():
         if name.endswith("weight_quantizer"):
             assert not module.is_enabled, f"quantizer {name} is still enabled"
