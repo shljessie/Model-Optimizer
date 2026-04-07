@@ -996,14 +996,25 @@ class _Attention(torch.autograd.Function):
         # Triton tiles must be powers of 2; pad head dim
         BLOCK_D = triton.next_power_of_2(HEAD_DIM)
 
-        # Skip-softmax: convert threshold to scaled log2 space for the kernel.
-        # The BLASST reference (https://arxiv.org/pdf/2512.12087) checks
-        # ln(lambda) on unscaled scores. Our kernel works in log2-scaled space
-        # (scores pre-multiplied by qk_scale = sm_scale * LOG2E), so we
-        # pre-scale: threshold_scaled = log2(lambda) * sm_scale.
+        # Skip-softmax: convert lambda threshold to log2 space for the kernel.
+        #
+        # BLASST (https://arxiv.org/pdf/2512.12087) checks the criterion on the
+        # sm_scale-SCALED attention logits a_ij = q·k / sqrt(d):
+        #
+        #   tile_max_a < running_max_a + ln(lambda)
+        #
+        # The Triton kernel stores scores as x = a * log2(e) (for exp2 efficiency),
+        # so a = x * ln(2).  Substituting:
+        #
+        #   tile_max_x * ln(2) < running_max_x * ln(2) + ln(lambda)
+        #   tile_max_x         < running_max_x + log2(lambda)
+        #
+        # Therefore the threshold in kernel (log2) space is simply log2(lambda).
+        # Do NOT multiply by sm_scale — that factor is already absorbed into the
+        # log2(e) conversion above.
         apply_skip = skip_softmax_threshold is not None and skip_softmax_threshold > 0.0
         if apply_skip:
-            skip_threshold_log2 = math.log2(skip_softmax_threshold) * sm_scale
+            skip_threshold_log2 = math.log2(skip_softmax_threshold)
         else:
             skip_threshold_log2 = 0.0
 
