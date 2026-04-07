@@ -124,7 +124,7 @@ def make_augment_fn(specs: list[AugmentationSpec]):
                 # Conflict: dataset already has a system prompt — skip this augmentation.
                 pass
             else:
-                messages = [{"role": "system", "content": spec.content}] + messages
+                messages = [{"role": "system", "content": spec.content}, *messages]
 
         return {"messages": messages}
 
