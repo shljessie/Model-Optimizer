@@ -19,7 +19,7 @@ This example applies skip-softmax sparse attention to the Wan 2.2 video
 generation model (text-to-video) using exponential model calibration
 (``scale_factor = a * exp(b * target_sparsity)``).
 
-During calibration, ``flash_skip_softmax`` with the eager attention backend
+During calibration, ``triton_skip_softmax`` with the Triton calibration kernel
 collects sparsity statistics across multiple threshold trials. The fitted
 exponential model then allows runtime control of the target sparsity ratio
 without recalibration.

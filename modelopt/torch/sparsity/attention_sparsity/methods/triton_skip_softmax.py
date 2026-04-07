@@ -83,9 +83,14 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
         """Inference: activate skip-softmax with calibrated or fixed threshold."""
         module._apply_skip_softmax = True
 
-        # Set threshold on Triton backends
-        threshold = self._get_effective_threshold(module)
-        self._set_triton_backends(threshold=threshold)
+        # When calibrated, pass scale_factor so backends compute
+        # threshold = scale_factor / seq_k at call time (adapts to actual seqlen).
+        # Otherwise fall back to the static threshold.
+        scale_factor = self._get_scale_factor()
+        if scale_factor is not None:
+            self._set_triton_backends(scale_factor=scale_factor)
+        else:
+            self._set_triton_backends(threshold=self.skip_softmax_threshold)
         with self._get_diffusers_backend_context():
             try:
                 yield
@@ -107,8 +112,12 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
                 module._apply_skip_softmax = False
                 self._clear_triton_backends()
 
-    def _get_effective_threshold(self, module) -> float:
-        """Compute threshold from calibration params or use fixed value."""
+    def _get_scale_factor(self) -> float | None:
+        """Compute scale_factor from calibration params, or None if uncalibrated.
+
+        The scale_factor is sequence-length-independent. Backends divide by the
+        actual ``seq_k`` at call time: ``threshold = scale_factor / seq_k``.
+        """
         if self.calibration_params and self.target_sparse_ratio:
             import math
 
@@ -117,15 +126,8 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
             b = params.get("b", 0)
             target = self.target_sparse_ratio.get("prefill", 0.5)
             if a > 0 and b > 0:
-                # scale_factor = a * exp(b * target_sparsity)
-                # threshold = scale_factor / seqlen
-                # For diffusion with fixed seqlen, use a representative value.
-                # The actual seqlen adaptation happens at the kernel level.
-                scale_factor = a * math.exp(b * target)
-                # Use a default seqlen estimate; the kernel threshold is in
-                # absolute space so we just pass the raw threshold.
-                return scale_factor / 4224  # TODO: pass actual seqlen at runtime
-        return self.skip_softmax_threshold
+                return a * math.exp(b * target)
+        return None
 
     @staticmethod
     @contextmanager
@@ -172,19 +174,28 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
     def _collect_calibration_stats(self, module):
         """Read Triton calibration counters and store as stats on the module."""
         counters = None
+        seq_k = None
 
         try:
-            from ..kernels.diffusers_triton_attention import get_calibration_counters
+            from ..kernels.diffusers_triton_attention import (
+                get_calibration_counters,
+                get_calibration_seq_k,
+            )
 
             counters = get_calibration_counters()
+            seq_k = get_calibration_seq_k()
         except ImportError:
             pass
 
         if counters is None:
             try:
-                from ..kernels.ltx_triton_attention import get_calibration_counters
+                from ..kernels.ltx_triton_attention import (
+                    get_calibration_counters,
+                    get_calibration_seq_k,
+                )
 
                 counters = get_calibration_counters()
+                seq_k = get_calibration_seq_k()
             except ImportError:
                 pass
 
@@ -196,10 +207,10 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
         skipped = counters[:, 1].float()
         sparsity_list = (skipped / total.clamp(min=1)).tolist()
 
-        # Estimate sample_length from total tiles:
-        # total_tiles = num_heads * num_q_tiles * num_kv_tiles * batch
-        # For simplicity, use total[0] as a proxy for sequence length scaling
-        sample_length = int(total[0].item())
+        # Use actual KV sequence length from backend for the exponential model fit.
+        # The calibrator uses: scale_factor = threshold * sample_length, so this
+        # must be the real sequence length, not the total tile count.
+        sample_length = seq_k if seq_k is not None else 0
 
         module._last_stats = {
             "sparsity": sparsity_list,
@@ -209,10 +220,12 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
 
     def get_threshold_info(self) -> dict:
         """Get threshold information for debugging/display."""
-        if self.calibration_params and self.target_sparse_ratio:
+        scale_factor = self._get_scale_factor()
+        if scale_factor is not None:
             return {
                 "type": "dynamic_calibrated",
-                "formula": "threshold = a * exp(b * target_sparsity) / seqlen",
+                "formula": "threshold = scale_factor / seq_k (computed at runtime)",
+                "scale_factor": scale_factor,
                 "calibration_params": self.calibration_params,
                 "target_sparse_ratio": self.target_sparse_ratio,
             }

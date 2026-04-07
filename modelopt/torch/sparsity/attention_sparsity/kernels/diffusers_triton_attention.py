@@ -49,21 +49,27 @@ def set_triton_skip_softmax_config(
     threshold: float | None = None,
     calibration_mode: bool = False,
     threshold_trials: list[float] | None = None,
+    scale_factor: float | None = None,
 ) -> None:
     """Set thread-local skip-softmax config for the next Triton attention call.
 
     Args:
-        threshold: Skip-softmax threshold for inference mode.
+        threshold: Skip-softmax threshold for inference mode (static).
         calibration_mode: If True, use the calibration kernel to collect
             multi-threshold sparsity stats instead of skipping tiles.
         threshold_trials: List of thresholds to measure sparsity for
             (only used when calibration_mode=True).
+        scale_factor: Calibrated scale factor for dynamic threshold computation.
+            When set, the actual threshold is computed as ``scale_factor / seq_k``
+            at attention call time, adapting to the actual sequence length.
     """
     _thread_local.skip_threshold = threshold
     _thread_local.calibration_mode = calibration_mode
     _thread_local.threshold_trials = threshold_trials
+    _thread_local.scale_factor = scale_factor
     # Accumulated counters across all attention calls in one forward pass
     _thread_local.calibration_counters = None
+    _thread_local.calibration_seq_k = None
 
 
 def clear_triton_skip_softmax_config() -> None:
@@ -71,12 +77,19 @@ def clear_triton_skip_softmax_config() -> None:
     _thread_local.skip_threshold = None
     _thread_local.calibration_mode = False
     _thread_local.threshold_trials = None
+    _thread_local.scale_factor = None
     _thread_local.calibration_counters = None
+    _thread_local.calibration_seq_k = None
 
 
 def get_calibration_counters() -> "torch.Tensor | None":
     """Return accumulated calibration counters ``[num_thresholds, 2]`` or None."""
     return getattr(_thread_local, "calibration_counters", None)
+
+
+def get_calibration_seq_k() -> int | None:
+    """Return KV sequence length observed during calibration, or None."""
+    return getattr(_thread_local, "calibration_seq_k", None)
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +153,20 @@ def _diffusers_triton_attention(
             else:
                 _thread_local.calibration_counters = prev + counters
 
+            # Store actual KV sequence length for calibration stats
+            _thread_local.calibration_seq_k = seq_k
+
             return o.view(batch, seq_q, num_heads_q, head_dim)
 
-    # --- Inference mode: skip-softmax with single threshold ---
-    threshold = getattr(_thread_local, "skip_threshold", None)
-    if threshold is not None and threshold > 0.0:
-        kw["skip_softmax_threshold"] = threshold
+    # --- Inference mode: skip-softmax with dynamic or static threshold ---
+    scale_factor = getattr(_thread_local, "scale_factor", None)
+    if scale_factor is not None and scale_factor > 0.0:
+        # Dynamic threshold: adapt to actual sequence length
+        kw["skip_softmax_threshold"] = scale_factor / seq_k
+    else:
+        threshold = getattr(_thread_local, "skip_threshold", None)
+        if threshold is not None and threshold > 0.0:
+            kw["skip_softmax_threshold"] = threshold
 
     assert attention is not None, "Triton attention kernel not available (requires CUDA + triton)"
     o = attention(q, k, v, **kw)

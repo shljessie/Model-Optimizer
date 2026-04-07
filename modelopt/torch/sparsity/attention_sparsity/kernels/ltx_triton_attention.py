@@ -37,14 +37,17 @@ def set_ltx_triton_context(
     threshold: float | None = None,
     calibration_mode: bool = False,
     threshold_trials: list[float] | None = None,
+    scale_factor: float | None = None,
 ) -> None:
     """Set thread-local Triton config for LTX-2 attention."""
     _thread_local.active = active
     _thread_local.threshold = threshold
     _thread_local.calibration_mode = calibration_mode
     _thread_local.threshold_trials = threshold_trials
+    _thread_local.scale_factor = scale_factor
     if not calibration_mode:
         _thread_local.calibration_counters = None
+    _thread_local.calibration_seq_k = None
 
 
 def clear_ltx_triton_context() -> None:
@@ -53,20 +56,28 @@ def clear_ltx_triton_context() -> None:
     _thread_local.threshold = None
     _thread_local.calibration_mode = False
     _thread_local.threshold_trials = None
+    _thread_local.scale_factor = None
     _thread_local.calibration_counters = None
+    _thread_local.calibration_seq_k = None
 
 
-def _get_ltx_triton_context() -> tuple[bool, float | None]:
-    """Return (active, threshold)."""
+def _get_ltx_triton_context() -> tuple[bool, float | None, float | None]:
+    """Return (active, threshold, scale_factor)."""
     return (
         getattr(_thread_local, "active", False),
         getattr(_thread_local, "threshold", None),
+        getattr(_thread_local, "scale_factor", None),
     )
 
 
 def get_calibration_counters() -> "torch.Tensor | None":
     """Return accumulated calibration counters ``[num_thresholds, 2]`` or None."""
     return getattr(_thread_local, "calibration_counters", None)
+
+
+def get_calibration_seq_k() -> int | None:
+    """Return KV sequence length observed during calibration, or None."""
+    return getattr(_thread_local, "calibration_seq_k", None)
 
 
 def _ltx_triton_attention(
@@ -120,10 +131,17 @@ def _ltx_triton_attention(
             else:
                 _thread_local.calibration_counters = prev + counters
 
+            # Store actual KV sequence length for calibration stats
+            _thread_local.calibration_seq_k = seq_k
+
             return o.view(b, seq_q, heads * dim_head)
 
-    # --- Inference mode ---
-    if threshold is not None and threshold > 0.0:
+    # --- Inference mode: dynamic or static threshold ---
+    scale_factor = getattr(_thread_local, "scale_factor", None)
+    if scale_factor is not None and scale_factor > 0.0:
+        # Dynamic threshold: adapt to actual sequence length
+        kw["skip_softmax_threshold"] = scale_factor / seq_k
+    elif threshold is not None and threshold > 0.0:
         kw["skip_softmax_threshold"] = threshold
 
     assert attention is not None, "Triton attention kernel not available (requires CUDA + triton)"
@@ -138,7 +156,7 @@ class _TritonLTXAttentionWrapper:
         self._original_fn = original_fn
 
     def __call__(self, q, k, v, heads, mask=None):
-        active, threshold = _get_ltx_triton_context()
+        active, threshold, scale_factor = _get_ltx_triton_context()
         if active:
             return _ltx_triton_attention(q, k, v, heads, mask, threshold)
         return self._original_fn(q, k, v, heads, mask)
