@@ -1081,9 +1081,30 @@ def quantize_main(
         if args.fold_weights:
             print("Folding weights before perplexity evaluation...")
             mtq.fold_weight(language_model)
-        eval_data = get_wikitext2(tokenizer, args.eval_perplexity_seq_len)
+        if args.eval_perplexity_input_path:
+            print(f"Loading perplexity eval data from {args.eval_perplexity_input_path}")
+            eval_data = torch.load(
+                args.eval_perplexity_input_path, map_location="cpu", weights_only=True
+            )
+            # Unbatch to [1, seq_len] per element for compute_perplexity batching
+            unbatched = []
+            for t in eval_data:
+                if not isinstance(t, torch.Tensor):
+                    continue
+                if t.dim() == 1:
+                    unbatched.append(t.unsqueeze(0))
+                elif t.shape[0] > 1:
+                    unbatched.extend(t.unbind(0))
+                else:
+                    unbatched.append(t)
+            eval_data = [t.unsqueeze(0) if t.dim() == 1 else t for t in unbatched]
+            print(f"Loaded {len(eval_data)} sequences from {args.eval_perplexity_input_path}")
+            label = args.eval_perplexity_input_path
+        else:
+            eval_data = get_wikitext2(tokenizer, args.eval_perplexity_seq_len)
+            label = "Wikitext-2"
         ppl = compute_perplexity(full_model, eval_data)
-        print(f"Wikitext-2 perplexity: {ppl:.2f}")
+        print(f"{label} perplexity: {ppl:.2f}")
 
     # Plugin-registered configs (e.g. PSX LUTS from modelopt-internal) are not exportable
     # via the standard TRT-LLM / HF export paths. Fall back to save_pretrained().
@@ -1340,6 +1361,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2048,
         help="Sequence length for perplexity evaluation (default: 2048).",
+    )
+    parser.add_argument(
+        "--eval_perplexity_input_path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a .pt file containing pre-tokenized evaluation data "
+            "(List[Tensor], each [1, seq_len]) for perplexity evaluation. "
+            "When set, this data is used instead of WikiText-2. "
+            "Compatible with the .pt files produced by create_holdout_mse_inputs.py "
+            "or --activation_mse_input_path."
+        ),
     )
     parser.add_argument(
         "--measure_activation_mse",
