@@ -17,9 +17,12 @@
 
 Registers a ``modelopt_triton`` backend in diffusers' ``_AttentionBackendRegistry``
 that converts the diffusers [B, S, H, D] layout to the Triton FA kernel's varlen
-[total_tokens, H, D] format. Supports skip-softmax tile skipping for sparse attention.
+[total_tokens, H, D] format.
 
-Used during **inference** -- calibration uses the eager backend instead.
+Two modes:
+- **Inference**: Calls ``attention()`` with skip-softmax tile skipping.
+- **Calibration**: Calls ``attention_calibrate()`` to collect multi-threshold
+  sparsity statistics without skipping any tiles.
 """
 
 import inspect
@@ -33,24 +36,47 @@ from diffusers.models.attention_dispatch import (
     attention_backend,
 )
 
-from modelopt.torch.kernels import attention
+from modelopt.torch.kernels import attention, attention_calibrate
 
 _BACKEND_NAME = "modelopt_triton"
 _BACKEND_REGISTERED = False
 
 # Thread-local storage for per-forward skip-softmax configuration.
-# The method's get_sparse_context() sets these before each forward pass.
 _thread_local = threading.local()
 
 
-def set_triton_skip_softmax_config(threshold: float | None = None) -> None:
-    """Set thread-local skip-softmax config for the next Triton attention call."""
+def set_triton_skip_softmax_config(
+    threshold: float | None = None,
+    calibration_mode: bool = False,
+    threshold_trials: list[float] | None = None,
+) -> None:
+    """Set thread-local skip-softmax config for the next Triton attention call.
+
+    Args:
+        threshold: Skip-softmax threshold for inference mode.
+        calibration_mode: If True, use the calibration kernel to collect
+            multi-threshold sparsity stats instead of skipping tiles.
+        threshold_trials: List of thresholds to measure sparsity for
+            (only used when calibration_mode=True).
+    """
     _thread_local.skip_threshold = threshold
+    _thread_local.calibration_mode = calibration_mode
+    _thread_local.threshold_trials = threshold_trials
+    # Accumulated counters across all attention calls in one forward pass
+    _thread_local.calibration_counters = None
 
 
 def clear_triton_skip_softmax_config() -> None:
     """Clear thread-local skip-softmax config."""
     _thread_local.skip_threshold = None
+    _thread_local.calibration_mode = False
+    _thread_local.threshold_trials = None
+    _thread_local.calibration_counters = None
+
+
+def get_calibration_counters() -> "torch.Tensor | None":
+    """Return accumulated calibration counters ``[num_thresholds, 2]`` or None."""
+    return getattr(_thread_local, "calibration_counters", None)
 
 
 # ---------------------------------------------------------------------------
@@ -68,11 +94,7 @@ def _diffusers_triton_attention(
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
-    """Compute attention via Triton FA kernel on diffusers layout ``[B, S, H, D]``.
-
-    Converts to the kernel's varlen format, calls the Triton FA kernel, and
-    converts back.
-    """
+    """Compute attention via Triton FA kernel on diffusers layout ``[B, S, H, D]``."""
     batch, seq_q, num_heads_q, head_dim = query.shape
     seq_k = key.shape[1]
     device = query.device
@@ -97,7 +119,6 @@ def _diffusers_triton_attention(
         "softmax_scale": scale,
     }
 
-    # If Q and KV have different sequence lengths, pass separate KV metadata
     if seq_q != seq_k:
         b_start_loc_k = torch.arange(batch, device=device, dtype=torch.int32) * seq_k
         b_seq_len_k = torch.full((batch,), seq_k, device=device, dtype=torch.int32)
@@ -105,15 +126,29 @@ def _diffusers_triton_attention(
         kw["b_seq_len_k"] = b_seq_len_k
         kw["max_input_len_k"] = seq_k
 
-    # Read skip-softmax config from thread-local storage
+    # --- Calibration mode: collect multi-threshold stats ---
+    calib_mode = getattr(_thread_local, "calibration_mode", False)
+    if calib_mode:
+        trials = getattr(_thread_local, "threshold_trials", None)
+        if trials and attention_calibrate is not None:
+            o, counters = attention_calibrate(q, k, v, **kw, threshold_trials=trials)
+
+            # Accumulate counters across all attention calls in this forward pass
+            prev = getattr(_thread_local, "calibration_counters", None)
+            if prev is None:
+                _thread_local.calibration_counters = counters
+            else:
+                _thread_local.calibration_counters = prev + counters
+
+            return o.view(batch, seq_q, num_heads_q, head_dim)
+
+    # --- Inference mode: skip-softmax with single threshold ---
     threshold = getattr(_thread_local, "skip_threshold", None)
     if threshold is not None and threshold > 0.0:
         kw["skip_softmax_threshold"] = threshold
 
     assert attention is not None, "Triton attention kernel not available (requires CUDA + triton)"
     o = attention(q, k, v, **kw)
-
-    # Reshape back: [B*S, H, D] -> [B, S, H, D]
     return o.view(batch, seq_q, num_heads_q, head_dim)
 
 
@@ -131,14 +166,12 @@ def register_diffusers_triton_attention() -> None:
     if _BACKEND_REGISTERED:
         return
 
-    # Extend the AttentionBackendName enum with our custom value
     new_member = str.__new__(AttentionBackendName, _BACKEND_NAME)
     new_member._name_ = "MODELOPT_TRITON"
     new_member._value_ = _BACKEND_NAME
     AttentionBackendName._member_map_["MODELOPT_TRITON"] = new_member
     AttentionBackendName._value2member_map_[_BACKEND_NAME] = new_member
 
-    # Register the backend function
     _AttentionBackendRegistry._backends[new_member] = _diffusers_triton_attention
     _AttentionBackendRegistry._constraints[new_member] = []
     _AttentionBackendRegistry._supported_arg_names[new_member] = set(
@@ -149,10 +182,7 @@ def register_diffusers_triton_attention() -> None:
 
 
 def get_triton_attention_backend():
-    """Return a context manager that activates the modelopt_triton backend.
-
-    Raises RuntimeError if the backend has not been registered yet.
-    """
+    """Return a context manager that activates the modelopt_triton backend."""
     if not _BACKEND_REGISTERED:
         raise RuntimeError(
             "modelopt_triton backend not registered. "

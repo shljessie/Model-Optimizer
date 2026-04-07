@@ -66,12 +66,13 @@ class SparseAttentionStatsManager:
         self.aggregated_stats["total_calls"] += 1
         self.aggregated_stats["total_blocks"] += stats.get("total_blocks", 0)
 
-        incoming = stats["sparse_blocks"]
-        if "sparse_blocks" not in self.aggregated_stats:
-            self.aggregated_stats["sparse_blocks"] = list(incoming)
-        else:
-            for i, val in enumerate(incoming):
-                self.aggregated_stats["sparse_blocks"][i] += val
+        incoming = stats.get("sparse_blocks")
+        if incoming is not None:
+            if "sparse_blocks" not in self.aggregated_stats:
+                self.aggregated_stats["sparse_blocks"] = list(incoming)
+            else:
+                for i, val in enumerate(incoming):
+                    self.aggregated_stats["sparse_blocks"][i] += val
 
         phase = stats.get("phase", "unknown")
         if phase in self.aggregated_stats["phase_counts"]:

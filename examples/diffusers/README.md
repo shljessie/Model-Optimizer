@@ -296,10 +296,8 @@ config = {
                                  8e-1, 9e-1, 9.9e-1],
         },
         "*.attn1": {
-            "method": "flash_skip_softmax",
-            "thresholds": {"prefill": [1e-3]},
-            "br": 128, "bc": 128,
-            "backend": "pytorch",
+            "method": "triton_skip_softmax",
+            "backend": "triton",
             "is_causal": False,
             "collect_stats": True,
             "enable": True,

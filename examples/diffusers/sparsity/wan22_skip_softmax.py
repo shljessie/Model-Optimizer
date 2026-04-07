@@ -151,16 +151,15 @@ def build_pipeline(model_path: str) -> WanPipeline:
 def build_sparse_config(args: argparse.Namespace, num_blocks: int) -> dict:
     """Build sparse attention config from CLI args.
 
-    Uses flash_skip_softmax which supports both calibration (eager attention
-    with F.softmax patching) and inference. Calibration fits an exponential
-    model: scale_factor = a * exp(b * sparsity).
+    Uses triton_skip_softmax with the Triton FA kernel for both calibration
+    and inference. Calibration collects multi-threshold sparsity statistics
+    via the Triton calibration kernel, then fits an exponential model:
+    scale_factor = a * exp(b * sparsity).
     """
     attn_cfg: dict = {
-        "method": "flash_skip_softmax",
-        "thresholds": {"prefill": [1e-3]},
-        "br": 128,
-        "bc": 128,
-        "backend": "pytorch",
+        "method": "triton_skip_softmax",
+        "skip_softmax_threshold": 0.1,
+        "backend": "triton",
         "is_causal": False,  # Diffusion = bidirectional attention
         "collect_stats": True,
         "enable": True,
