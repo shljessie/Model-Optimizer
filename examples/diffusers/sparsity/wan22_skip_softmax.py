@@ -78,7 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Wan 2.2 video generation with skip-softmax sparse attention"
     )
-    parser.add_argument("--prompt", type=str, required=True, help="Text prompt for generation")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Text prompt for generation (optional, skips generation if not set)",
+    )
     parser.add_argument("--output", type=str, default="output.mp4", help="Output video path")
     parser.add_argument(
         "--model-path", type=str, default=DEFAULT_MODEL_PATH, help="Wan 2.2 model path or HF ID"
@@ -289,20 +294,21 @@ def main() -> None:
         config = build_sparse_config(args, num_blocks=num_blocks)
         mtsa.sparsify(transformer, config, forward_loop=forward_loop)
 
-    # ---- Generate ----
-    print(f"Generating: {args.prompt[:80]}...")
-    output = pipe(
-        prompt=args.prompt,
-        num_frames=args.num_frames,
-        height=args.height,
-        width=args.width,
-        num_inference_steps=args.num_steps,
-        guidance_scale=args.guidance_scale,
-        generator=torch.Generator(device="cuda").manual_seed(args.seed),
-    )
+    # ---- Generate (optional) ----
+    if args.prompt:
+        print(f"Generating: {args.prompt[:80]}...")
+        output = pipe(
+            prompt=args.prompt,
+            num_frames=args.num_frames,
+            height=args.height,
+            width=args.width,
+            num_inference_steps=args.num_steps,
+            guidance_scale=args.guidance_scale,
+            generator=torch.Generator(device="cuda").manual_seed(args.seed),
+        )
 
-    export_to_video(output.frames[0], args.output, fps=16)
-    print(f"Saved to {args.output}")
+        export_to_video(output.frames[0], args.output, fps=16)
+        print(f"Saved to {args.output}")
 
     # ---- Print stats ----
     for name, transformer in transformers_to_sparsify:

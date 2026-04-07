@@ -327,17 +327,17 @@ output = pipeline(prompt="a dog on the beach", ...)
 The 14B model automatically sparsifies both `transformer` and `transformer_2`.
 
 ```bash
-# 5B model (4 calibration prompts from OpenVid-1M, 151 frames, 40 steps)
+# 5B model — calibrate + generate (4 prompts from OpenVid-1M, 151 frames, 40 steps)
 python sparsity/wan22_skip_softmax.py \
     --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-    --prompt "A sunset over mountains" --output out.mp4 \
-    --calibrate --target-sparsity 0.5 --calib-size 4
+    --calibrate --target-sparsity 0.5 --calib-size 4 \
+    --prompt "A sunset over mountains" --output out.mp4
 
 # 14B model (both transformers sparsified)
 python sparsity/wan22_skip_softmax.py \
     --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-    --prompt "A sunset over mountains" --output out.mp4 \
-    --calibrate --target-sparsity 0.5 --calib-size 4
+    --calibrate --target-sparsity 0.5 --calib-size 4 \
+    --prompt "A sunset over mountains" --output out.mp4
 ```
 
 ## Cache Diffusion
