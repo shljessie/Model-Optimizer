@@ -83,7 +83,8 @@ def quantize():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, model_max_length=model_args.model_max_length
     )
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     calib_dataloader = _build_calib_dataloader(tokenizer, data_args, quant_args)
 

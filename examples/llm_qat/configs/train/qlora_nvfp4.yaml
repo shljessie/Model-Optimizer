@@ -29,6 +29,8 @@ gradient_checkpointing: true
 use_liger_kernel: true
 manual_gc: true
 seed: 42
+do_train: true
+do_eval: true
 
 # Evaluation
 eval_on_start: true

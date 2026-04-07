@@ -84,7 +84,8 @@ def train():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, model_max_length=model_args.model_max_length
     )
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # We set model.config.use_cache to False for training when gradient_checkpointing=False.
     # Currently useful for FSDP2 to allow for setting activation_checkpointing=True in the config file.
