@@ -290,9 +290,10 @@ import modelopt.torch.sparsity.attention_sparsity as mtsa
 config = {
     "sparse_cfg": {
         "calibration": {
-            "target_sparse_ratio": {"prefill": 0.25},
+            "target_sparse_ratio": {"prefill": 0.5},
             "threshold_trials": [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3,
-                                 1e-2, 2e-2, 5e-2, 1e-1, 2e-1, 3e-1, 5e-1, 7e-1],
+                                 1e-2, 2e-2, 5e-2, 1e-1, 2e-1, 3e-1, 5e-1, 7e-1,
+                                 8e-1, 9e-1, 9.9e-1],
         },
         "*.attn1": {
             "method": "flash_skip_softmax",
@@ -321,20 +322,22 @@ output = pipeline(prompt="a dog on the beach", ...)
 
 ### Example Scripts
 
-#### LTX-2 [Script](./sparsity/ltx2_skip_softmax.py)
-
-```bash
-python sparsity/ltx2_skip_softmax.py \
-    --prompt "A cat playing piano" --output out.mp4 \
-    --calibrate --target-sparsity 0.25 --skip-first-last 3
-```
-
 #### Wan 2.2 [Script](./sparsity/wan22_skip_softmax.py)
 
+The 14B model automatically sparsifies both `transformer` and `transformer_2`.
+
 ```bash
+# 5B model (4 calibration prompts from OpenVid-1M, 151 frames, 40 steps)
 python sparsity/wan22_skip_softmax.py \
+    --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
     --prompt "A sunset over mountains" --output out.mp4 \
-    --calibrate --target-sparsity 0.25 --skip-first-last 2
+    --calibrate --target-sparsity 0.5 --calib-size 4
+
+# 14B model (both transformers sparsified)
+python sparsity/wan22_skip_softmax.py \
+    --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --prompt "A sunset over mountains" --output out.mp4 \
+    --calibrate --target-sparsity 0.5 --calib-size 4
 ```
 
 ## Cache Diffusion

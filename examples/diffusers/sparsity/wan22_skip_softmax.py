@@ -48,8 +48,7 @@ from diffusers.utils import export_to_video
 import modelopt.torch.sparsity.attention_sparsity as mtsa
 from modelopt.torch.sparsity.attention_sparsity.sparse_attention import SparseAttentionModule
 
-DEFAULT_MODEL_PATH = os.environ.get("WAN22_MODEL_PATH", "Wan-AI/Wan2.2-T2V-5B")
-NUM_TRANSFORMER_BLOCKS = 40
+DEFAULT_MODEL_PATH = os.environ.get("WAN22_MODEL_PATH", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
 
 # Default threshold trials for calibration
 DEFAULT_THRESHOLD_TRIALS = [
@@ -69,6 +68,9 @@ DEFAULT_THRESHOLD_TRIALS = [
     3e-1,
     5e-1,
     7e-1,
+    8e-1,
+    9e-1,
+    9.9e-1,
 ]
 
 
@@ -109,20 +111,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-sparsity",
         type=float,
-        default=0.25,
+        default=0.5,
         help="Target sparsity ratio for calibration (0.0-1.0)",
     )
     parser.add_argument(
         "--calib-steps",
         type=int,
-        default=10,
+        default=40,
         help="Inference steps for calibration",
     )
     parser.add_argument(
         "--calib-frames",
         type=int,
-        default=33,
-        help="Number of frames for calibration (fewer = faster)",
+        default=151,
+        help="Number of frames for calibration",
+    )
+    parser.add_argument(
+        "--calib-size",
+        type=int,
+        default=4,
+        help="Number of calibration prompts from OpenVid-1M dataset",
     )
     return parser.parse_args()
 
@@ -135,7 +143,7 @@ def build_pipeline(model_path: str) -> WanPipeline:
     return pipe
 
 
-def build_sparse_config(args: argparse.Namespace) -> dict:
+def build_sparse_config(args: argparse.Namespace, num_blocks: int) -> dict:
     """Build sparse attention config from CLI args.
 
     Uses flash_skip_softmax which supports both calibration (eager attention
@@ -162,7 +170,7 @@ def build_sparse_config(args: argparse.Namespace) -> dict:
     # Keep first/last N layers dense for quality
     for i in range(args.skip_first_last):
         sparse_cfg[f"*blocks.{i}.attn*"] = {"enable": False}
-        sparse_cfg[f"*blocks.{NUM_TRANSFORMER_BLOCKS - 1 - i}.attn*"] = {"enable": False}
+        sparse_cfg[f"*blocks.{num_blocks - 1 - i}.attn*"] = {"enable": False}
 
     config: dict = {"sparse_cfg": sparse_cfg}
 
@@ -177,28 +185,44 @@ def build_sparse_config(args: argparse.Namespace) -> dict:
     return config
 
 
+def load_calib_prompts(calib_size: int) -> list[str]:
+    """Load calibration prompts from OpenVid-1M dataset."""
+    from datasets import load_dataset
+
+    dataset = load_dataset("nkp37/OpenVid-1M", split="train")
+    prompts = list(dataset["caption"][:calib_size])
+    print(f"Loaded {len(prompts)} calibration prompts from OpenVid-1M")
+    return prompts
+
+
 def build_calibration_forward_loop(
     pipe: WanPipeline,
-    prompt: str,
-    num_steps: int = 10,
-    num_frames: int = 33,
+    calib_size: int = 4,
+    num_steps: int = 40,
+    num_frames: int = 151,
     height: int = 480,
     width: int = 832,
     seed: int = 42,
 ):
-    """Build a forward loop for exponential model calibration."""
+    """Build a forward loop for exponential model calibration.
+
+    Uses prompts from OpenVid-1M dataset (same as quantization examples).
+    Each prompt is run individually (batch_size=1).
+    """
+    calib_prompts = load_calib_prompts(calib_size)
 
     def forward_loop(model):
-        print(f"Calibration: generating {num_frames} frames @ {height}x{width}...")
-        pipe(
-            prompt=prompt,
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            num_inference_steps=num_steps,
-            guidance_scale=5.0,
-            generator=torch.Generator(device="cuda").manual_seed(seed),
-        )
+        for i, prompt in enumerate(calib_prompts):
+            print(f"Calibration [{i + 1}/{len(calib_prompts)}]: {prompt[:60]}...")
+            pipe(
+                prompt=prompt,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                num_inference_steps=num_steps,
+                guidance_scale=5.0,
+                generator=torch.Generator(device="cuda").manual_seed(seed),
+            )
 
     return forward_loop
 
@@ -219,6 +243,17 @@ def print_sparsity_summary(model: torch.nn.Module) -> None:
         print(f"  {name}: {info}")
 
 
+def _get_num_blocks(transformer: torch.nn.Module) -> int:
+    """Count transformer blocks by looking for *.blocks.N.* submodules."""
+    max_idx = -1
+    for name, _ in transformer.named_modules():
+        parts = name.split(".")
+        for i, part in enumerate(parts):
+            if part == "blocks" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                max_idx = max(max_idx, int(parts[i + 1]))
+    return max_idx + 1
+
+
 def main() -> None:
     args = parse_args()
 
@@ -226,15 +261,20 @@ def main() -> None:
     print(f"Loading Wan 2.2 from {args.model_path}...")
     pipe = build_pipeline(args.model_path)
 
-    # ---- Get and sparsify the transformer ----
-    transformer = pipe.transformer
+    # ---- Collect transformers to sparsify ----
+    # Wan 2.2 5B has one transformer; 14B has two (transformer + transformer_2)
+    transformers_to_sparsify = []
+    if pipe.transformer is not None:
+        transformers_to_sparsify.append(("transformer", pipe.transformer))
+    if getattr(pipe, "transformer_2", None) is not None:
+        transformers_to_sparsify.append(("transformer_2", pipe.transformer_2))
 
-    config = build_sparse_config(args)
+    # ---- Build calibration forward loop (shared across transformers) ----
     forward_loop = None
     if args.calibrate:
         forward_loop = build_calibration_forward_loop(
             pipe,
-            prompt=args.prompt,
+            calib_size=args.calib_size,
             num_steps=args.calib_steps,
             num_frames=args.calib_frames,
             height=args.height,
@@ -242,8 +282,12 @@ def main() -> None:
             seed=args.seed,
         )
 
-    print("Applying skip-softmax sparse attention...")
-    mtsa.sparsify(transformer, config, forward_loop=forward_loop)
+    # ---- Sparsify each transformer ----
+    for name, transformer in transformers_to_sparsify:
+        num_blocks = _get_num_blocks(transformer)
+        print(f"Applying skip-softmax to {name} ({num_blocks} blocks)...")
+        config = build_sparse_config(args, num_blocks=num_blocks)
+        mtsa.sparsify(transformer, config, forward_loop=forward_loop)
 
     # ---- Generate ----
     print(f"Generating: {args.prompt[:80]}...")
@@ -261,7 +305,9 @@ def main() -> None:
     print(f"Saved to {args.output}")
 
     # ---- Print stats ----
-    print_sparsity_summary(transformer)
+    for name, transformer in transformers_to_sparsify:
+        print(f"\n{name}:")
+        print_sparsity_summary(transformer)
 
 
 if __name__ == "__main__":
