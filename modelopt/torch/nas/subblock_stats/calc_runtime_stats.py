@@ -1,7 +1,7 @@
 import argparse
 import json
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -20,7 +20,6 @@ from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import (
     FFNConfig,
     SubblockConfig,
 )
-from modelopt.torch.puzzletron.tools.logger import mprint
 
 
 def create_benchmark_model(
@@ -153,10 +152,14 @@ def calc_subblock_runtime(
     subblock_config: SubblockConfig,
 ) -> float:
 
+    block_config: BlockConfig | None = None
+
     if subblock_config is not None:
-        if not isinstance(subblock_config, AttentionConfig) and not isinstance(
-            subblock_config, FFNConfig
-        ):
+        if isinstance(subblock_config, BlockConfig):
+            block_config = subblock_config
+        elif isinstance(subblock_config, AttentionConfig) or isinstance(subblock_config, FFNConfig):
+            block_config = subblock_config.to_blockconfig()
+        else:
             raise Exception("Runtime stats: Not supported subblock type: {subblock_config}")
 
     model = create_benchmark_model(
@@ -165,7 +168,7 @@ def calc_subblock_runtime(
         runtime_config.num_attention_heads,
         runtime_config.prefill_seq_len,
         runtime_config.generation_seq_len,
-        block_config=subblock_config.to_blockconfig() if subblock_config is not None else None,
+        block_config=block_config,
         repeat_block_n_times=runtime_config.repeat_block_n_times,
     )
     with tempfile.TemporaryDirectory() as model_tmpdir:
@@ -179,6 +182,29 @@ def calc_subblock_runtime(
         subblock_total_runtime_ms = run_vllm_latency_benchmark(Path(model_tmpdir), runtime_config)
 
     return subblock_total_runtime_ms
+
+
+def calc_no_block_runtime(runtime_config: RuntimeConfig) -> float:
+
+    runtime_config1 = replace(runtime_config, repeat_block_n_times=0)
+    runtime_config10 = replace(runtime_config, repeat_block_n_times=9)
+
+    block_config = BlockConfig(
+        attention=AttentionConfig(
+            no_op=False, num_key_value_heads=runtime_config.num_attention_heads
+        ),
+        ffn=FFNConfig(
+            no_op=False, intermediate_size=runtime_config.hidden_size, moe=None
+        ),  # , hidden_act="silu"),
+        parallel_blocks=None,
+    )
+
+    runtime_ms1 = calc_subblock_runtime(runtime_config1, None)
+    runtime_ms10 = calc_subblock_runtime(runtime_config10, block_config)
+
+    no_block_runtime_ms = runtime_ms1 - (runtime_ms10 - runtime_ms1) / 9
+
+    return no_block_runtime_ms
 
 
 def calc_runtime_for_subblocks(
@@ -223,12 +249,9 @@ def calc_runtime_for_subblocks(
             subblock_total_runtime_ms = calc_subblock_runtime(runtime_config, subblock_config)
             baseline_runtime_ms = calc_subblock_runtime(runtime_config, None)
             total_runtime_ms = subblock_total_runtime_ms - baseline_runtime_ms
-            mprint(
-                f"|||| {subblock_config=} {subblock_total_runtime_ms=} {baseline_runtime_ms=} {total_runtime_ms=}"
-            )
 
         runtime_by_subblock_dict[subblock_config] = total_runtime_ms
 
-    no_block_runtime_ms = 0.0  # TODO: Implement this
+    no_block_runtime_ms = calc_no_block_runtime(runtime_config)
 
     return runtime_by_subblock_dict, no_block_runtime_ms
