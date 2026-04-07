@@ -50,6 +50,16 @@ from modelopt.torch.sparsity.attention_sparsity.sparse_attention import SparseAt
 
 DEFAULT_MODEL_PATH = os.environ.get("WAN22_MODEL_PATH", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
 
+# fmt: off
+# ruff: noqa: RUF001
+DEFAULT_NEGATIVE_PROMPT = (  # Official Wan 2.2 negative prompt (Chinese)
+    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
+    "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
+    "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
+    "杂乱的背景，三条腿，背景人很多，倒着走"
+)
+# fmt: on
+
 # Default threshold trials for calibration
 DEFAULT_THRESHOLD_TRIALS = [
     1e-6,
@@ -93,9 +103,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--width", type=int, default=832, help="Video width")
-    parser.add_argument("--num-steps", type=int, default=50, help="Number of inference steps")
+    parser.add_argument("--num-steps", type=int, default=40, help="Number of inference steps")
     parser.add_argument(
-        "--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale"
+        "--guidance-scale", type=float, default=4.0, help="Classifier-free guidance scale"
+    )
+    parser.add_argument(
+        "--guidance-scale-2",
+        type=float,
+        default=3.0,
+        help="Second guidance scale for 14B dual-transformer model (ignored by 5B)",
+    )
+    parser.add_argument(
+        "--negative-prompt",
+        type=str,
+        default=DEFAULT_NEGATIVE_PROMPT,
+        help="Negative prompt",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
@@ -207,6 +229,9 @@ def build_calibration_forward_loop(
     height: int = 480,
     width: int = 832,
     seed: int = 42,
+    guidance_scale: float = 4.0,
+    guidance_scale_2: float | None = 3.0,
+    negative_prompt: str = "",
 ):
     """Build a forward loop for exponential model calibration.
 
@@ -218,15 +243,19 @@ def build_calibration_forward_loop(
     def forward_loop(model):
         for i, prompt in enumerate(calib_prompts):
             print(f"Calibration [{i + 1}/{len(calib_prompts)}]: {prompt[:60]}...")
-            pipe(
-                prompt=prompt,
-                num_frames=num_frames,
-                height=height,
-                width=width,
-                num_inference_steps=num_steps,
-                guidance_scale=5.0,
-                generator=torch.Generator(device="cuda").manual_seed(seed),
-            )
+            kw: dict = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "num_frames": num_frames,
+                "height": height,
+                "width": width,
+                "num_inference_steps": num_steps,
+                "guidance_scale": guidance_scale,
+                "generator": torch.Generator(device="cuda").manual_seed(seed),
+            }
+            if guidance_scale_2 is not None:
+                kw["guidance_scale_2"] = guidance_scale_2
+            pipe(**kw)
 
     return forward_loop
 
@@ -284,6 +313,9 @@ def main() -> None:
             height=args.height,
             width=args.width,
             seed=args.seed,
+            guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
+            negative_prompt=args.negative_prompt,
         )
 
     # ---- Sparsify each transformer ----
@@ -296,15 +328,19 @@ def main() -> None:
     # ---- Generate (optional) ----
     if args.prompt:
         print(f"Generating: {args.prompt[:80]}...")
-        output = pipe(
-            prompt=args.prompt,
-            num_frames=args.num_frames,
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.num_steps,
-            guidance_scale=args.guidance_scale,
-            generator=torch.Generator(device="cuda").manual_seed(args.seed),
-        )
+        pipe_kwargs: dict = {
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+            "num_frames": args.num_frames,
+            "height": args.height,
+            "width": args.width,
+            "num_inference_steps": args.num_steps,
+            "guidance_scale": args.guidance_scale,
+            "generator": torch.Generator(device="cuda").manual_seed(args.seed),
+        }
+        if args.guidance_scale_2 is not None:
+            pipe_kwargs["guidance_scale_2"] = args.guidance_scale_2
+        output = pipe(**pipe_kwargs)
 
         export_to_video(output.frames[0], args.output, fps=16)
         print(f"Saved to {args.output}")
