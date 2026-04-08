@@ -1,0 +1,35 @@
+FROM vllm/vllm-openai:v0.15.1
+
+ENV PIP_NO_CACHE_DIR=off \
+    PIP_CONSTRAINT=
+
+WORKDIR /workspace
+
+# Install system dependencies needed for modelopt
+RUN apt-get update && apt-get install -y \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the entire Model-Optimizer source code
+COPY . Model-Optimizer
+
+# Remove .git directory to reduce image size
+RUN rm -rf Model-Optimizer/.git
+
+# Install modelopt from local source with all dependencies
+RUN cd Model-Optimizer && \
+    pip install -e ".[all,dev-test]"
+
+# Allow users to run without root
+RUN chmod -R 777 /workspace
+
+# Set WORKDIR to repo root so relative path in ENTRYPOINT works
+WORKDIR /workspace/Model-Optimizer
+
+# Set 1:4 sparse attention config as default (overridable at docker run time)
+ENV SPARSE_ATTN_CFG=SPARSE_SOFTMAX_14
+
+# Model path/name is passed as the first argument at docker run time
+# --attention-backend forces FlashAttention (ModelOptSparseAttentionImpl inherits from FlashAttentionImpl)
+ENTRYPOINT ["python3", "examples/vllm_serve/vllm_serve_sparse_attn.py"]

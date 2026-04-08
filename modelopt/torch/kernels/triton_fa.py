@@ -1267,4 +1267,142 @@ def attention(
     )
 
 
-__all__ = ["attention"]
+def attention_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    max_input_len: int,
+    is_causal: bool = True,
+    softmax_scale: float | None = None,
+    b_start_loc_k: torch.Tensor | None = None,
+    b_seq_len_k: torch.Tensor | None = None,
+    max_input_len_k: int | None = None,
+    *,
+    sparsity_n: int = 0,
+    sparsity_m: int = 4,
+    num_sink_tokens: int = 0,
+    dense_window_size: int = 64,
+    skip_softmax_threshold: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Variable-length flash attention returning both output and LSE.
+
+    Same interface as :func:`attention` but returns ``(output, lse)`` where
+    *lse* is the log-sum-exp in **natural-log** space with shape
+    ``[total_q_tokens, num_q_heads]``.  Intended for inference workloads that
+    need LSE for attention-state merging (e.g. MLA chunked prefill).
+
+    This function does **not** support paged KV cache or autograd — use the
+    contiguous Q/K/V path only.
+
+    Args:
+        q: [total_q_tokens, num_q_heads, head_dim]
+        k: [total_kv_tokens, num_kv_heads, head_dim]
+        v: [total_kv_tokens, num_kv_heads, head_dim]
+        b_start_loc: [batch] start offset of each Q sequence in the flat tensor.
+        b_seq_len: [batch] length of each Q sequence.
+        max_input_len: Maximum Q sequence length (for grid sizing).
+        is_causal: Whether to apply causal masking.
+        softmax_scale: Scale factor (default: 1/sqrt(head_dim)).
+        b_start_loc_k: [batch] start offset for K/V (None = same as Q).
+        b_seq_len_k: [batch] length for K/V (None = same as Q).
+        max_input_len_k: Maximum K/V sequence length (None = same as Q).
+        sparsity_n: N:M sparsity — keep top-N of every M attention scores.
+        sparsity_m: N:M sparsity — group size (4 or 8).
+        num_sink_tokens: KV positions before this index are kept dense.
+        dense_window_size: Tokens near the query diagonal kept dense.
+        skip_softmax_threshold: BLASST threshold lambda.
+
+    Returns:
+        (output, lse):
+            output: [total_q_tokens, num_q_heads, head_dim]
+            lse: [total_q_tokens, num_q_heads] in natural-log space
+    """
+    sm_scale = 1.0 / (q.shape[2] ** 0.5) if softmax_scale is None else softmax_scale
+
+    HEAD_DIM = q.shape[2]
+    num_q_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    kv_group_num = num_q_heads // num_kv_heads
+    batch = b_seq_len.shape[0]
+
+    if b_seq_len_k is None:
+        b_seq_len_k = b_seq_len
+        b_start_loc_k = b_start_loc
+
+    if b_start_loc_k is None:
+        b_start_loc_k = torch.zeros_like(b_start_loc)
+
+    qk_scale = sm_scale * LOG2E
+    BLOCK_D = triton.next_power_of_2(HEAD_DIM)
+
+    apply_skip = skip_softmax_threshold is not None and skip_softmax_threshold > 0.0
+    if apply_skip:
+        assert skip_softmax_threshold is not None
+        skip_threshold_log2 = math.log2(skip_softmax_threshold) * sm_scale
+    else:
+        skip_threshold_log2 = 0.0
+
+    o = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], num_q_heads, device=q.device, dtype=torch.float32)
+
+    def grid(META):
+        return (batch, num_q_heads, triton.cdiv(max_input_len, META["BLOCK_M"]))
+
+    _attn_fwd[grid](
+        q,
+        k,
+        v,
+        qk_scale,
+        b_start_loc,
+        b_seq_len,
+        b_start_loc_k,
+        b_seq_len_k,
+        o,
+        lse,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o.stride(0),
+        o.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        N_CTX=max_input_len,
+        kv_group_num=kv_group_num,
+        BLOCK_D=BLOCK_D,
+        IS_CAUSAL=is_causal,
+        HEAD_DIM=HEAD_DIM,
+        STORE_LSE=True,
+        SPARSITY_N=sparsity_n,
+        SPARSITY_M=sparsity_m,
+        NUM_SINK_TOKENS=num_sink_tokens,
+        DENSE_WINDOW_SIZE=dense_window_size,
+        APPLY_SKIP_SOFTMAX=apply_skip,
+        SKIP_THRESHOLD_LOG2=skip_threshold_log2,
+        IS_PAGED=False,
+        K_cache=None,
+        V_cache=None,
+        Block_table=None,
+        stride_kc_block=0,
+        stride_kc_pos=0,
+        stride_kc_head=0,
+        stride_vc_block=0,
+        stride_vc_pos=0,
+        stride_vc_head=0,
+        PAGE_SIZE=16,
+        max_blocks_per_seq=0,
+    )
+
+    # Convert LSE from log2 space to natural-log space.
+    # Kernel stores: row_max + log2(row_sum) where row_max is in log2-scaled space.
+    # Standard LSE = stored_lse * ln(2).
+    lse.mul_(math.log(2))
+
+    return o, lse
+
+
+__all__ = ["attention", "attention_with_lse"]

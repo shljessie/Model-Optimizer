@@ -21,6 +21,7 @@ from modelopt.torch.utils import import_plugin
 
 IS_AVAILABLE = False
 attention = None
+attention_with_lse = None
 register_triton_attention = None
 
 if torch.cuda.is_available():
@@ -32,8 +33,10 @@ if torch.cuda.is_available():
         ),
     ):
         from .triton_fa import attention as _attention
+        from .triton_fa import attention_with_lse as _attention_with_lse
 
         attention = _attention
+        attention_with_lse = _attention_with_lse
         IS_AVAILABLE = True
         with import_plugin("transformers"):
             from .hf_triton_attention import register_triton_attention as _register_triton_attention
@@ -43,5 +46,6 @@ if torch.cuda.is_available():
 __all__ = [
     "IS_AVAILABLE",
     "attention",
+    "attention_with_lse",
     "register_triton_attention",
 ]
