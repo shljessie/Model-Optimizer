@@ -108,6 +108,7 @@ def max_calibrate(
     model: nn.Module,
     forward_loop: ForwardLoop | None = None,
     distributed_sync=True,
+    sync_expert_weight_amax=False,
 ):
     """Calibrate the model using max.
 
@@ -116,6 +117,7 @@ def max_calibrate(
         forward_loop: A callable which takes the model as argument and
             forwards calibration data through the model.
         distributed_sync: Whether to sync input_quantizer amax across distributed processes.
+        sync_expert_weight_amax: Whether to sync weight quantizer amax across MoE experts.
 
     See :class:`MaxCalibConfig <modelopt.torch.quantization.config.MaxCalibConfig>` for
     details on the remaining arguments.
@@ -127,10 +129,10 @@ def max_calibrate(
         forward_loop(model)
     finish_stats_collection(model)
 
-    # Sync input_quantizer amax across local experts within each rank (for SequentialMLP)
+    # Sync quantizer amax across local experts within each rank (for SequentialMLP)
     for name, module in model.named_modules():
         if hasattr(module, "layer_sync_moe_local_experts_amax"):
-            module.layer_sync_moe_local_experts_amax()
+            module.layer_sync_moe_local_experts_amax(sync_weight_amax=sync_expert_weight_amax)
 
     if not distributed_sync:
         return
@@ -1100,7 +1102,9 @@ def awq_lite(
             self.awq_lite.num_cache_steps += 1
             self.awq_lite.num_tokens += input.numel() / input.shape[-1]
             if self.awq_lite.is_input_quantized:
-                with set_quantizer_by_cfg_context(self.input_quantizer, {"*": {"enable": True}}):
+                with set_quantizer_by_cfg_context(
+                    self.input_quantizer, [{"quantizer_name": "*", "enable": True}]
+                ):
                     max_calibrate(self.input_quantizer, lambda quantizer: quantizer(input), False)
             return out_actual
 
