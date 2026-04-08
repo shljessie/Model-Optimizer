@@ -15,8 +15,6 @@
 
 """Plugins for sparse attention integration with various frameworks."""
 
-from modelopt.torch.utils import import_plugin
-
 # List of model plugins that are called during conversion
 # Each plugin is a callable that takes (model) and performs validation/setup
 CUSTOM_MODEL_PLUGINS: list = []
@@ -27,9 +25,6 @@ def register_custom_model_plugins_on_the_fly(model):
     for callback in CUSTOM_MODEL_PLUGINS:
         callback(model)
 
-
-with import_plugin("diffusers"):
-    from . import diffusers
 
 from . import huggingface  # noqa: E402
 

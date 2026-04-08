@@ -20,7 +20,8 @@ that converts the diffusers [B, S, H, D] layout to the Triton FA kernel's varlen
 [total_tokens, H, D] format.
 
 Two modes:
-- **Inference**: Calls ``attention()`` with skip-softmax tile skipping.
+- **Inference**: Calls ``attention()`` with optional skip-softmax tile skipping,
+  N:M sparse softmax, and/or NVFP4 P-matrix quantization.
 - **Calibration**: Calls ``attention_calibrate()`` to collect multi-threshold
   sparsity statistics without skipping any tiles.
 """
@@ -49,8 +50,15 @@ def set_triton_skip_softmax_config(
     threshold: float | None = None,
     calibration_mode: bool = False,
     threshold_trials: list[float] | None = None,
+    sparsity_n: int = 0,
+    sparsity_m: int = 4,
+    num_sink_tokens: int = 0,
+    dense_window_size: int = 64,
 ) -> None:
-    """Set thread-local skip-softmax config for the next Triton attention call.
+    """Set thread-local sparse attention config for the next Triton attention call.
+
+    This controls skip-softmax tile skipping and N:M sparsity. It does NOT touch
+    ``quantize_p`` — that is managed independently by :func:`set_sage_attention_config`.
 
     Args:
         threshold: Skip-softmax threshold for inference mode.
@@ -58,20 +66,55 @@ def set_triton_skip_softmax_config(
             multi-threshold sparsity stats instead of skipping tiles.
         threshold_trials: List of thresholds to measure sparsity for
             (only used when calibration_mode=True).
+        sparsity_n: Keep top-N of every M attention scores (0 to disable N:M sparsity).
+        sparsity_m: Group size for N:M sparsity (4 or 8).
+        num_sink_tokens: KV positions before this index kept dense (attention sinks).
+        dense_window_size: Tokens near the diagonal kept dense (absolute token count).
     """
     _thread_local.skip_threshold = threshold
     _thread_local.calibration_mode = calibration_mode
     _thread_local.threshold_trials = threshold_trials
+    _thread_local.sparsity_n = sparsity_n
+    _thread_local.sparsity_m = sparsity_m
+    _thread_local.num_sink_tokens = num_sink_tokens
+    _thread_local.dense_window_size = dense_window_size
     # Accumulated counters across all attention calls in one forward pass
     _thread_local.calibration_counters = None
 
 
 def clear_triton_skip_softmax_config() -> None:
-    """Clear thread-local skip-softmax config."""
+    """Clear thread-local sparse attention config.
+
+    Only clears skip-softmax / N:M sparsity params. Does NOT reset ``quantize_p``
+    so that :func:`set_sage_attention_config` remains active across attention layers.
+    """
     _thread_local.skip_threshold = None
     _thread_local.calibration_mode = False
     _thread_local.threshold_trials = None
+    _thread_local.sparsity_n = 0
+    _thread_local.sparsity_m = 4
+    _thread_local.num_sink_tokens = 0
+    _thread_local.dense_window_size = 64
     _thread_local.calibration_counters = None
+
+
+def set_sage_attention_config(quantize_p: bool = True) -> None:
+    """Set NVFP4 P-matrix quantization flag for SageAttention.
+
+    Manages ``quantize_p`` independently of sparse-attention params so that
+    SageAttention can be applied standalone or combined with skip-softmax /
+    N:M sparsity without either feature clobbering the other.
+
+    Args:
+        quantize_p: If True, quantize the post-softmax P tile to NVFP4 E2M1
+            inside the Triton kernel (per-tile max scaling).
+    """
+    _thread_local.quantize_p = quantize_p
+
+
+def clear_sage_attention_config() -> None:
+    """Clear NVFP4 P-matrix quantization flag."""
+    _thread_local.quantize_p = False
 
 
 def get_calibration_counters() -> "torch.Tensor | None":
@@ -142,10 +185,25 @@ def _diffusers_triton_attention(
 
             return o.view(batch, seq_q, num_heads_q, head_dim)
 
-    # --- Inference mode: skip-softmax with single threshold ---
+    # --- Inference mode: optional skip-softmax, N:M sparsity, and/or NVFP4 quantize_p ---
     threshold = getattr(_thread_local, "skip_threshold", None)
     if threshold is not None and threshold > 0.0:
         kw["skip_softmax_threshold"] = threshold
+
+    sparsity_n = getattr(_thread_local, "sparsity_n", 0)
+    if sparsity_n > 0:
+        kw["sparsity_n"] = sparsity_n
+        kw["sparsity_m"] = getattr(_thread_local, "sparsity_m", 4)
+        num_sink_tokens = getattr(_thread_local, "num_sink_tokens", 0)
+        if num_sink_tokens > 0:
+            kw["num_sink_tokens"] = num_sink_tokens
+        dense_window_size = getattr(_thread_local, "dense_window_size", 64)
+        if dense_window_size > 0:
+            kw["dense_window_size"] = dense_window_size
+
+    quantize_p = getattr(_thread_local, "quantize_p", False)
+    if quantize_p:
+        kw["quantize_p"] = True
 
     assert attention is not None, "Triton attention kernel not available (requires CUDA + triton)"
     o = attention(q, k, v, **kw)

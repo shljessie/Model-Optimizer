@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the diffusers WAN sparse attention plugin.
+"""Unit tests for the diffusers WAN sparse attention via the modelopt_triton backend.
 
 Tests cover:
-- Plugin registration: WanAttention is registered with SparseAttentionRegistry
-- Processor replacement: ModelOptWanAttnProcessor is installed after sparsify()
-- Config validation: "diffusers_triton" backend is accepted
-- Forward shape: output shape matches input shape after sparsify()
-- Enable/disable: is_enabled flag propagates to the processor
-- Both methods: triton_sparse_softmax and triton_skip_softmax
+- Config validation: "triton" backend is accepted; "diffusers_triton" is rejected
+- quantize_p is NOT in SparseAttentionAttributeConfig (it moved to quantization.sage_attention)
+- triton_sparse_softmax and triton_skip_softmax do NOT have quantize_p attribute
+- diffusers_triton_attention: set_triton_skip_softmax_config does NOT touch quantize_p
+- diffusers_triton_attention: set_sage_attention_config / clear_sage_attention_config
+- clear_triton_skip_softmax_config does NOT reset quantize_p (composability)
 """
 
 import pytest
@@ -31,17 +31,11 @@ pytest.importorskip("diffusers")
 import torch
 import torch.nn as nn
 
-import modelopt.torch.sparsity.attention_sparsity as mtsa
-from modelopt.torch.sparsity.attention_sparsity.plugins.diffusers import (
-    ModelOptWanAttnProcessor,
-    WanSparseAttentionModule,
-    register_wan_sparse_attention,
-)
-from modelopt.torch.sparsity.attention_sparsity.sparse_attention import SparseAttentionModule
 
 # ---------------------------------------------------------------------------
-# Configs
+# Configs (no quantize_p — that's now a quantization feature)
 # ---------------------------------------------------------------------------
+
 
 _SPARSE_CFG = {
     "sparse_cfg": {
@@ -51,7 +45,7 @@ _SPARSE_CFG = {
             "sparsity_m": 4,
             "num_sink_tokens": 0,
             "dense_window_size": 0,
-            "backend": "diffusers_triton",
+            "backend": "triton",
             "enable": True,
         },
         "default": {"enable": False},
@@ -63,7 +57,7 @@ _SKIP_CFG = {
         "*": {
             "method": "triton_skip_softmax",
             "skip_softmax_threshold": 0.1,
-            "backend": "diffusers_triton",
+            "backend": "triton",
             "enable": True,
         },
         "default": {"enable": False},
@@ -72,63 +66,32 @@ _SKIP_CFG = {
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_wan_attention(dim=64, heads=4, dim_head=16):
-    """Create a small WanAttention module (CPU, float32)."""
-    from diffusers.models.transformers.transformer_wan import WanAttention
-
-    return WanAttention(dim=dim, heads=heads, dim_head=dim_head)
-
-
-def _make_wan_model(num_layers=2, dim=64, heads=4, dim_head=16):
-    """Tiny nn.Sequential wrapping several WanAttention modules."""
-    from diffusers.models.transformers.transformer_wan import WanAttention
-
-    class _WanModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layers = nn.ModuleList(
-                [WanAttention(dim=dim, heads=heads, dim_head=dim_head) for _ in range(num_layers)]
-            )
-
-        def forward(self, x):
-            for layer in self.layers:
-                x = layer(x)
-            return x
-
-    return _WanModel()
-
-
-def _rand_hidden(batch=1, seq=16, dim=64):
-    return torch.randn(batch, seq, dim)
-
-
-# ---------------------------------------------------------------------------
 # Tests: config validation
 # ---------------------------------------------------------------------------
 
 
-class TestDiffusersTritonBackend:
-    """Validate that the "diffusers_triton" backend is accepted by the config system."""
+class TestTritonBackend:
+    """Validate that the "triton" backend is accepted and "diffusers_triton" is rejected."""
 
     def test_backend_accepted_sparse(self):
         from modelopt.torch.sparsity.attention_sparsity.config import SparseAttentionAttributeConfig
 
-        cfg = SparseAttentionAttributeConfig(
-            backend="diffusers_triton", method="triton_sparse_softmax"
-        )
-        assert cfg.backend == "diffusers_triton"
+        cfg = SparseAttentionAttributeConfig(backend="triton", method="triton_sparse_softmax")
+        assert cfg.backend == "triton"
 
     def test_backend_accepted_skip(self):
         from modelopt.torch.sparsity.attention_sparsity.config import SparseAttentionAttributeConfig
 
-        cfg = SparseAttentionAttributeConfig(
-            backend="diffusers_triton", method="triton_skip_softmax"
-        )
-        assert cfg.backend == "diffusers_triton"
+        cfg = SparseAttentionAttributeConfig(backend="triton", method="triton_skip_softmax")
+        assert cfg.backend == "triton"
+
+    def test_diffusers_triton_backend_rejected(self):
+        from pydantic import ValidationError
+
+        from modelopt.torch.sparsity.attention_sparsity.config import SparseAttentionAttributeConfig
+
+        with pytest.raises(ValidationError):
+            SparseAttentionAttributeConfig(backend="diffusers_triton")
 
     def test_invalid_backend_still_rejected(self):
         from pydantic import ValidationError
@@ -138,162 +101,194 @@ class TestDiffusersTritonBackend:
         with pytest.raises(ValidationError):
             SparseAttentionAttributeConfig(backend="unknown_backend")
 
+    def test_quantize_p_not_in_sparse_config(self):
+        """quantize_p moved to quantization.sage_attention — should not appear in sparse config."""
+        from modelopt.torch.sparsity.attention_sparsity.config import SparseAttentionAttributeConfig
 
-# ---------------------------------------------------------------------------
-# Tests: plugin registration
-# ---------------------------------------------------------------------------
-
-
-class TestPluginRegistration:
-    """register_wan_sparse_attention() should register WanAttention with the registry."""
-
-    def test_register_on_model_with_wan_attention(self):
-        model = _make_wan_model()
-        result = register_wan_sparse_attention(model)
-        assert result is True
-
-    def test_register_returns_false_for_non_wan_model(self):
-        model = nn.Linear(64, 64)
-        result = register_wan_sparse_attention(model)
-        assert result is False
-
-    def test_register_is_idempotent(self):
-        """Calling register twice should not raise or double-register."""
-        model = _make_wan_model()
-        register_wan_sparse_attention(model)
-        register_wan_sparse_attention(model)  # second call — no error
+        cfg = SparseAttentionAttributeConfig(backend="triton", method="triton_sparse_softmax")
+        assert not hasattr(cfg, "quantize_p"), (
+            "quantize_p should NOT be a field on SparseAttentionAttributeConfig; "
+            "it belongs to modelopt.torch.quantization.sage_attention"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Tests: sparsify() replaces modules and processor
+# Tests: sparse methods do NOT have quantize_p
 # ---------------------------------------------------------------------------
 
 
-class TestSparsifyReplacement:
-    """After mtsa.sparsify(), WanAttention modules become WanSparseAttentionModule."""
+class TestMethodNoQuantizeP:
+    """triton_skip_softmax and triton_sparse_softmax must NOT expose quantize_p."""
 
-    def test_module_type_after_sparsify(self):
-        model = _make_wan_model(num_layers=2)
-        mtsa.sparsify(model, _SPARSE_CFG)
+    def test_skip_softmax_no_quantize_p(self):
+        from modelopt.torch.sparsity.attention_sparsity.methods.triton_skip_softmax import (
+            TritonSkipSoftmaxMethod,
+        )
 
-        sparse_modules = [m for m in model.modules() if isinstance(m, SparseAttentionModule)]
-        assert len(sparse_modules) == 2
-        for m in sparse_modules:
-            assert isinstance(m, WanSparseAttentionModule)
+        m = TritonSkipSoftmaxMethod(method_config={"skip_softmax_threshold": 0.05})
+        assert not hasattr(m, "quantize_p"), (
+            "TritonSkipSoftmaxMethod must not have a quantize_p attribute; "
+            "NVFP4 quantization is managed by modelopt.torch.quantization.sage_attention"
+        )
+        assert m.skip_softmax_threshold == pytest.approx(0.05)
 
-    def test_processor_type_after_sparsify(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SPARSE_CFG)
+    def test_sparse_softmax_no_quantize_p(self):
+        from modelopt.torch.sparsity.attention_sparsity.methods.triton_sparse_softmax import (
+            TritonSparseSoftmaxMethod,
+        )
 
-        sparse_modules = [m for m in model.modules() if isinstance(m, WanSparseAttentionModule)]
-        assert len(sparse_modules) == 1
-        proc = sparse_modules[0].processor
-        assert isinstance(proc, ModelOptWanAttnProcessor)
-
-    def test_processor_has_correct_sparse_kw_sparse(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SPARSE_CFG)
-
-        sparse_mod = next(m for m in model.modules() if isinstance(m, WanSparseAttentionModule))
-        kw = sparse_mod.processor.sparse_kw
-        assert kw["sparsity_n"] == 2
-        assert kw["sparsity_m"] == 4
-
-    def test_processor_has_correct_sparse_kw_skip(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SKIP_CFG)
-
-        sparse_mod = next(m for m in model.modules() if isinstance(m, WanSparseAttentionModule))
-        kw = sparse_mod.processor.sparse_kw
-        assert "skip_softmax_threshold" in kw
-        assert kw["skip_softmax_threshold"] == pytest.approx(0.1)
+        m = TritonSparseSoftmaxMethod(method_config={"sparsity_n": 2, "sparsity_m": 4})
+        assert not hasattr(m, "quantize_p"), (
+            "TritonSparseSoftmaxMethod must not have a quantize_p attribute; "
+            "NVFP4 quantization is managed by modelopt.torch.quantization.sage_attention"
+        )
+        assert m.sparsity_n == 2
 
 
 # ---------------------------------------------------------------------------
-# Tests: forward pass output shape (CPU, no Triton kernel — uses SDPA fallback)
+# Tests: diffusers_triton_attention thread-local config
 # ---------------------------------------------------------------------------
 
 
-class TestForwardShape:
-    """Forward pass through a sparsified model returns the correct output shape.
+class TestDiffusersTritonAttentionConfig:
+    """set/clear functions for sparse params and sage_attention params work correctly."""
 
-    The Triton kernel is not available on CPU, so ModelOptWanAttnProcessor falls
-    back to dispatch_attention_fn (standard SDPA) for these tests.  We force
-    this by setting _enabled=False on the processor, which exercises the SDPA
-    fallback path explicitly.
-    """
+    def test_set_and_get_threshold(self):
+        from modelopt.torch.sparsity.attention_sparsity.kernels.diffusers_triton_attention import (
+            _thread_local,
+            clear_triton_skip_softmax_config,
+            set_triton_skip_softmax_config,
+        )
 
-    def _run_with_sdpa_fallback(self, model, hidden):
-        """Disable sparse modules so the SDPA fallback is used (works on CPU)."""
-        for m in model.modules():
-            if isinstance(m, WanSparseAttentionModule):
-                m.disable()
-        return model(hidden)
+        set_triton_skip_softmax_config(threshold=0.05)
+        assert _thread_local.skip_threshold == pytest.approx(0.05)
+        clear_triton_skip_softmax_config()
 
-    def test_output_shape_self_attention(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SPARSE_CFG)
-        hidden = _rand_hidden(batch=2, seq=16, dim=64)
-        out = self._run_with_sdpa_fallback(model, hidden)
-        assert out.shape == hidden.shape
+    def test_set_triton_skip_softmax_config_no_quantize_p_param(self):
+        """set_triton_skip_softmax_config must NOT accept quantize_p."""
+        import inspect
 
-    def test_output_shape_multiple_layers(self):
-        model = _make_wan_model(num_layers=3)
-        mtsa.sparsify(model, _SPARSE_CFG)
-        hidden = _rand_hidden(batch=1, seq=32, dim=64)
-        out = self._run_with_sdpa_fallback(model, hidden)
-        assert out.shape == hidden.shape
+        from modelopt.torch.sparsity.attention_sparsity.kernels.diffusers_triton_attention import (
+            set_triton_skip_softmax_config,
+        )
 
-    def test_output_shape_skip_method(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SKIP_CFG)
-        hidden = _rand_hidden(batch=1, seq=16, dim=64)
-        out = self._run_with_sdpa_fallback(model, hidden)
-        assert out.shape == hidden.shape
+        sig = inspect.signature(set_triton_skip_softmax_config)
+        assert "quantize_p" not in sig.parameters, (
+            "set_triton_skip_softmax_config must not have a quantize_p parameter; "
+            "use set_sage_attention_config() instead"
+        )
+
+    def test_set_and_get_sparsity_params(self):
+        from modelopt.torch.sparsity.attention_sparsity.kernels.diffusers_triton_attention import (
+            _thread_local,
+            clear_triton_skip_softmax_config,
+            set_triton_skip_softmax_config,
+        )
+
+        set_triton_skip_softmax_config(
+            sparsity_n=2,
+            sparsity_m=4,
+            num_sink_tokens=16,
+            dense_window_size=128,
+        )
+        assert _thread_local.sparsity_n == 2
+        assert _thread_local.sparsity_m == 4
+        assert _thread_local.num_sink_tokens == 16
+        assert _thread_local.dense_window_size == 128
+        clear_triton_skip_softmax_config()
+        assert _thread_local.sparsity_n == 0
+        assert _thread_local.sparsity_m == 4
+        assert _thread_local.num_sink_tokens == 0
+        assert _thread_local.dense_window_size == 64
+
+    def test_clear_sparse_does_not_reset_quantize_p(self):
+        """clear_triton_skip_softmax_config must NOT reset quantize_p.
+
+        This is the key composability guarantee: SageAttention sets quantize_p=True
+        once for the whole transformer forward; each per-layer sparsity context
+        can clear its own sparse params without clobbering the outer quantize_p.
+        """
+        from modelopt.torch.sparsity.attention_sparsity.kernels.diffusers_triton_attention import (
+            _thread_local,
+            clear_sage_attention_config,
+            clear_triton_skip_softmax_config,
+            set_sage_attention_config,
+            set_triton_skip_softmax_config,
+        )
+
+        # SageAttention outer wrapper sets quantize_p=True
+        set_sage_attention_config(quantize_p=True)
+        assert _thread_local.quantize_p is True
+
+        # Sparsity per-layer context sets threshold then clears
+        set_triton_skip_softmax_config(threshold=0.1)
+        clear_triton_skip_softmax_config()
+
+        # quantize_p must survive the sparsity clear
+        assert _thread_local.quantize_p is True, (
+            "clear_triton_skip_softmax_config() must not reset quantize_p; "
+            "SageAttention controls quantize_p independently"
+        )
+
+        # SageAttention outer wrapper clears quantize_p
+        clear_sage_attention_config()
+        assert _thread_local.quantize_p is False
+
+    def test_set_sage_attention_config(self):
+        from modelopt.torch.sparsity.attention_sparsity.kernels.diffusers_triton_attention import (
+            _thread_local,
+            clear_sage_attention_config,
+            set_sage_attention_config,
+        )
+
+        set_sage_attention_config(quantize_p=True)
+        assert _thread_local.quantize_p is True
+        clear_sage_attention_config()
+        assert _thread_local.quantize_p is False
 
 
 # ---------------------------------------------------------------------------
-# Tests: enable / disable
+# Tests: apply_sage_attention API
 # ---------------------------------------------------------------------------
 
 
-class TestEnableDisable:
-    """is_enabled propagates into the processor._enabled flag on forward."""
+class TestApplySageAttention:
+    """apply_sage_attention wraps the transformer forward and marks the module."""
 
-    def test_enabled_by_default(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SPARSE_CFG)
-        sparse_mod = next(m for m in model.modules() if isinstance(m, WanSparseAttentionModule))
-        assert sparse_mod.is_enabled is True
+    def _make_dummy_transformer(self):
+        """A minimal nn.Module whose forward returns a tensor."""
 
-    def test_disable_sets_processor_flag(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SPARSE_CFG)
-        sparse_mod = next(m for m in model.modules() if isinstance(m, WanSparseAttentionModule))
+        class DummyTransformer(nn.Module):
+            def forward(self, x):
+                return x * 2
 
-        sparse_mod.disable()
+        return DummyTransformer()
 
-        # Run a forward to trigger the flag sync
-        hidden = _rand_hidden(batch=1, seq=8, dim=64)
-        import contextlib
+    def test_marks_transformer(self):
+        """apply_sage_attention sets _modelopt_sage_attention=True on the module."""
+        pytest.importorskip("triton")
 
-        with contextlib.suppress(Exception):
-            sparse_mod(hidden)  # may fail without Triton; we only care about the flag
+        from modelopt.torch.quantization import apply_sage_attention
 
-        assert sparse_mod.processor._enabled is False
+        model = self._make_dummy_transformer()
+        assert not hasattr(model, "_modelopt_sage_attention")
+        apply_sage_attention(model)
+        assert getattr(model, "_modelopt_sage_attention", False) is True
 
-    def test_enable_after_disable(self):
-        model = _make_wan_model(num_layers=1)
-        mtsa.sparsify(model, _SPARSE_CFG)
-        sparse_mod = next(m for m in model.modules() if isinstance(m, WanSparseAttentionModule))
+    def test_wraps_forward(self):
+        """apply_sage_attention replaces forward with a wrapper function."""
+        pytest.importorskip("triton")
 
-        sparse_mod.disable()
-        sparse_mod.enable()
+        from modelopt.torch.quantization import apply_sage_attention
 
-        hidden = _rand_hidden(batch=1, seq=8, dim=64)
-        import contextlib
+        model = self._make_dummy_transformer()
+        original = model.forward
+        apply_sage_attention(model)
+        assert model.forward is not original
 
-        with contextlib.suppress(Exception):
-            sparse_mod(hidden)
+    def test_import_from_mtq(self):
+        """apply_sage_attention is accessible via modelopt.torch.quantization."""
+        import modelopt.torch.quantization as mtq
 
-        assert sparse_mod.processor._enabled is True
+        assert hasattr(mtq, "apply_sage_attention")
+        assert callable(mtq.apply_sage_attention)

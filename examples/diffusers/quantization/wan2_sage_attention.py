@@ -36,25 +36,22 @@ Attention kernel variants supported via ``--kernel``:
 
 ``triton-sparse`` (requires triton + modelopt)
     ModelOpt Triton flash-attention kernel with N:M sparse softmax (2:4 by default).
-    Applied via ``mtsa.sparsify()`` to the WAN transformer using the ``diffusers_triton``
-    backend. For every 4 K positions, keeps top-2 attention scores; the other 2 are
-    set to -inf before softmax. Uses WanSparseAttentionModule from modelopt.
+    Applied via ``mtsa.sparsify()`` to the WAN transformer using the ``triton``
+    backend with the modelopt_triton diffusers attention backend. For every 4 K
+    positions, keeps top-2 attention scores; the other 2 are set to -inf before
+    softmax.
 
 ``triton-skip`` (requires triton + modelopt)
     ModelOpt Triton flash-attention kernel with skip-softmax tile pruning.
     Tiles whose attention mass is below a threshold (default 0.1) are skipped entirely.
-    Applied via ``mtsa.sparsify()`` using the ``diffusers_triton`` backend.
+    Applied via ``mtsa.sparsify()`` using the ``triton`` backend with the modelopt_triton
+    diffusers attention backend.
 
-``triton-sparse-nvfp4`` (requires triton + modelopt)
-    ModelOpt Triton flash-attention with N:M sparse softmax (2:4) AND NVFP4 E2M1
-    P-matrix quantization in a single fused Triton kernel pass.  Per-tile scaling
-    (one scale per BLOCK_M×BLOCK_N tile) — finer granularity than a Python
-    post-softmax approach.  Combines sparsity and quantization in one pass.
-
-``triton-skip-nvfp4`` (requires triton + modelopt)
-    ModelOpt Triton flash-attention with skip-softmax tile pruning AND NVFP4 E2M1
-    P-matrix quantization in a single fused Triton kernel pass.  Skipped tiles
-    contribute nothing and are never quantized.
+NVFP4 P-matrix quantization (``--quantize-p``) is a **SageAttention** feature —
+an independent quantization pass applied via
+``modelopt.torch.quantization.apply_sage_attention()``.  It quantizes the
+post-softmax P tile to NVFP4 E2M1 inside the Triton kernel (per-tile max scaling).
+``--quantize-p`` can be combined with any Triton sparse kernel or used standalone.
 
 Requirements::
 
@@ -84,10 +81,10 @@ Usage::
     python wan2_sage_attention.py --prompt "..." --kernel triton-skip
 
     # ModelOpt Triton sparse + NVFP4 P-matrix quantization
-    python wan2_sage_attention.py --prompt "..." --kernel triton-sparse-nvfp4
+    python wan2_sage_attention.py --prompt "..." --kernel triton-sparse --quantize-p
 
     # ModelOpt Triton skip-softmax + NVFP4 P-matrix quantization
-    python wan2_sage_attention.py --prompt "..." --kernel triton-skip-nvfp4
+    python wan2_sage_attention.py --prompt "..." --kernel triton-skip --quantize-p
 
     # Smaller 5B model (fits on a single 24 GB GPU)
     python wan2_sage_attention.py \\
@@ -118,8 +115,6 @@ KERNEL_SAGE2_FP16 = "sage2-fp16"
 KERNEL_SAGE2_FP8 = "sage2-fp8"
 KERNEL_TRITON_SPARSE = "triton-sparse"
 KERNEL_TRITON_SKIP = "triton-skip"
-KERNEL_TRITON_SPARSE_NVFP4 = "triton-sparse-nvfp4"
-KERNEL_TRITON_SKIP_NVFP4 = "triton-skip-nvfp4"
 KERNEL_CHOICES = [
     KERNEL_FP8,
     KERNEL_SAGE1,
@@ -127,16 +122,12 @@ KERNEL_CHOICES = [
     KERNEL_SAGE2_FP8,
     KERNEL_TRITON_SPARSE,
     KERNEL_TRITON_SKIP,
-    KERNEL_TRITON_SPARSE_NVFP4,
-    KERNEL_TRITON_SKIP_NVFP4,
 ]
 
 # Kernels that modify pipe.transformer in-place via ModelOpt APIs (not SDPA patching).
 _TRITON_MODELOPT_KERNELS = {
     KERNEL_TRITON_SPARSE,
     KERNEL_TRITON_SKIP,
-    KERNEL_TRITON_SPARSE_NVFP4,
-    KERNEL_TRITON_SKIP_NVFP4,
 }
 
 _KERNEL_DESCRIPTIONS = {
@@ -146,8 +137,6 @@ _KERNEL_DESCRIPTIONS = {
     KERNEL_SAGE2_FP8: "sageattn_qk_int8_pv_fp8_cuda (SA2++, INT8 QK + FP8 PV, fp32+fp16 accum)",
     KERNEL_TRITON_SPARSE: "ModelOpt Triton flash-attn + N:M sparse softmax (2:4) via mtsa.sparsify()",
     KERNEL_TRITON_SKIP: "ModelOpt Triton flash-attn + skip-softmax tile pruning via mtsa.sparsify()",
-    KERNEL_TRITON_SPARSE_NVFP4: "ModelOpt Triton flash-attn + 2:4 sparse softmax + NVFP4 P-matrix quantization",
-    KERNEL_TRITON_SKIP_NVFP4: "ModelOpt Triton flash-attn + skip-softmax tile pruning + NVFP4 P-matrix quantization",
 }
 
 # SageAttention CUDA kernel support by GPU compute capability:
@@ -222,8 +211,6 @@ def _detect_available_kernels() -> list[str]:
 
         available.append(KERNEL_TRITON_SPARSE)
         available.append(KERNEL_TRITON_SKIP)
-        available.append(KERNEL_TRITON_SPARSE_NVFP4)
-        available.append(KERNEL_TRITON_SKIP_NVFP4)
     except ImportError:
         pass
 
@@ -443,7 +430,7 @@ _TRITON_SPARSE_CONFIG = {
             "sparsity_m": 4,
             "num_sink_tokens": 0,
             "dense_window_size": 0,
-            "backend": "diffusers_triton",
+            "backend": "triton",
             "enable": True,
         },
         "default": {"enable": False},
@@ -457,36 +444,7 @@ _TRITON_SKIP_CONFIG = {
         "*": {
             "method": "triton_skip_softmax",
             "skip_softmax_threshold": _TRITON_SKIP_DEFAULT_THRESHOLD,
-            "backend": "diffusers_triton",
-            "enable": True,
-        },
-        "default": {"enable": False},
-    }
-}
-
-_TRITON_SPARSE_NVFP4_CONFIG = {
-    "sparse_cfg": {
-        "*": {
-            "method": "triton_sparse_softmax",
-            "sparsity_n": 2,
-            "sparsity_m": 4,
-            "num_sink_tokens": 0,
-            "dense_window_size": 0,
-            "backend": "diffusers_triton",
-            "quantize_p": True,
-            "enable": True,
-        },
-        "default": {"enable": False},
-    }
-}
-
-_TRITON_SKIP_NVFP4_CONFIG = {
-    "sparse_cfg": {
-        "*": {
-            "method": "triton_skip_softmax",
-            "skip_softmax_threshold": _TRITON_SKIP_DEFAULT_THRESHOLD,
-            "backend": "diffusers_triton",
-            "quantize_p": True,
+            "backend": "triton",
             "enable": True,
         },
         "default": {"enable": False},
@@ -496,8 +454,6 @@ _TRITON_SKIP_NVFP4_CONFIG = {
 _TRITON_KERNEL_CONFIGS = {
     KERNEL_TRITON_SPARSE: _TRITON_SPARSE_CONFIG,
     KERNEL_TRITON_SKIP: _TRITON_SKIP_CONFIG,
-    KERNEL_TRITON_SPARSE_NVFP4: _TRITON_SPARSE_NVFP4_CONFIG,
-    KERNEL_TRITON_SKIP_NVFP4: _TRITON_SKIP_NVFP4_CONFIG,
 }
 
 
@@ -508,12 +464,12 @@ def apply_triton_sparse_kernel(
 ) -> None:
     """Apply a ModelOpt Triton sparse attention kernel to the WAN transformer.
 
-    Calls ``mtsa.sparsify()`` with ``backend="diffusers_triton"``, which installs
-    a ``ModelOptWanAttnProcessor`` on every ``WanAttention`` module.  The NVFP4
-    variants additionally pass ``quantize_p=True`` to the Triton kernel, enabling
-    per-tile NVFP4 E2M1 P-matrix quantization in a single fused pass.
+    Calls ``mtsa.sparsify()`` with the ``triton`` backend, which activates the
+    modelopt_triton diffusers attention backend for every attention forward pass.
 
-    This modifies the model in-place.
+    This modifies the model in-place.  To additionally apply NVFP4 P-matrix
+    quantization (SageAttention), call ``apply_sage_attention(transformer)``
+    **after** this function.
 
     Args:
         transformer: The ``pipe.transformer`` WAN model.
@@ -527,13 +483,13 @@ def apply_triton_sparse_kernel(
     import modelopt.torch.sparsity.attention_sparsity as mtsa
 
     config = copy.deepcopy(_TRITON_KERNEL_CONFIGS[kernel])
-    if skip_threshold is not None and kernel in (KERNEL_TRITON_SKIP, KERNEL_TRITON_SKIP_NVFP4):
+    if skip_threshold is not None and kernel == KERNEL_TRITON_SKIP:
         config["sparse_cfg"]["*"]["skip_softmax_threshold"] = skip_threshold
 
     mtsa.sparsify(transformer, config)
     thr = config["sparse_cfg"].get("*", {}).get("skip_softmax_threshold", "n/a")
     print(f"[Attention] Applied {kernel}: {_KERNEL_DESCRIPTIONS[kernel]}")
-    if kernel in (KERNEL_TRITON_SKIP, KERNEL_TRITON_SKIP_NVFP4):
+    if kernel == KERNEL_TRITON_SKIP:
         print(f"[Attention]   skip_softmax_threshold={thr}")
 
 
@@ -763,9 +719,19 @@ def parse_args() -> argparse.Namespace:
             "sage2-fp16: SA2 INT8+FP16; "
             "sage2-fp8: SA2++ INT8+FP8; "
             "triton-sparse: ModelOpt Triton 2:4 N:M sparse softmax (requires triton + modelopt); "
-            "triton-skip: ModelOpt Triton skip-softmax tile pruning (requires triton + modelopt); "
-            "triton-sparse-nvfp4: triton-sparse + NVFP4 P-matrix quantization in one Triton pass; "
-            "triton-skip-nvfp4: triton-skip + NVFP4 P-matrix quantization in one Triton pass"
+            "triton-skip: ModelOpt Triton skip-softmax tile pruning (requires triton + modelopt)"
+        ),
+    )
+    parser.add_argument(
+        "--quantize-p",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply SageAttention NVFP4 E2M1 P-matrix quantization via "
+            "modelopt.torch.quantization.apply_sage_attention(). "
+            "Quantizes the post-softmax P tile inside the Triton kernel (per-tile max scaling). "
+            "Can be used standalone or combined with any Triton sparse kernel: "
+            "--kernel triton-sparse --quantize-p"
         ),
     )
     parser.add_argument(
@@ -792,7 +758,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="LAMBDA",
         help=(
-            "Override skip_softmax_threshold for triton-skip / triton-skip-nvfp4 kernels. "
+            "Override skip_softmax_threshold for the triton-skip kernel. "
             f"Default: {_TRITON_SKIP_DEFAULT_THRESHOLD}. "
             "A tile is skipped when exp(tile_max - running_max) < LAMBDA "
             "(equivalently: tile_max < running_max + log(LAMBDA)). "
@@ -822,7 +788,15 @@ def main() -> None:
 
         # --- Quantized ---
         if args.kernel in _TRITON_MODELOPT_KERNELS:
-            apply_triton_sparse_kernel(pipe.transformer, args.kernel, skip_threshold=args.skip_threshold)
+            apply_triton_sparse_kernel(
+                pipe.transformer,
+                args.kernel,
+                skip_threshold=args.skip_threshold,
+            )
+            if args.quantize_p:
+                from modelopt.torch.quantization import apply_sage_attention
+
+                apply_sage_attention(pipe.transformer)
         else:
             enable_attention_kernel(args.kernel)
         _, frames_quant = run_inference(pipe, args, label=args.kernel)
@@ -896,14 +870,29 @@ def main() -> None:
         run_inference(pipe, args, label="baseline")
 
     elif args.kernel in _TRITON_MODELOPT_KERNELS:
-        apply_triton_sparse_kernel(pipe.transformer, args.kernel, skip_threshold=args.skip_threshold)
+        apply_triton_sparse_kernel(
+            pipe.transformer,
+            args.kernel,
+            skip_threshold=args.skip_threshold,
+        )
+        if args.quantize_p:
+            from modelopt.torch.quantization import apply_sage_attention
+
+            apply_sage_attention(pipe.transformer)
         run_inference(pipe, args, label=args.kernel)
 
     else:
-        enable_attention_kernel(args.kernel)
-        run_inference(pipe, args, label=args.kernel)
-        print_kernel_stats()
-        disable_attention_kernel()
+        if args.quantize_p:
+            # Standalone SageAttention (NVFP4 P-matrix) without sparse attention
+            from modelopt.torch.quantization import apply_sage_attention
+
+            apply_sage_attention(pipe.transformer)
+            run_inference(pipe, args, label="sage_attention")
+        else:
+            enable_attention_kernel(args.kernel)
+            run_inference(pipe, args, label=args.kernel)
+            print_kernel_stats()
+            disable_attention_kernel()
 
 
 if __name__ == "__main__":
