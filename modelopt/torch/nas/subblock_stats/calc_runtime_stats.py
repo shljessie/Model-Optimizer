@@ -22,6 +22,14 @@ from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import (
 )
 
 
+def _make_standard_block_config(hidden_size: int, num_attention_heads: int) -> BlockConfig:
+    return BlockConfig(
+        attention=AttentionConfig(no_op=False, num_key_value_heads=num_attention_heads),
+        ffn=FFNConfig(no_op=False, intermediate_size=hidden_size, moe=None),
+        parallel_blocks=None,
+    )
+
+
 def create_benchmark_model(
     vocab_size: int,
     hidden_size: int,
@@ -32,15 +40,7 @@ def create_benchmark_model(
     repeat_block_n_times: int = 10,
 ) -> LlamaForCausalLM:
 
-    block_configs = [
-        BlockConfig(
-            attention=AttentionConfig(no_op=False, num_key_value_heads=num_attention_heads),
-            ffn=FFNConfig(
-                no_op=False, intermediate_size=hidden_size, moe=None
-            ),  # , hidden_act="silu"),
-            parallel_blocks=None,
-        )
-    ]
+    block_configs = [_make_standard_block_config(hidden_size, num_attention_heads)]
 
     if block_config:
         block_configs.extend([block_config] * repeat_block_n_times)
@@ -157,10 +157,10 @@ def calc_subblock_runtime(
     if subblock_config is not None:
         if isinstance(subblock_config, BlockConfig):
             block_config = subblock_config
-        elif isinstance(subblock_config, AttentionConfig) or isinstance(subblock_config, FFNConfig):
+        elif isinstance(subblock_config, (AttentionConfig, FFNConfig)):
             block_config = subblock_config.to_blockconfig()
         else:
-            raise Exception("Runtime stats: Not supported subblock type: {subblock_config}")
+            raise Exception(f"Runtime stats: Not supported subblock type: {subblock_config}")
 
     model = create_benchmark_model(
         runtime_config.vocab_size,
@@ -189,14 +189,8 @@ def calc_no_block_runtime(runtime_config: RuntimeConfig) -> float:
     runtime_config1 = replace(runtime_config, repeat_block_n_times=0)
     runtime_config10 = replace(runtime_config, repeat_block_n_times=9)
 
-    block_config = BlockConfig(
-        attention=AttentionConfig(
-            no_op=False, num_key_value_heads=runtime_config.num_attention_heads
-        ),
-        ffn=FFNConfig(
-            no_op=False, intermediate_size=runtime_config.hidden_size, moe=None
-        ),  # , hidden_act="silu"),
-        parallel_blocks=None,
+    block_config = _make_standard_block_config(
+        runtime_config.hidden_size, runtime_config.num_attention_heads
     )
 
     runtime_ms1 = calc_subblock_runtime(runtime_config1, None)
@@ -236,6 +230,8 @@ def calc_runtime_for_subblocks(
 
     runtime_by_subblock_dict = {}
 
+    baseline_runtime_ms = calc_subblock_runtime(runtime_config, None)
+
     for subblock_config in tqdm(
         sorted(subblock_config_set),
         desc=(
@@ -247,7 +243,6 @@ def calc_runtime_for_subblocks(
             total_runtime_ms = 0.0
         else:
             subblock_total_runtime_ms = calc_subblock_runtime(runtime_config, subblock_config)
-            baseline_runtime_ms = calc_subblock_runtime(runtime_config, None)
             total_runtime_ms = subblock_total_runtime_ms - baseline_runtime_ms
 
         runtime_by_subblock_dict[subblock_config] = total_runtime_ms
