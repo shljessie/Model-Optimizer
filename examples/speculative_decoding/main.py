@@ -221,17 +221,31 @@ def train():
     use_offline_training = data_args.offline_data_path is not None
 
     if checkpoint:
-        # Load model from output_dir (top-level save) rather than checkpoint subdir
-        # to avoid meta tensor errors. The checkpoint path is passed to
-        # trainer.train(resume_from_checkpoint=...) for optimizer/step resume.
+        # Prefer top-level output_dir, fall back to checkpoint subdir
         model_load_path = training_args.output_dir
+        if not os.path.isfile(os.path.join(model_load_path, "model.safetensors")):
+            model_load_path = checkpoint
+            print_rank_0(
+                f"No model.safetensors in {training_args.output_dir}, "
+                f"loading from checkpoint: {model_load_path}"
+            )
+        # Use patch (same as original training) but WITHOUT device_map="cpu"
+        # to preserve parameter layout for optimizer state resume.
         with patch_transformers5_params_loading():
             model = load_vlm_or_llm(
                 model_load_path,
                 torch_dtype="auto",
-                device_map="cpu",
                 trust_remote_code=model_args.trust_remote_code,
             )
+        # Re-create rotary embeddings whose inv_freq buffers are still on meta
+        # device (not saved in checkpoints). Must happen before Trainer.to(device).
+        for mod in model.modules():
+            if hasattr(mod, "rotary_emb"):
+                rotary = mod.rotary_emb
+                if any(b.is_meta for b in rotary.buffers()):
+                    cfg = getattr(rotary, "config", None)
+                    if cfg is not None:
+                        mod.rotary_emb = type(rotary)(config=cfg, device="cpu")
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_load_path, trust_remote_code=model_args.trust_remote_code
         )
@@ -327,7 +341,34 @@ def train():
     )
 
     print_rank_0("Start training...")
-    trainer.train(resume_from_checkpoint=checkpoint)
+    if checkpoint and not os.path.isfile(
+        os.path.join(training_args.output_dir, "model.safetensors")
+    ):
+        # Resume from checkpoint subdir: try full resume first, fall back to
+        # partial resume (model weights + trainer state, fresh optimizer) if
+        # the optimizer state doesn't match.
+        try:
+            trainer.train(resume_from_checkpoint=checkpoint)
+        except ValueError as e:
+            if "parameter group" in str(e):
+                print_rank_0(
+                    f"Optimizer state mismatch: {e}\n"
+                    f"Resuming with fresh optimizer from {checkpoint}"
+                )
+                state_file = os.path.join(checkpoint, "trainer_state.json")
+                if os.path.isfile(state_file):
+                    state = json.load(open(state_file))
+                    resumed_step = state.get("global_step", 0)
+                    resumed_max_steps = state.get("max_steps", -1)
+                    print_rank_0(f"Resuming from step {resumed_step}/{resumed_max_steps}")
+                    if resumed_max_steps > 0:
+                        training_args.max_steps = resumed_max_steps
+                    trainer.state = trainer.state.load_from_json(state_file)
+                trainer.train()
+            else:
+                raise
+    else:
+        trainer.train(resume_from_checkpoint=checkpoint)
     trainer.save_state()
     trainer.save_model(training_args.output_dir)
 

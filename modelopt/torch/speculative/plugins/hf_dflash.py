@@ -265,6 +265,7 @@ class DFlashModule(nn.Module):
         )
         self.norm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = _ROTARY_CLS(config=config)
+        self._rotary_config = config  # Stored for re-creating rotary_emb on resume
 
         # Initialize weights matching HF PreTrainedModel (normal_ with initializer_range)
         # SpecForge's DFlashDraftModel uses Qwen3PreTrainedModel.post_init() which does this.
@@ -283,6 +284,9 @@ class DFlashModule(nn.Module):
         """Forward matching SpecForge DFlashDraftModel.forward."""
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
+        # Re-create rotary_emb on correct device if buffers are on meta (checkpoint resume)
+        if any(b.is_meta for b in self.rotary_emb.buffers()):
+            self.rotary_emb = _ROTARY_CLS(config=self._rotary_config, device=hidden_states.device)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for layer in self.layers:
