@@ -47,8 +47,15 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
         super().__init__()
         method_config = method_config or {}
         self.skip_softmax_threshold = method_config.get("skip_softmax_threshold", 0.1)
+        self.skip_softmax_raw_threshold: float | None = method_config.get(
+            "skip_softmax_raw_threshold", None
+        )
         # Calibration state
         self._threshold_trials: list[float] | None = None
+        # Runtime sparsity measurement
+        self._measure_sparsity: bool = False
+        self._sparsity_total: int = 0
+        self._sparsity_skipped: int = 0
 
     @property
     def name(self) -> str:
@@ -83,18 +90,28 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
         """Inference: activate skip-softmax with calibrated or fixed threshold."""
         module._apply_skip_softmax = True
 
-        # When calibrated, pass scale_factor so backends compute
-        # threshold = scale_factor / seq_k at call time (adapts to actual seqlen).
-        # Otherwise fall back to the static threshold.
-        scale_factor = self._get_scale_factor()
-        if scale_factor is not None:
-            self._set_triton_backends(scale_factor=scale_factor)
+        backend_kwargs: dict = {}
+        if self._measure_sparsity:
+            backend_kwargs["measure_sparsity"] = True
+
+        # Priority: raw_threshold > scale_factor (calibrated) > static threshold
+        if self.skip_softmax_raw_threshold is not None:
+            self._set_triton_backends(
+                raw_threshold=self.skip_softmax_raw_threshold, **backend_kwargs
+            )
         else:
-            self._set_triton_backends(threshold=self.skip_softmax_threshold)
+            scale_factor = self._get_scale_factor()
+            if scale_factor is not None:
+                self._set_triton_backends(scale_factor=scale_factor, **backend_kwargs)
+            else:
+                self._set_triton_backends(threshold=self.skip_softmax_threshold, **backend_kwargs)
         with self._get_diffusers_backend_context():
             try:
                 yield
             finally:
+                # Collect accumulated runtime sparsity counters before clearing
+                if self._measure_sparsity:
+                    self._collect_sparsity_counters()
                 module._apply_skip_softmax = False
                 self._clear_triton_backends()
 
@@ -233,3 +250,31 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
             "type": "static",
             "value": self.skip_softmax_threshold,
         }
+
+    # ------------------------------------------------------------------
+    # Runtime sparsity measurement
+    # ------------------------------------------------------------------
+
+    def enable_measure_sparsity(self, enabled: bool = True) -> None:
+        """Enable or disable runtime sparsity measurement."""
+        self._measure_sparsity = enabled
+
+    def reset_sparsity_counters(self) -> None:
+        """Reset accumulated sparsity counters to zero."""
+        self._sparsity_total = 0
+        self._sparsity_skipped = 0
+
+    def get_sparsity_counters(self) -> tuple[int, int]:
+        """Return accumulated ``(total_tiles, skipped_tiles)``."""
+        return self._sparsity_total, self._sparsity_skipped
+
+    def _collect_sparsity_counters(self) -> None:
+        """Read runtime sparsity counters from the backend and accumulate."""
+        try:
+            from ..kernels.diffusers_triton_attention import get_sparsity_counters
+
+            total, skipped = get_sparsity_counters()
+            self._sparsity_total += total
+            self._sparsity_skipped += skipped
+        except ImportError:
+            pass

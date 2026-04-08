@@ -16,8 +16,15 @@
 """Wan 2.2 inference with skip-softmax sparse attention.
 
 This example applies skip-softmax sparse attention to the Wan 2.2 video
-generation model (text-to-video) using exponential model calibration
-(``scale_factor = a * exp(b * target_sparsity)``).
+generation model (text-to-video). Three modes are supported:
+
+1. **Baseline** — pass ``--baseline`` for dense inference (default diffusers backend).
+2. **Triton baseline** — pass ``--triton-baseline`` for dense Triton FA kernel
+   (no skip-softmax, same kernel as sparse runs for apples-to-apples comparison).
+3. **Fixed raw threshold** — pass ``--raw-threshold`` to supply a log2-space
+   threshold directly to the Triton kernel. No calibration data is needed.
+4. **Calibrated threshold** — pass ``--calibrate`` to run exponential-model
+   calibration (``scale_factor = a * exp(b * target_sparsity)``).
 
 During calibration, ``triton_skip_softmax`` with the Triton calibration kernel
 collects sparsity statistics across multiple threshold trials. The fitted
@@ -29,13 +36,17 @@ and cross-attention (attn2). Only self-attention is sparsified.
 
 Usage::
 
-    # With calibration (recommended)
-    python wan22_skip_softmax.py --prompt "A cat playing piano" --output out.mp4 \\
-        --calibrate --target-sparsity 0.25
+    # Baseline (dense, no sparsity)
+    python wan22_skip_softmax.py --baseline --prompt "A cat playing piano" \\
+        --output baseline.mp4
 
-    # Custom model path
-    python wan22_skip_softmax.py --model-path /path/to/Wan2.2-T2V-5B \\
-        --prompt "A sunset over mountains" --output sunset.mp4 --calibrate
+    # Fixed raw threshold (no calibration needed)
+    python wan22_skip_softmax.py --raw-threshold -5.0 --report-avg-sparsity \\
+        --prompt "A cat playing piano" --output out.mp4
+
+    # With calibration
+    python wan22_skip_softmax.py --calibrate --target-sparsity 0.25 \\
+        --report-avg-sparsity --prompt "A cat playing piano" --output out.mp4
 """
 
 import argparse
@@ -123,10 +134,34 @@ def parse_args() -> argparse.Namespace:
 
     # Sparse attention options
     parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Run dense inference with default diffusers backend (no sparsity)",
+    )
+    parser.add_argument(
+        "--triton-baseline",
+        action="store_true",
+        help="Run dense inference with Triton FA kernel (no skip-softmax, "
+        "apples-to-apples comparison with sparse runs)",
+    )
+    parser.add_argument(
+        "--raw-threshold",
+        type=float,
+        default=None,
+        help="Raw skip_threshold_log2 value passed directly to the Triton kernel. "
+        "Negative values (e.g., -5.0 means tile must be within 5 units of running max). "
+        "Bypasses calibration and lambda conversion. Typical range: -1 to -30.",
+    )
+    parser.add_argument(
         "--skip-first-last",
         type=int,
         default=2,
         help="Number of first/last transformer layers to keep dense (default: 2)",
+    )
+    parser.add_argument(
+        "--report-avg-sparsity",
+        action="store_true",
+        help="Report per-layer and overall average tile sparsity after generation",
     )
 
     # Calibration options
@@ -173,19 +208,25 @@ def build_pipeline(model_path: str) -> WanPipeline:
 def build_sparse_config(args: argparse.Namespace, num_blocks: int) -> dict:
     """Build sparse attention config from CLI args.
 
-    Uses triton_skip_softmax with the Triton FA kernel for both calibration
-    and inference. Calibration collects multi-threshold sparsity statistics
-    via the Triton calibration kernel, then fits an exponential model:
-    scale_factor = a * exp(b * sparsity).
+    Two modes:
+    - **Raw threshold**: ``--raw-threshold`` sets ``skip_softmax_raw_threshold``
+      directly on the Triton kernel — no calibration needed.
+    - **Calibrated**: ``--calibrate`` collects multi-threshold sparsity statistics
+      via the Triton calibration kernel, then fits an exponential model:
+      ``scale_factor = a * exp(b * sparsity)``.
     """
     attn_cfg: dict = {
         "method": "triton_skip_softmax",
-        "skip_softmax_threshold": 0.1,
+        "skip_softmax_threshold": 0.0 if args.triton_baseline else 0.1,
         "backend": "triton",
         "is_causal": False,  # Diffusion = bidirectional attention
         "collect_stats": True,
         "enable": True,
     }
+
+    # Raw threshold bypasses calibration and lambda conversion
+    if args.raw_threshold is not None:
+        attn_cfg["skip_softmax_raw_threshold"] = args.raw_threshold
 
     sparse_cfg: dict = {
         "*.attn1*": attn_cfg,  # Self-attention only
@@ -200,8 +241,8 @@ def build_sparse_config(args: argparse.Namespace, num_blocks: int) -> dict:
 
     config: dict = {"sparse_cfg": sparse_cfg}
 
-    # Add calibration config with threshold trials
-    if args.calibrate:
+    # Add calibration config only when calibrating (not with raw threshold)
+    if args.calibrate and args.raw_threshold is None:
         sparse_cfg["calibration"] = {
             "target_sparse_ratio": {"prefill": args.target_sparsity},
             "samples": 1,
@@ -260,8 +301,18 @@ def build_calibration_forward_loop(
     return forward_loop
 
 
+def enable_sparsity_measurement(model: torch.nn.Module) -> None:
+    """Enable runtime sparsity measurement on all sparse attention modules."""
+    for _name, module in model.named_modules():
+        if isinstance(module, SparseAttentionModule) and module.is_enabled:
+            method = module._sparse_method_instance
+            if hasattr(method, "enable_measure_sparsity"):
+                method.reset_sparsity_counters()
+                method.enable_measure_sparsity(True)
+
+
 def print_sparsity_summary(model: torch.nn.Module) -> None:
-    """Print per-module sparsity statistics."""
+    """Print per-module sparsity statistics including runtime kernel counters."""
     enabled, disabled = [], []
     for name, module in model.named_modules():
         if isinstance(module, SparseAttentionModule):
@@ -274,6 +325,38 @@ def print_sparsity_summary(model: torch.nn.Module) -> None:
     for name, module in enabled:
         info = module.get_threshold_info()
         print(f"  {name}: {info}")
+
+
+def print_runtime_sparsity(model: torch.nn.Module) -> None:
+    """Print runtime tile sparsity measured via kernel atomic counters."""
+    total_all = 0
+    skipped_all = 0
+    per_module: list[tuple[str, int, int]] = []
+
+    for name, module in model.named_modules():
+        if isinstance(module, SparseAttentionModule) and module.is_enabled:
+            method = module._sparse_method_instance
+            if hasattr(method, "get_sparsity_counters"):
+                total, skipped = method.get_sparsity_counters()
+                if total > 0:
+                    per_module.append((name, total, skipped))
+                    total_all += total
+                    skipped_all += skipped
+
+    if total_all == 0:
+        print("\nNo runtime sparsity data collected.")
+        return
+
+    print("\n" + "=" * 70)
+    print("Runtime tile sparsity (measured via kernel atomic counters)")
+    print("=" * 70)
+    for name, total, skipped in per_module:
+        ratio = skipped / total
+        print(f"  {name}: {skipped:,}/{total:,} tiles skipped ({ratio:.1%})")
+    ratio_all = skipped_all / total_all
+    print("-" * 70)
+    print(f"  Overall: {skipped_all:,}/{total_all:,} tiles skipped ({ratio_all:.1%})")
+    print("=" * 70)
 
 
 def _get_num_blocks(transformer: torch.nn.Module) -> int:
@@ -294,39 +377,71 @@ def main() -> None:
     print(f"Loading Wan 2.2 from {args.model_path}...")
     pipe = build_pipeline(args.model_path)
 
-    # ---- Collect transformers to sparsify ----
+    # ---- Collect transformers ----
     # Wan 2.2 5B has one transformer; 14B has two (transformer + transformer_2)
-    transformers_to_sparsify = []
+    transformers = []
     if pipe.transformer is not None:
-        transformers_to_sparsify.append(("transformer", pipe.transformer))
+        transformers.append(("transformer", pipe.transformer))
     if getattr(pipe, "transformer_2", None) is not None:
-        transformers_to_sparsify.append(("transformer_2", pipe.transformer_2))
+        transformers.append(("transformer_2", pipe.transformer_2))
 
-    # ---- Build calibration forward loop (shared across transformers) ----
-    forward_loop = None
-    if args.calibrate:
-        forward_loop = build_calibration_forward_loop(
-            pipe,
-            calib_size=args.calib_size,
-            num_steps=args.calib_steps,
-            num_frames=args.calib_frames,
-            height=args.height,
-            width=args.width,
-            seed=args.seed,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            negative_prompt=args.negative_prompt,
-        )
+    # ---- Sparsify (unless baseline) ----
+    if args.baseline:
+        print("Baseline mode: running dense inference (default diffusers backend)")
+    elif args.triton_baseline:
+        print("Triton baseline: dense Triton FA kernel (no skip-softmax)")
+        for name, transformer in transformers:
+            num_blocks = _get_num_blocks(transformer)
+            print(f"Applying Triton backend to {name} ({num_blocks} blocks)...")
+            config = build_sparse_config(args, num_blocks=num_blocks)
+            mtsa.sparsify(transformer, config, forward_loop=None)
+    else:
+        # Build calibration forward loop if needed
+        forward_loop = None
+        if args.raw_threshold is not None:
+            print(f"Using fixed raw threshold: {args.raw_threshold} (skipping calibration)")
+            if args.calibrate:
+                print("Warning: --calibrate is ignored when --raw-threshold is set")
+        elif args.calibrate:
+            forward_loop = build_calibration_forward_loop(
+                pipe,
+                calib_size=args.calib_size,
+                num_steps=args.calib_steps,
+                num_frames=args.calib_frames,
+                height=args.height,
+                width=args.width,
+                seed=args.seed,
+                guidance_scale=args.guidance_scale,
+                guidance_scale_2=args.guidance_scale_2,
+                negative_prompt=args.negative_prompt,
+            )
+        else:
+            print(
+                "Warning: neither --baseline, --raw-threshold, nor --calibrate specified; "
+                "using default static threshold"
+            )
 
-    # ---- Sparsify each transformer ----
-    for name, transformer in transformers_to_sparsify:
-        num_blocks = _get_num_blocks(transformer)
-        print(f"Applying skip-softmax to {name} ({num_blocks} blocks)...")
-        config = build_sparse_config(args, num_blocks=num_blocks)
-        mtsa.sparsify(transformer, config, forward_loop=forward_loop)
+        for name, transformer in transformers:
+            num_blocks = _get_num_blocks(transformer)
+            print(f"Applying skip-softmax to {name} ({num_blocks} blocks)...")
+            config = build_sparse_config(args, num_blocks=num_blocks)
+            mtsa.sparsify(transformer, config, forward_loop=forward_loop)
+
+    # ---- Free calibration memory before inference ----
+    if not args.baseline and not args.triton_baseline and forward_loop is not None:
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("Cleared CUDA cache after calibration")
 
     # ---- Generate (optional) ----
     if args.prompt:
+        # Enable runtime sparsity measurement before generation
+        if args.report_avg_sparsity and not args.baseline:
+            for _name, transformer in transformers:
+                enable_sparsity_measurement(transformer)
+
         print(f"Generating: {args.prompt[:80]}...")
         pipe_kwargs: dict = {
             "prompt": args.prompt,
@@ -346,9 +461,12 @@ def main() -> None:
         print(f"Saved to {args.output}")
 
     # ---- Print stats ----
-    for name, transformer in transformers_to_sparsify:
-        print(f"\n{name}:")
-        print_sparsity_summary(transformer)
+    if not args.baseline:
+        for name, transformer in transformers:
+            print(f"\n{name}:")
+            print_sparsity_summary(transformer)
+            if args.report_avg_sparsity:
+                print_runtime_sparsity(transformer)
 
 
 if __name__ == "__main__":

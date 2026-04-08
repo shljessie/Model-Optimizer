@@ -139,6 +139,17 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         ),
     )
 
+    skip_softmax_raw_threshold: float | None = ModeloptField(
+        default=None,
+        title="Raw skip-softmax threshold (skip_threshold_log2).",
+        description=(
+            "Raw value passed directly to the Triton kernel as skip_threshold_log2. "
+            "The kernel skips tiles where tile_row_max < row_max + raw_threshold. "
+            "Typical values are negative (e.g., -5.0). Takes precedence over "
+            "skip_softmax_threshold and calibration when set."
+        ),
+    )
+
     @field_validator("method")
     @classmethod
     def validate_method(cls, v):
