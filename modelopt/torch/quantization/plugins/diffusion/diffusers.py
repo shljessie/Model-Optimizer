@@ -64,7 +64,6 @@ from ...nn import (
     TensorQuantizer,
 )
 from ...nn.modules.quant_conv import _QuantConv3d
-from ...utils import is_torch_export_mode
 from ..custom import _QuantFunctionalMixin
 
 onnx_dtype_map = {
@@ -282,41 +281,32 @@ class FP8SDPA(Function):
         )
 
 
-# ---------------------------------------------------------------------------
 # WanCausalConv3d quantization support (diffusers VAE)
-# ---------------------------------------------------------------------------
 try:
     from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 
     @QuantModuleRegistry.register({WanCausalConv3d: "WanCausalConv3d"})
     class _QuantDiffusersWanCausalConv3d(_QuantConv3d):
-        """Quantized diffusers WanCausalConv3d.
-
-        WanCausalConv3d inherits from nn.Conv3d directly, so we override
-        forward to apply causal padding + cache before the quantized conv.
-        """
-
-        @staticmethod
-        def _get_quantized_weight(
-            module: "QuantLinearConvBase", weight: torch.Tensor
-        ) -> torch.Tensor:
-            if module._enable_weight_quantization or is_torch_export_mode():
-                return module.weight_quantizer(weight)
-            return weight
+        """Quantized WanCausalConv3d — applies causal padding before quantized conv."""
 
         def forward(self, x, cache_x=None):
+            # Apply WanCausalConv3d-specific causal padding
+            padding = list(self._padding)
+            if cache_x is not None and self._padding[4] > 0:
+                cache_x = cache_x.to(x.device)
+                x = torch.cat([cache_x, x], dim=2)
+                padding[4] -= cache_x.shape[2]
+            x = F.pad(x, padding)
+
+            # NVFP4 implicit GEMM path (self.padding is (0,0,0) since padding already applied)
+            if self._should_use_implicit_gemm():
+                if not (self.input_quantizer._if_calib and not self.input_quantizer._if_quant):
+                    return self._implicit_gemm_forward(x)
+
+            # Default quantized conv path (skip WanCausalConv3d.forward to avoid double-padding)
             with self.quantize_weight():
-                padding = list(self._padding)
-                if cache_x is not None and self._padding[4] > 0:
-                    cache_x = cache_x.to(x.device)
-                    x = torch.cat([cache_x, x], dim=2)
-                    padding[4] -= cache_x.shape[2]
-                x = F.pad(x, padding)
-
                 input = self.input_quantizer(x)
-                # Call nn.Conv3d.forward (grandparent), skipping WanCausalConv3d.forward
                 output = torch.nn.Conv3d.forward(self, input)
-
                 if isinstance(output, tuple):
                     return (self.output_quantizer(output[0]), *output[1:])
                 return self.output_quantizer(output)

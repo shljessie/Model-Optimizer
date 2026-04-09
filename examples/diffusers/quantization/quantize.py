@@ -137,10 +137,11 @@ class Quantizer:
             # Override block size if non-default
             if self.config.block_size != 16:
                 import copy
+
                 quant_config = copy.deepcopy(quant_config)
-                for key in ("*weight_quantizer", "*input_quantizer", "**weight_quantizer", "**input_quantizer"):
-                    if key in quant_config["quant_cfg"] and "block_sizes" in quant_config["quant_cfg"][key]:
-                        quant_config["quant_cfg"][key]["block_sizes"][-1] = self.config.block_size
+                for entry in quant_config["quant_cfg"]:
+                    if isinstance(entry, dict) and "block_sizes" in entry.get("cfg", {}):
+                        entry["cfg"]["block_sizes"][-1] = self.config.block_size
         else:
             raise NotImplementedError(f"Unknown format {self.config.format}")
         if self.config.quantize_mha:
@@ -183,7 +184,9 @@ class Quantizer:
         mtq.quantize(backbone, quant_config, forward_loop)
         # Get model-specific filter function
         model_filter_func = get_model_filter_func(self.model_config.model_type, backbone_name)
-        self.logger.info(f"Using filter function for {self.model_config.model_type.value}/{backbone_name}")
+        self.logger.info(
+            f"Using filter function for {self.model_config.model_type.value}/{backbone_name}"
+        )
 
         self.logger.info("Disabling specific quantizers...")
         mtq.disable_quantizer(backbone, model_filter_func)
@@ -307,19 +310,21 @@ class ExportManager:
         if self.pipeline_manager is None:
             raise RuntimeError("Pipeline manager is required for per-backbone checkpoints.")
 
-        if restore_path.exists() and restore_path.is_dir():
-            for backbone_name, backbone in self.pipeline_manager.iter_backbones():
-                # Try named checkpoint first, fall back to legacy "backbone.pt"
-                source_path = restore_path / f"{backbone_name}.pt"
-                if not source_path.exists():
-                    source_path = restore_path / "backbone.pt"
-                if not source_path.exists():
-                    raise FileNotFoundError(
-                        f"Checkpoint not found for {backbone_name}: tried "
-                        f"{restore_path / f'{backbone_name}.pt'} and {restore_path / 'backbone.pt'}"
-                    )
-                self.logger.info(f"Restoring {backbone_name} from {source_path}")
-                mto.restore(backbone, str(source_path))
+        if not restore_path.exists() or not restore_path.is_dir():
+            raise FileNotFoundError(f"Checkpoint directory not found: {restore_path}")
+
+        backbones = list(self.pipeline_manager.iter_backbones())
+        for backbone_name, backbone in backbones:
+            source_path = restore_path / f"{backbone_name}.pt"
+            # Legacy fallback: only safe when there is exactly one backbone
+            if not source_path.exists() and len(backbones) == 1:
+                source_path = restore_path / "backbone.pt"
+            if not source_path.exists():
+                raise FileNotFoundError(
+                    f"Checkpoint not found for '{backbone_name}' in {restore_path}"
+                )
+            self.logger.info(f"Restoring {backbone_name} from {source_path}")
+            mto.restore(backbone, str(source_path))
         self.logger.info("Checkpoints restored successfully")
 
     # TODO: should not do the any data type
@@ -612,9 +617,7 @@ def main() -> None:
 
             for backbone_name, backbone in pipeline_manager.iter_backbones():
                 logger.info(f"Quantizing backbone: {backbone_name}")
-                backbone_quant_config = quantizer.get_quant_config(
-                    calib_config.n_steps, backbone
-                )
+                backbone_quant_config = quantizer.get_quant_config(calib_config.n_steps, backbone)
 
                 # Full pipeline inference for calibration — cached modules
                 # (transformer, video_decoder) are exercised during __call__
@@ -622,7 +625,9 @@ def main() -> None:
                     calibrator.run_calibration(batched_prompts)
 
                 quantizer.quantize_model(
-                    backbone, backbone_quant_config, forward_loop,
+                    backbone,
+                    backbone_quant_config,
+                    forward_loop,
                     backbone_name=backbone_name,
                 )
 

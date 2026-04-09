@@ -58,23 +58,20 @@ class PipelineManager:
         Raises:
             ValueError: If model type is unsupported
         """
-        try:
-            pipeline_cls = MODEL_PIPELINE[model_type]
-            if pipeline_cls is None:
-                raise ValueError(f"Model type {model_type.value} does not use diffusers pipelines.")
-            model_id = (
-                MODEL_REGISTRY[model_type] if override_model_path is None else override_model_path
-            )
-            pipe = pipeline_cls.from_pretrained(
-                model_id,
-                torch_dtype=torch_dtype,
-                use_safetensors=True,
-                **MODEL_DEFAULTS[model_type].get("from_pretrained_extra_args", {}),
-            )
-            pipe.set_progress_bar_config(disable=True)
-            return pipe
-        except Exception as e:
-            raise e
+        pipeline_cls = MODEL_PIPELINE[model_type]
+        if pipeline_cls is None:
+            raise ValueError(f"Model type {model_type.value} does not use diffusers pipelines.")
+        model_id = (
+            MODEL_REGISTRY[model_type] if override_model_path is None else override_model_path
+        )
+        pipe = pipeline_cls.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            use_safetensors=True,
+            **MODEL_DEFAULTS[model_type].get("from_pretrained_extra_args", {}),
+        )
+        pipe.set_progress_bar_config(disable=True)
+        return pipe
 
     def create_pipeline(self) -> Any:
         """
@@ -157,21 +154,6 @@ class PipelineManager:
                 self.logger.info("Enabling VAE tiling for LTX-Video")
                 self.pipe.vae.enable_tiling()
 
-    def get_backbone(self) -> torch.nn.Module:
-        """
-        Get the backbone model(s).
-
-        Returns:
-            Single module if one backbone, ModuleList if multiple.
-        """
-        if not self.pipe:
-            raise RuntimeError("Pipeline not created. Call create_pipeline() first.")
-
-        backbone_pairs = list(self.iter_backbones())
-        if len(backbone_pairs) == 1:
-            return backbone_pairs[0][1]
-        return torch.nn.ModuleList([module for _, module in backbone_pairs])
-
     def iter_backbones(self) -> Iterator[tuple[str, torch.nn.Module]]:
         """
         Yield (backbone_name, module) pairs.
@@ -239,6 +221,7 @@ class PipelineManager:
             raise ValueError("Missing required extra_param: gemma_root.")
 
         from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+        from ltx_core.quantization import QuantizationPolicy
         from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
         distilled_lora = [
@@ -254,7 +237,7 @@ class PipelineManager:
             "spatial_upsampler_path": str(spatial_upsampler_path),
             "gemma_root": str(gemma_root),
             "loras": [],
-            "fp8transformer": bool(fp8_quantization),
+            "quantization": QuantizationPolicy.fp8_cast() if fp8_quantization else None,
         }
         pipeline_kwargs.update(params)
         return TI2VidTwoStagesPipeline(**pipeline_kwargs)
