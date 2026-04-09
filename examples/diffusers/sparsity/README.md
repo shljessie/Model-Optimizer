@@ -1,6 +1,6 @@
 # Skip-Softmax Sparse Attention for Diffusion Models
 
-Skip-softmax sparse attention (BLASST, https://arxiv.org/pdf/2512.12087) skips KV
+Skip-softmax sparse attention (BLASST, <https://arxiv.org/pdf/2512.12087>) skips KV
 tiles whose attention scores are negligible during the FlashAttention computation,
 reducing FLOPs without retraining.
 
@@ -136,4 +136,3 @@ mtsa.sparsify(transformer, config, forward_loop)
 
 - **Calibration sparsity ratio**: The calibrated threshold goes through `log2(threshold) * sm_scale` conversion, producing `skip_threshold_log2` values in a different scale than raw thresholds. Needs investigation to ensure the fitted (a, b) parameters produce expected sparsity levels.
 - **14B dual transformer calibration**: Transformers are calibrated sequentially — transformer_2's calibration runs while transformer_1 is already sparsified, introducing asymmetric calibration conditions.
-

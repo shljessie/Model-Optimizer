@@ -243,7 +243,9 @@ class DynamicThresholdCalibrator:
         print(f"  Fitted a: {a:.6e}")
         print(f"  Fitted b: {b:.4f}")
         print(f"  R-squared: {r_squared:.6f}")
-        print(f"  Observed sparsity range: [{min_observed_sparsity:.1%}, {max_observed_sparsity:.1%}]")
+        print(
+            f"  Observed sparsity range: [{min_observed_sparsity:.1%}, {max_observed_sparsity:.1%}]"
+        )
         print(f"  Data points used: {int(np.sum(valid_mask))} / {len(all_data_points)}")
 
         # Show scale_factor for various target sparsities
@@ -253,9 +255,7 @@ class DynamicThresholdCalibrator:
         for target in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
             sf = a * np.exp(b * target)
             note = ""
-            if target < min_observed_sparsity:
-                note = "(extrapolation)"
-            elif target > max_observed_sparsity:
+            if target < min_observed_sparsity or target > max_observed_sparsity:
                 note = "(extrapolation)"
             print(f"  {target:<10.0%} {sf:<15.4f} {note:<20}")
 
