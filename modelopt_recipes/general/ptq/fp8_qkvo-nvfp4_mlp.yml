@@ -15,7 +15,8 @@
 
 metadata:
   recipe_type: ptq
-  description: FP8 per-tensor weight and activation for attention QKVO projections (W8A8), NVFP4 static weight and dynamic activation for MLP layers (W4A4), max calibration.
+  description: FP8 per-tensor weight and activation for attention QKVO projections (W8A8), NVFP4 static weight and dynamic activation for MLP layers (W4A4),
+    max calibration.
 ptq_cfg:
   algorithm: max
   quant_cfg:
