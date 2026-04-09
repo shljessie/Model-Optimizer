@@ -37,7 +37,7 @@ from .config import (
     AWQFullCalibConfig,
     AWQLiteCalibConfig,
     CompressConfig,
-    GPTQLiteConfig,
+    GPTQCalibConfig,
     LocalHessianCalibConfig,
     MaxCalibConfig,
     MseCalibConfig,
@@ -59,7 +59,7 @@ from .conversion import (
 )
 from .model_calib import (
     awq,
-    gptq_lite,
+    gptq,
     local_hessian_calibrate,
     max_calibrate,
     mse_calibrate,
@@ -236,18 +236,12 @@ def wrapped_calib_func(
             if hasattr(module, "_moe_calib_experts_ratio"):
                 module._moe_calib_experts_ratio = moe_calib_experts_ratio
 
-    moe_count_expert_calib_tokens = kwargs.pop("moe_count_expert_calib_tokens", False)
-    if moe_count_expert_calib_tokens:
-        for module in model.modules():
-            if hasattr(module, "_moe_count_expert_calib_tokens"):
-                module._moe_count_expert_calib_tokens = True
-
     if func is not None:
         if sequential:
             if forward_loop is None:
                 raise ValueError("forward_loop is required for calibration but got None.")
-            assert method in ["max"], (
-                f"Sequential calibration currently only supports max calibration, got {method}"
+            assert method in ["max", "gptq"], (
+                f"Sequential calibration currently only supports max and gptq calibration, got {method}"
             )
             # Wrap with sequential processing
             sequential_calibrate(
@@ -499,12 +493,12 @@ class SVDQuantModeDescriptor(BaseCalibrateModeDescriptor):
 
 
 @CalibrateModeRegistry.register_mode
-class GPTQLiteModeDescriptor(BaseCalibrateModeDescriptor):
+class GPTQModeDescriptor(BaseCalibrateModeDescriptor):
     """Mode for GPTQ calibration algorithm."""
 
     @property
     def config_class(self) -> type[QuantizeAlgorithmConfig]:
         """Specifies the config class for the mode."""
-        return GPTQLiteConfig
+        return GPTQCalibConfig
 
-    _calib_func = gptq_lite
+    _calib_func = gptq

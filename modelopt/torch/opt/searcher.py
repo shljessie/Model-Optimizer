@@ -26,15 +26,24 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import Any, final
+from typing import TYPE_CHECKING, Any, final
 
 import numpy as np
 import pulp
-import torch
 import torch.nn as nn
 
 from modelopt.torch.utils import distributed as dist
-from modelopt.torch.utils import no_stdout, print_rank_0, run_forward_loop, warn_rank_0
+from modelopt.torch.utils import (
+    no_stdout,
+    print_rank_0,
+    run_forward_loop,
+    safe_load,
+    safe_save,
+    warn_rank_0,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 LimitsTuple = tuple[float, float]
 ConstraintsDict = dict[str, str | float | dict | None]
@@ -238,9 +247,18 @@ class BaseSearcher(ABC):
 
     def _get_checkpoint_path(self) -> str | None:
         """Get per-rank checkpoint path when distributed, otherwise the original path."""
-        checkpoint = self.config["checkpoint"]
+        checkpoint: str | Path | None = self.config["checkpoint"]
         if checkpoint is None:
             return None
+        checkpoint = str(checkpoint)
+        # Detect directory: exists as dir, ends with separator, or has no file extension
+        is_dir_path = (
+            os.path.isdir(checkpoint)
+            or checkpoint.endswith(os.sep)
+            or not os.path.splitext(checkpoint)[1]
+        )
+        if is_dir_path:
+            return os.path.join(checkpoint, f"rank{dist.rank()}.pth")
         if dist.is_initialized():
             dirname, basename = os.path.split(checkpoint)
             name, ext = os.path.splitext(basename)
@@ -264,8 +282,7 @@ class BaseSearcher(ABC):
             return False
 
         print_rank_0(f"Loading searcher state from {checkpoint}...")
-        # Security NOTE: weights_only=False is used here on ModelOpt-generated ckpt, not on untrusted user input
-        state_dict = torch.load(checkpoint, weights_only=False)
+        state_dict = safe_load(checkpoint)
         if strict:
             assert state_dict.keys() == self.state_dict().keys(), "Keys in checkpoint don't match!"
         for key, default_val in self.default_state_dict.items():
@@ -289,7 +306,7 @@ class BaseSearcher(ABC):
         save_dirname, _ = os.path.split(checkpoint)
         if save_dirname:
             os.makedirs(save_dirname, exist_ok=True)
-        torch.save(self.state_dict(), checkpoint)
+        safe_save(self.state_dict(), checkpoint)
 
 
 class LPS:

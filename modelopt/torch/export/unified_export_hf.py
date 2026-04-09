@@ -218,7 +218,10 @@ def _collect_shared_input_modules(
 
     # Run dummy forward pass to collect modules sharing same input
     try:
-        with torch.no_grad(), set_quantizer_by_cfg_context(model, {"*": {"enable": False}}):
+        with (
+            torch.no_grad(),
+            set_quantizer_by_cfg_context(model, [{"quantizer_name": "*", "enable": False}]),
+        ):
             dummy_forward_fn()
     finally:
         # Always remove hooks
@@ -378,6 +381,9 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
         elif getattr(model.config, "is_encoder_decoder", False):
             # For other encoder-decoder models (non-VL), pass both encoder and decoder input ids
             model(fake_input, decoder_input_ids=decoder_fake_input)
+        elif hasattr(model, "get_dummy_inputs"):
+            # For speculative decoding models (EAGLE, etc.), use model-provided dummy inputs
+            model(**model.get_dummy_inputs())
         else:
             model(fake_input)
 
@@ -641,6 +647,9 @@ def _process_quantized_modules(
         ):
             sub_module.unpack_weight()
         if get_quantization_format(sub_module) != QUANTIZATION_NONE:
+            # Skip QuantMoELinear - it's handled separately in _reconstruct_fused_moe_linear
+            if type(sub_module).__name__ == "QuantMoELinear":
+                continue
             if is_quantlinear(sub_module):
                 try:
                     with fsdp2_aware_weight_update(model, sub_module, reshard=False):
@@ -790,6 +799,11 @@ def _export_transformers_checkpoint(
 
     # Process all quantized modules and export weights
     _process_quantized_modules(model, dtype, is_modelopt_qlora)
+
+    # Reconstruct fused MoELinear: per-expert _QuantLinear weights → original 3D format
+    from modelopt.torch.quantization.plugins.huggingface import _reconstruct_fused_moe_linear
+
+    _reconstruct_fused_moe_linear(model)
 
     if accelerator is not None:
         # Gather state_dict from all ranks
@@ -1118,6 +1132,7 @@ def export_hf_checkpoint(
     save_modelopt_state: bool = False,
     components: list[str] | None = None,
     extra_state_dict: dict[str, torch.Tensor] | None = None,
+    max_shard_size: int | str = "10GB",
     **kwargs,
 ):
     """Export quantized HuggingFace model checkpoint (transformers or diffusers).
@@ -1136,6 +1151,7 @@ def export_hf_checkpoint(
         components: Only used for diffusers pipelines. Optional list of component names
             to export. If None, all quantized components are exported.
         extra_state_dict: Extra state dictionary to add to the exported model.
+        max_shard_size: Maximum size of each safetensors shard file. Defaults to "10GB".
         **kwargs: Internal-only keyword arguments. Supported key: merged_base_safetensor_path
             (str, optional). When provided, merges the exported diffusion transformer
             weights with non-transformer components (VAE, vocoder, text encoders, etc.)
@@ -1153,7 +1169,7 @@ def export_hf_checkpoint(
         is_diffusers_obj = is_diffusers_object(model)
     if is_diffusers_obj:
         _export_diffusers_checkpoint(
-            model, dtype, export_dir, components, merged_base_safetensor_path
+            model, dtype, export_dir, components, merged_base_safetensor_path, max_shard_size
         )
         return
 
@@ -1183,6 +1199,7 @@ def export_hf_checkpoint(
                 export_dir,
                 state_dict={**post_state_dict, **(extra_state_dict or {})},
                 save_modelopt_state=save_modelopt_state,
+                max_shard_size=max_shard_size,
             )
         finally:
             _unpatch_revert_weight_conversion(_patches)

@@ -32,6 +32,75 @@ from .sparse_attention import SparseAttentionModule, SparseAttentionRegistry
 from .utils import get_named_sparse_attention_modules, get_sparse_attention_modules
 
 
+def _set_attn_implementation(model: nn.Module, config: SparseAttentionConfig) -> None:
+    """Set the correct attn_implementation based on the sparse attention method/backend.
+
+    - ``backend="triton"``: registers the Triton kernel with HF and sets
+      ``attn_implementation="modelopt_triton"``.
+    - ``backend="pytorch"`` (default): sets ``attn_implementation="eager"`` so that
+      softmax-patching methods (e.g. skip-softmax) work correctly.  FlashAttention
+      and SDPA bypass ``F.softmax``, so eager is required.
+    - ``method="vsa"``: no-op. VSA patches ``F.scaled_dot_product_attention``
+      directly in ``SparseAttentionModule.forward()``, so no ``attn_implementation``
+      change is needed.
+
+    This is called automatically during ``mtsa.sparsify()`` so users never need
+    to manually set ``attn_implementation``.
+    """
+    sparse_cfg = config.sparse_cfg if hasattr(config, "sparse_cfg") else {}
+
+    # Collect methods and backends only from layer configs (identified by having a "method" key).
+    # Other dict entries (e.g. "calibration") are not layer configs.
+    layer_cfgs = [v for v in sparse_cfg.values() if isinstance(v, dict) and "method" in v]
+    methods = {v.get("method") for v in layer_cfgs}
+    backends = {v.get("backend", "pytorch") for v in layer_cfgs}
+
+    # VSA patches F.scaled_dot_product_attention directly — it does not change
+    # attn_implementation.  Skip the rest for VSA-only configs.
+    if methods == {"vsa"}:
+        return
+
+    # Reject mixed VSA + non-VSA configs (VSA patches SDPA globally per-module,
+    # while softmax-patching methods need attn_implementation="eager").
+    non_vsa_methods = methods - {"vsa"}
+    if "vsa" in methods and non_vsa_methods:
+        raise ValueError(
+            f"Cannot mix VSA with other sparse attention methods ({non_vsa_methods}). "
+            f"VSA patches F.scaled_dot_product_attention, which is incompatible "
+            f"with softmax-patching or triton methods."
+        )
+
+    model_config = getattr(model, "config", None)
+
+    if "triton" in backends and "pytorch" in backends:
+        raise ValueError(
+            "Mixed backends ('triton' and 'pytorch') in the same model are not "
+            "supported. All sparse attention layers must use the same backend."
+        )
+
+    if "triton" in backends:
+        from .kernels import register_triton_attention
+
+        if register_triton_attention is None:
+            raise ImportError(
+                "Triton backend requires 'triton' package. Install with: pip install triton"
+            )
+        if not register_triton_attention():
+            raise RuntimeError(
+                "Failed to register Triton attention with HuggingFace. "
+                "Check that your transformers version supports ALL_ATTENTION_FUNCTIONS."
+            )
+
+        # Set attn_implementation so HF dispatches to the Triton kernel.
+        # HF's ALL_ATTENTION_FUNCTIONS is checked at forward time, not construction
+        # time, so this works even after the model is already loaded.
+        if model_config is not None:
+            model_config._attn_implementation = "modelopt_triton"
+    elif model_config is not None:
+        # For pytorch backend, force eager for softmax patching.
+        model_config._attn_implementation = "eager"
+
+
 def is_attn_sparsified(model: nn.Module) -> bool:
     """Check if a model has sparse attention applied.
 
@@ -60,6 +129,9 @@ def convert_to_sparse_attention_model(
     """
     # Initialize the true module if necessary
     model = model.init_modellike() if isinstance(model, ModelLikeModule) else model
+
+    # Set the correct attn_implementation for the chosen backend
+    _set_attn_implementation(model, config)
 
     # Apply custom model plugins
     register_custom_model_plugins_on_the_fly(model)
@@ -136,7 +208,7 @@ def set_sparse_attention_attribute(
 ):
     """Set sparse attention attributes for modules matching pattern.
 
-    Similar to quantization's set_quantizer_attribute.
+    Similar to quantization's set_quantizer_attributes_partial.
 
     Args:
         model: Model to configure
