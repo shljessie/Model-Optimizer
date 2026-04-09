@@ -10,7 +10,8 @@ Two modes are supported:
 - **Calibrated threshold** — an exponential model
   (`scale_factor = a * exp(b * target_sparsity)`) is calibrated once via the
   Triton calibration kernel, then the target sparsity can be adjusted at runtime
-  without recalibration.
+  without recalibration. Log-space fitting (`fit_logspace=True`) is recommended
+  for diffusion models where scale_factors span many orders of magnitude.
 
 ## Supported Models
 
@@ -43,6 +44,7 @@ python wan22_skip_softmax.py \
 
 # Report runtime sparsity (per-layer tile skip ratios)
 python wan22_skip_softmax.py \
+    --model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
     --raw-threshold -0.7 --report-avg-sparsity \
     --prompt "A cat playing piano" --output out.mp4
 ```
@@ -81,6 +83,7 @@ mtsa.sparsify(transformer, config, forward_loop)
        │                        - Per-program output buffers (no atomic contention)
        │                        - Python-side reduction: sum across programs
        ├─ Fit: scale_factor = a * exp(b * sparsity)
+       │    └─ fit_logspace=True: fits in log space (minimizes relative error)
        └─ Apply a, b to all modules
             └─ Inference: threshold = scale_factor / seq_k
 ```
@@ -114,13 +117,13 @@ mtsa.sparsify(transformer, config, forward_loop)
 | File | Role |
 |------|------|
 | `calibrate.py` | Orchestrates calibration. Skips RULER dataset when user provides `forward_loop` (diffusion models). Applies fitted (a, b) to all modules. |
-| `calibrator.py` | `DynamicThresholdCalibrator`: collects (scale_factor, sparsity) pairs via Triton calibration kernel, fits exponential model `scale_factor = a * exp(b * sparsity)`. |
+| `calibrator.py` | `DynamicThresholdCalibrator`: collects (scale_factor, sparsity) pairs via Triton calibration kernel, fits exponential model `scale_factor = a * exp(b * sparsity)`. Supports `fit_logspace=True` for log-space fitting (recommended for diffusion models). |
 
 ### Config & Conversion
 
 | File | Role |
 |------|------|
-| `config.py` | `SparseAttentionAttributeConfig` with `skip_softmax_threshold`, `skip_softmax_raw_threshold`, calibration settings. |
+| `config.py` | `SparseAttentionAttributeConfig` with `skip_softmax_threshold`, `skip_softmax_raw_threshold`, calibration settings. `CalibrationConfig` with `fit_logspace` field. |
 | `conversion.py` | `_register_diffusers_backends_if_needed()` auto-registers Triton backends on `sparsify()`. |
 | `sparse_attention.py` | `SparseAttentionModule` wrapper — delegates to method's `get_sparse_context()`. |
 
@@ -134,5 +137,5 @@ mtsa.sparsify(transformer, config, forward_loop)
 
 ## Known Issues
 
-- **Calibration sparsity ratio**: The calibrated threshold goes through `log2(threshold) * sm_scale` conversion, producing `skip_threshold_log2` values in a different scale than raw thresholds. Needs investigation to ensure the fitted (a, b) parameters produce expected sparsity levels.
 - **14B dual transformer calibration**: Transformers are calibrated sequentially — transformer_2's calibration runs while transformer_1 is already sparsified, introducing asymmetric calibration conditions.
+- **Minimum achievable sparsity**: Even the strictest threshold may yield 30-40% sparsity on diffusion models (many tiles are inherently negligible). Targets below this floor cause extrapolation; an inference-time warning is emitted.
