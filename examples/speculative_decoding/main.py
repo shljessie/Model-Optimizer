@@ -40,6 +40,7 @@ from accelerate import ParallelismConfig
 from eagle_utils import (
     EagleTrainerWithAccLog,
     EagleTrainingPlot,
+    LoRAWarmupCallback,
     make_eagle_supervised_data_module,
     patch_ring_attention_for_ttt,
 )
@@ -281,17 +282,35 @@ def train():
         else:
             raise Exception(f"{training_args.mode} is not supported!")
 
+    # Move any remaining CPU buffers to CUDA so DDP (NCCL-only) can broadcast
+    # them.  We iterate named_buffers and reassign via the owning module to
+    # keep the module tree consistent.  Parameters are left on CPU — the HF
+    # Trainer will move them during init.
+    if torch.cuda.is_available():
+        _target_dev = torch.device("cuda", 0)
+        for name, buf in list(model.named_buffers()):
+            if buf.device.type == "cpu":
+                parts = name.split(".")
+                mod = model
+                for p in parts[:-1]:
+                    mod = getattr(mod, p)
+                setattr(mod, parts[-1], buf.to(_target_dev))
+
     print_rank_0("Loading dataset...")
     if training_args.mode == "eagle3":
         data_module = make_eagle_supervised_data_module(
             tokenizer, data_args, train_len=training_args.training_seq_len
         )
 
+    callbacks = [EagleTrainingPlot(training_args.ar_validate_steps, training_args.estimate_ar)]
+    if eagle_cfg.get("eagle_base_lora") and eagle_cfg.get("eagle_base_lora_warmup_steps", 0) > 0:
+        callbacks.append(LoRAWarmupCallback(eagle_cfg["eagle_base_lora_warmup_steps"]))
+
     trainer = EagleTrainerWithAccLog(
         model=model,
         processing_class=tokenizer,
         args=training_args,
-        callbacks=[EagleTrainingPlot(training_args.ar_validate_steps, training_args.estimate_ar)],
+        callbacks=callbacks,
         **data_module,
     )
 
