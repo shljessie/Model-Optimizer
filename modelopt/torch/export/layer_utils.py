@@ -308,9 +308,11 @@ def is_moe(module: nn.Module) -> bool:
     if any(key in name for key in ["arcticmoe", "deepseekmoe", "dbrxffn"]):
         return True
     # Structural detection: modules with router + experts (e.g. Gemma4TextDecoderLayer)
-    if hasattr(module, "router") and hasattr(module, "experts") and isinstance(module.experts, nn.Module):
-        return True
-    return False
+    return (
+        hasattr(module, "router")
+        and hasattr(module, "experts")
+        and isinstance(module.experts, nn.Module)
+    )
 
 
 def is_quantlinear(module: nn.Module) -> bool:
