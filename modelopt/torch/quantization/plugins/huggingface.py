@@ -1202,6 +1202,19 @@ try:
 except ImportError:
     pass
 
+try:
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextExperts
+
+    # Gemma4TextExperts has the same fused 3D tensor layout as Qwen3_5MoeExperts
+    # (gate_up_proj, down_proj, hidden_dim, intermediate_dim, num_experts, act_fn)
+    # so we reuse _QuantQwen35MoeExperts which unfuses into per-expert nn.Linear layers.
+    if Gemma4TextExperts not in QuantModuleRegistry:
+        QuantModuleRegistry.register({Gemma4TextExperts: "hf.Gemma4TextExperts"})(
+            _QuantQwen35MoeExperts
+        )
+except ImportError:
+    pass
+
 
 class _QuantGptOssExperts(_QuantFunctionalMixin):
     """Quantized wrapper for `transformers.GptOssExperts`.
