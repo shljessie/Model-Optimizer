@@ -337,6 +337,15 @@ class CalibrationConfig(ModeloptBaseConfig):
         ),
     )
 
+    fit_logspace: bool = ModeloptField(
+        default=False,
+        title="Fit in log space",
+        description=(
+            "If True, fit the exponential model in log space (minimizes relative error). "
+            "Recommended for diffusion models where scale_factors span many orders of magnitude."
+        ),
+    )
+
     cache_dir: str | None = ModeloptField(
         default=None,
         title="Cache directory",

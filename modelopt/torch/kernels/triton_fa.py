@@ -1213,11 +1213,11 @@ def _attn_fwd_calibrate(
         tile_row_max = tl.max(scores, 1)
 
         # --- Vectorized multi-threshold sparsity measurement ---
-        # Compute the "hardest to skip" gap across all Q rows in this tile.
-        # A tile is skipped iff ALL rows satisfy: tile_row_max < row_max + thresh.
-        # Equivalently: min(tile_row_max - row_max) < thresh.
-        min_gap = tl.min(tile_row_max - row_max)  # scalar
-        skip_mask = (min_gap < thresholds).to(tl.int32)  # [PADDED_THRESHOLDS]
+        # A tile is skipped iff ALL Q rows satisfy: tile_row_max < row_max + thresh.
+        # Equivalently: max(tile_row_max - row_max) < thresh (worst-case row
+        # must still be below threshold for the tile to be skippable).
+        max_gap = tl.max(tile_row_max - row_max)  # scalar
+        skip_mask = (max_gap < thresholds).to(tl.int32)  # [PADDED_THRESHOLDS]
         local_skipped += skip_mask
         num_tiles += 1
 

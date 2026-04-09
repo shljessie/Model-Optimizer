@@ -73,6 +73,9 @@ DEFAULT_NEGATIVE_PROMPT = (  # Official Wan 2.2 negative prompt (Chinese)
 
 # Default threshold trials for calibration
 DEFAULT_THRESHOLD_TRIALS = [
+    1e-12,
+    1e-10,
+    1e-8,
     1e-6,
     5e-6,
     1e-5,
@@ -247,6 +250,7 @@ def build_sparse_config(args: argparse.Namespace, num_blocks: int) -> dict:
             "target_sparse_ratio": {"prefill": args.target_sparsity},
             "samples": 1,
             "threshold_trials": DEFAULT_THRESHOLD_TRIALS,
+            "fit_logspace": True,
         }
 
     return config

@@ -137,12 +137,29 @@ class TritonSkipSoftmaxMethod(SparseAttentionMethod):
         """
         if self.calibration_params and self.target_sparse_ratio:
             import math
+            import warnings
 
             params = self.calibration_params.get("prefill", {})
             a = params.get("a", 0)
             b = params.get("b", 0)
             target = self.target_sparse_ratio.get("prefill", 0.5)
             if a > 0 and b > 0:
+                # Warn if target is outside the calibrated range
+                min_s = params.get("min_observed_sparsity")
+                max_s = params.get("max_observed_sparsity")
+                if min_s is not None and target < min_s:
+                    warnings.warn(
+                        f"Target sparsity {target:.1%} is below the minimum observed "
+                        f"during calibration ({min_s:.1%}). The model is extrapolating "
+                        f"and runtime sparsity will likely be higher than the target.",
+                        stacklevel=2,
+                    )
+                elif max_s is not None and target > max_s:
+                    warnings.warn(
+                        f"Target sparsity {target:.1%} is above the maximum observed "
+                        f"during calibration ({max_s:.1%}). The model is extrapolating.",
+                        stacklevel=2,
+                    )
                 return a * math.exp(b * target)
         return None
 
