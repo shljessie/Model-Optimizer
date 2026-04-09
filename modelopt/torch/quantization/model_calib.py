@@ -1581,8 +1581,6 @@ def sequential_calibrate(
     try:
         for layer_idx, layer in enumerate(transformer_layers):
             print_rank_0(f"Calibrating layer {layer_idx + 1}/{len(transformer_layers)}")
-            # Store layer_idx so gptq/GPTQHelper can access it for debugging
-            layer._seq_calib_layer_idx = layer_idx
             layer_inputs = input_getter.get_input_activations(layer, forward_loop)
 
             def _layer_forward_loop(m, _inputs=layer_inputs):

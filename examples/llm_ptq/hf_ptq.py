@@ -248,33 +248,74 @@ def make_calib_dataloader(
 
 
 def _make_mse_holdout_dataloader(args, tokenizer, device):
-    """Create a hold-out dataloader for activation MSE, skipping calibration samples."""
-    from modelopt.torch.utils.dataset_utils import SUPPORTED_DATASET_CONFIG
+    """Create a hold-out dataloader for activation MSE, excluding calibration samples.
+
+    Uses content-based exclusion: reconstructs the exact calibration texts and
+    filters them from the hold-out set.  This is robust to empty/filtered samples
+    that cause pure index-based skipping to under-count and produce overlap.
+    """
+    from modelopt.torch.utils.dataset_utils import SUPPORTED_DATASET_CONFIG, get_dataset_samples
 
     dataset_names, calib_sizes = args.dataset, args.calib_size
     n_mse = args.activation_mse_max_samples
 
-    # Per-split skip = calib samples / number of splits for that dataset
+    # 1. Reconstruct the exact calibration texts (same args as make_calib_dataloader).
+    calib_texts: set[str] = set()
+    for ds_name, cs in zip(dataset_names, calib_sizes):
+        calib_texts.update(get_dataset_samples(ds_name, cs, tokenizer=tokenizer))
+
+    # 2. Per-split skip for efficiency (avoids re-iterating calibration range).
     skip_per_dataset = []
     for ds_name, cs in zip(dataset_names, calib_sizes):
         n_splits = len(
             SUPPORTED_DATASET_CONFIG.get(ds_name, {}).get("config", {}).get("split", [None])
         )
-        skip_per_dataset.append(cs // max(n_splits, 1))
+        skip_per_dataset.append(-(-cs // max(n_splits, 1)))
     skip = max(skip_per_dataset)
 
-    # Distribute hold-out samples proportionally across datasets
+    # 3. Distribute hold-out samples proportionally across datasets.
     total_calib = sum(calib_sizes)
     holdout_sizes = [max(1, int(n_mse * cs / total_calib)) for cs in calib_sizes]
     holdout_sizes[-1] = n_mse - sum(holdout_sizes[:-1])
 
-    return get_dataset_dataloader(
-        dataset_name=dataset_names,
-        tokenizer=tokenizer,
+    # 4. Collect hold-out texts, requesting extras to replace any filtered overlaps.
+    all_holdout_texts: list[str] = []
+    for ds_name, hs in zip(dataset_names, holdout_sizes):
+        texts = get_dataset_samples(
+            ds_name,
+            hs + len(calib_texts),
+            tokenizer=tokenizer,
+            skip_samples=skip,
+        )
+        filtered = [t for t in texts if t not in calib_texts][:hs]
+        all_holdout_texts.extend(filtered)
+
+    # 5. Tokenize and build dataloader (mirrors get_dataset_dataloader logic).
+    tok = copy.deepcopy(tokenizer)
+    batch_encoded = tok(
+        all_holdout_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+    )
+    if device:
+        batch_encoded = batch_encoded.to(device)
+
+    class _InputIdsDataset(torch.utils.data.Dataset):
+        def __init__(self, input_ids):
+            self.input_ids = input_ids
+
+        def __getitem__(self, idx):
+            return {"input_ids": self.input_ids[idx]}
+
+        def __len__(self):
+            return len(self.input_ids)
+
+    return DataLoader(
+        _InputIdsDataset(batch_encoded["input_ids"]),
         batch_size=args.batch_size,
-        num_samples=holdout_sizes,
-        device=device,
-        skip_samples=skip,
+        shuffle=False,
     )
 
 
