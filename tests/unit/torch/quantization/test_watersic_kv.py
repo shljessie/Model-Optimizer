@@ -185,7 +185,13 @@ class TestZsicQuantize:
         """Rescaler path with n_rescaler_iters=5 should produce valid output with low NMSE."""
         W, A, alpha, Sigma_X, L = setup
         W_hat, rate, nmse, Z, gamma = zsic_quantize(
-            W, A, alpha, Sigma_X, L, use_lmmse=True, n_rescaler_iters=5
+            W,
+            A,
+            alpha,
+            Sigma_X,
+            L,
+            use_lmmse=True,
+            n_rescaler_iters=5,
         )
 
         assert W_hat.shape == W.shape

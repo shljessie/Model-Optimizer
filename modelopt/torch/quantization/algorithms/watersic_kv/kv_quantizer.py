@@ -30,12 +30,7 @@ from torch import Tensor
 
 from modelopt.torch.utils import print_rank_0
 
-from .zsic import (
-    _compute_hessian_cholesky,
-    binary_search_c,
-    damp_for_rate,
-    watersic_quantize,
-)
+from .zsic import _compute_hessian_cholesky, binary_search_c, damp_for_rate, watersic_quantize
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -76,7 +71,7 @@ def _compute_importance_weights(P: Tensor, importance_clip: float = 50.0) -> Ten
         Clamp the normalised weights to ``[1/clip, clip]`` to prevent
         extreme outliers.
 
-    Returns
+    Returns:
     -------
     sqrt_w : Tensor (N, 1)
         Square-root importance weights, suitable for left-multiplying the
@@ -121,7 +116,7 @@ def kl_divergence_logits(
     K_q : Tensor (..., N, D)
     temperature : float
 
-    Returns
+    Returns:
     -------
     kl : float
         Mean KL divergence in **bits** (i.e. divided by ln 2).
@@ -130,10 +125,10 @@ def kl_divergence_logits(
     K64 = K.double()
     Kq64 = K_q.double()
 
-    s = Q64 @ K64.transpose(-2, -1) / temperature   # (..., S, N)
+    s = Q64 @ K64.transpose(-2, -1) / temperature  # (..., S, N)
     s_q = Q64 @ Kq64.transpose(-2, -1) / temperature  # (..., S, N)
 
-    log_Z = torch.logsumexp(s, dim=-1)      # (..., S)
+    log_Z = torch.logsumexp(s, dim=-1)  # (..., S)
     log_Z_q = torch.logsumexp(s_q, dim=-1)  # (..., S)
 
     P = torch.softmax(s, dim=-1)  # (..., S, N)
@@ -172,6 +167,7 @@ class WaterSICKVHelper:
         kl_aware: bool = False,
         importance_clip: float = 50.0,
     ):
+        """Initialize helper for a single attention module."""
         self.module = module
         self.name = name
         self.kl_aware = kl_aware
@@ -186,7 +182,7 @@ class WaterSICKVHelper:
 
     def setup(self):
         """Patch ``_quantized_attention`` on the module instance to capture Q/K."""
-        # The original is a @staticmethod on the class – grab the underlying function.
+        # The original is a @staticmethod on the class - grab the underlying function.
         original_fn = type(self.module)._quantized_attention
         self._original_fn = original_fn
 
@@ -231,7 +227,7 @@ class WaterSICKVHelper:
         target_rate: float = 4.0,
         use_lmmse: bool = True,
         n_rescaler_iters: int = 0,
-        sample_frac: float = 0.1,
+        sample_frac: float | None = None,
     ) -> WaterSICKVState:
         """Run WaterSIC quantisation on the collected key activations.
 
@@ -246,7 +242,7 @@ class WaterSICKVHelper:
         sample_frac : float
             Fraction of rows used by :func:`binary_search_c`.
 
-        Returns
+        Returns:
         -------
         WaterSICKVState
         """
@@ -291,6 +287,8 @@ class WaterSICKVHelper:
             _, L, perm = precomputed
 
             # Binary search for the scale factor c.
+            n_tokens = K_h.shape[0]
+            sf = sample_frac if sample_frac is not None else min(0.1, 1000.0 / max(n_tokens, 1))
             c = binary_search_c(
                 K_h,
                 A,
@@ -298,7 +296,7 @@ class WaterSICKVHelper:
                 damp_pct=damp_pct,
                 use_lmmse=use_lmmse,
                 n_rescaler_iters=n_rescaler_iters,
-                sample_frac=sample_frac,
+                sample_frac=sf,
                 _precomputed=precomputed,
             )
 
@@ -317,9 +315,7 @@ class WaterSICKVHelper:
             if sqrt_w is not None:
                 W_hat = W_hat / sqrt_w
 
-            print_rank_0(
-                f"  [{self.name}] head {h}: rate={rate:.2f} bpe, nmse={nmse:.4f}"
-            )
+            print_rank_0(f"  [{self.name}] head {h}: rate={rate:.2f} bpe, nmse={nmse:.4f}")
 
             # Recover per-head state.
             # alpha = c / L.diag() (same as inside watersic_quantize).
@@ -334,9 +330,9 @@ class WaterSICKVHelper:
         mean_rate = sum(rates) / len(rates) if rates else 0.0
 
         state = WaterSICKVState(
-            Z=torch.stack(Z_heads),           # (H, B*S_k, D)
-            alpha=torch.stack(alpha_heads),    # (H, D)
-            gamma=torch.stack(gamma_heads),    # (H, D)
+            Z=torch.stack(Z_heads),  # (H, B*S_k, D)
+            alpha=torch.stack(alpha_heads),  # (H, D)
+            gamma=torch.stack(gamma_heads),  # (H, D)
             perm=torch.stack(perm_heads) if perm_heads and perm_heads[0] is not None else None,
             rate=mean_rate,
         )

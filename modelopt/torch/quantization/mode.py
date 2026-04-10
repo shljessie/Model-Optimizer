@@ -66,6 +66,7 @@ from .model_calib import (
     sequential_calibrate,
     smoothquant,
     svdquant,
+    watersic_kv,
 )
 
 __all__ = ["BaseCalibrateModeDescriptor"]
@@ -240,8 +241,8 @@ def wrapped_calib_func(
         if sequential:
             if forward_loop is None:
                 raise ValueError("forward_loop is required for calibration but got None.")
-            assert method in ["max", "gptq"], (
-                f"Sequential calibration currently only supports max and gptq calibration, got {method}"
+            assert method in ["max", "gptq", "watersic_kv"], (
+                f"Sequential calibration currently only supports max, gptq, and watersic_kv calibration, got {method}"
             )
             # Wrap with sequential processing
             sequential_calibrate(
@@ -502,3 +503,17 @@ class GPTQModeDescriptor(BaseCalibrateModeDescriptor):
         return GPTQCalibConfig
 
     _calib_func = gptq
+
+
+@CalibrateModeRegistry.register_mode
+class WaterSICKVModeDescriptor(BaseCalibrateModeDescriptor):
+    """Mode for WaterSIC KV-cache quantization algorithm."""
+
+    @property
+    def config_class(self) -> type[QuantizeAlgorithmConfig]:
+        """Specifies the config class for the mode."""
+        from .algorithms.watersic_kv.config import WaterSICKVCalibConfig
+
+        return WaterSICKVCalibConfig
+
+    _calib_func = watersic_kv

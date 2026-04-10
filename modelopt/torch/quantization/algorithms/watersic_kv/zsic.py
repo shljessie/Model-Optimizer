@@ -283,7 +283,13 @@ def watersic_quantize(
     alpha = c / L.diag()
 
     W_hat, rate, nmse, Z, gamma = zsic_quantize(
-        W, A, alpha, Sigma_X, L, use_lmmse=use_lmmse, n_rescaler_iters=n_rescaler_iters
+        W,
+        A,
+        alpha,
+        Sigma_X,
+        L,
+        use_lmmse=use_lmmse,
+        n_rescaler_iters=n_rescaler_iters,
     )
 
     # Undo permutation.
