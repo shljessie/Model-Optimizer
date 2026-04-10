@@ -46,7 +46,7 @@ def filter_func_default(name: str) -> bool:
 
 def check_conv_and_mha(backbone, if_fp4, quantize_mha):
     for name, module in backbone.named_modules():
-        if isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)) and if_fp4:
+        if isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d)) and if_fp4:
             module.weight_quantizer.disable()
             module.input_quantizer.disable()
 
