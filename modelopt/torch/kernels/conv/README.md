@@ -14,7 +14,7 @@ This kernel is integrated into `modelopt.torch.quantization` via `_QuantConv3d` 
 
 | Stage | Precision |
 |-------|-----------|
-| Input / output tensors | FP32 (user-facing) |
+| Input / output tensors | FP32, FP16, or BF16 (dtype is preserved) |
 | Internal compute | BF16 via WMMA m16n16k16 tensor cores |
 | Accumulation | FP32 |
 | FP4 activation quantization | E2M1 values, FP8 E4M3 scales |
@@ -105,7 +105,7 @@ Standalone FP4 (E2M1) blockwise fake quantization with FP8 E4M3 scale quantizati
 
 ```bash
 # Run tests (requires GPU)
-python -m pytest modelopt/torch/kernels/conv/test_implicit_gemm.py -v
+python -m pytest tests/gpu/torch/quantization/kernels/test_implicit_gemm.py -v
 
 # Run benchmarks
 python -m modelopt.torch.kernels.conv.bench_implicit_gemm                    # default shapes
