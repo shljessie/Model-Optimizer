@@ -129,13 +129,15 @@ class QuantCustomModule(OriginalModule):
 
 ## Pattern 2: MoE Models
 
-**Standard MoE** (per-expert `nn.Linear` in a `ModuleList` with `gate` + `experts`): Auto-detected by `register_sparse_moe_on_the_fly`. No custom code needed — amax sync and calibration coverage are handled automatically.
+**Most MoE models are auto-detected** — ModelOpt handles two common patterns automatically:
 
-**Custom MoE** requires patching. Read the model source to understand how expert weights are stored and computed, then find the closest pattern in the plugin (`modelopt/torch/quantization/plugins/huggingface.py`):
+- **transformers >= 5.0**: Unified fused experts (`gate_up_proj` + `down_proj` 3D tensors) → auto-detected by `register_fused_experts_on_the_fly`, handled by `_QuantFusedExperts`. Covers Mixtral, Qwen, DeepSeek, Jamba, OlMoE, etc.
+- **transformers < 5.0**: Sequential per-expert `nn.Linear` with `gate` + `experts` → auto-detected by `register_sparse_moe_on_the_fly`.
+
+**Custom MoE** (non-standard layout not matching auto-detection) requires patching. Find the closest pattern in the plugin (`modelopt/torch/quantization/plugins/huggingface.py`):
 
 | MoE design | Strategy | Plugin example |
 | --- | --- | --- |
-| Fused weights + per-expert dispatch loop | Expand to per-expert `nn.Linear` | `_QuantQwen35MoeExperts` |
 | Fused weights + `torch.bmm` | Add `TensorQuantizer` around bmm | `_QuantLlama4TextExperts` |
 | Fused weights + functional interception | Intercept matmul ops | `_QuantGptOssExperts` |
 | Fused 2D weights (experts stacked in rows) | Two-level expansion | `_QuantDbrxExpertGLU` |
@@ -339,3 +341,4 @@ tokenizer.save_pretrained(output_path)
 - **Check quantizer summary**: `mtq.print_quant_summary(model)` shows which quantizers are enabled/disabled
 - **Inspect dtypes**: After loading, iterate `model.named_parameters()` and check for unexpected FP8 tensors
 - **Watch for silent disabling**: A misconfigured wildcard pattern can silently disable quantizers — always verify the summary
+- **Read pip errors carefully**: `ResolutionImpossible` means dependency conflict (try `--no-deps`), NOT network failure. Check for `Connection refused`/`Name resolution failed` before concluding network is down

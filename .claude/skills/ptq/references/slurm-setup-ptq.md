@@ -42,6 +42,19 @@ export PYTHONPATH=/path/to/Model-Optimizer:$PYTHONPATH
 
 If `PYTHONPATH` doesn't work due to missing compiled extensions, fall back to `pip install -e ".[hf]" --no-build-isolation`.
 
+**Watch for pip dependency conflicts** — NGC containers set `PIP_CONSTRAINT` to pin versions, causing `ResolutionImpossible` errors. Unset it first so pip can resolve freely:
+
+```bash
+unset PIP_CONSTRAINT
+pip install transformers   # now resolves with new deps included
+```
+
+If that still conflicts, fall back to `--no-deps` (skips new deps — may need to add missing ones manually):
+
+```bash
+pip install transformers --no-deps
+```
+
 ---
 
 ## 2. GPU Sizing
