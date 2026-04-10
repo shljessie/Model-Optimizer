@@ -1,25 +1,31 @@
-# Conv3D Implicit GEMM (Experimental)
+# Conv3D Implicit GEMM
 
-Experimental Conv3D kernel prototype using implicit GEMM, with optional fused FP4 fake quantization for activations.
+Conv3D kernel using implicit GEMM with BF16 WMMA tensor cores and optional fused FP4 (E2M1) fake quantization.
 
-This code is kept under `experimental/` by design and is **not** part of the stable `modelopt.torch.quantization` API.
+This kernel is integrated into `modelopt.torch.quantization` via `_QuantConv3d` — when NVFP4 quantization is applied to an `nn.Conv3d` layer through ModelOpt PTQ, the implicit GEMM path is used automatically. We have only tested it on VAE Conv3D layers from video generation models (e.g. Wan2.2).
 
-## Model Support
+## Requirements
 
-| Model/Framework | Supported | Notes |
-|-----------------|-----------|-------|
-| Video diffusion VAE Conv3D layers | Tested | Validated on VAE encoder/decoder Conv3D layers in video diffusion models |
-| Generic LLM backbones | No | Conv3D path is not relevant |
-| End-to-end ModelOpt PTQ/QAT pipeline | No | Not wired into formal quantization/export/compress flows |
+- **GPU:** SM80+ (Ampere or newer) for BF16 WMMA tensor cores
+- **PyTorch:** CUDA toolkit with JIT C++ extension support (`torch.utils.cpp_extension`)
+- **Grouped convolution is not supported** (groups must be 1)
 
-## Deployment
+## Data Types
 
-| Framework | Supported | Notes |
-|-----------|-----------|-------|
-| TensorRT-LLM | No | No formal export integration for this kernel path |
-| vLLM | No | No integration |
-| SGLang | No | No integration |
-| PyTorch runtime (CUDA) | Yes (experimental) | JIT-compiles CUDA extension on first use |
+| Stage | Precision |
+|-------|-----------|
+| Input / output tensors | FP32 (user-facing) |
+| Internal compute | BF16 via WMMA m16n16k16 tensor cores |
+| Accumulation | FP32 |
+| FP4 activation quantization | E2M1 values, FP8 E4M3 scales |
+
+## Integration with ModelOpt Quantization
+
+When NVFP4 quantization is configured on a `Conv3d` layer via ModelOpt PTQ, the implicit GEMM kernel is used automatically during quantized inference. The integration is in `_QuantConv3d` (`modelopt/torch/quantization/nn/modules/quant_conv.py`):
+
+- During **calibration**, the standard cuDNN path is used (faster).
+- During **quantized inference** with NVFP4 input and weight quantizers, the kernel fuses activation FP4 quantization inside the GEMM.
+- For all other quantization configs, the default cuDNN path is used as fallback.
 
 ## Usage
 
@@ -67,7 +73,9 @@ out_q = conv3d_implicit_gemm_cuda(
 
 ## API
 
-Function: `conv3d_implicit_gemm_cuda(...)` from `experimental/conv/implicit_gemm_cuda.py`
+### `conv3d_implicit_gemm_cuda`
+
+`from modelopt.torch.kernels.conv.implicit_gemm_cuda import conv3d_implicit_gemm_cuda`
 
 | Parameter | Description |
 |-----------|-------------|
@@ -81,23 +89,55 @@ Function: `conv3d_implicit_gemm_cuda(...)` from `experimental/conv/implicit_gemm
 | `quant_act` | Enable FP4 fake quantization on activations |
 | `fp4_block_size` | FP4 quantization block size (`16`, `32`, `64`, `128`, or `256`) |
 
+### `fp4_fake_quant`
+
+`from modelopt.torch.kernels.conv.implicit_gemm_cuda import fp4_fake_quant`
+
+Standalone FP4 (E2M1) blockwise fake quantization with FP8 E4M3 scale quantization. Uses the same CUDA device functions as the fused path inside the GEMM kernel.
+
+| Parameter | Description |
+|-----------|-------------|
+| `x` | Input tensor (any shape; `numel` must be divisible by `block_size`) |
+| `global_amax` | Scalar tensor — global abs max for scale computation |
+| `block_size` | Number of elements per FP4 quantization block (default `16`) |
+
+## Testing and Benchmarking
+
+```bash
+# Run tests (requires GPU)
+python -m pytest modelopt/torch/kernels/conv/test_implicit_gemm.py -v
+
+# Run benchmarks
+python -m modelopt.torch.kernels.conv.bench_implicit_gemm                    # default shapes
+python -m modelopt.torch.kernels.conv.bench_implicit_gemm --shapes wan22     # Wan2.2 VAE shapes
+python -m modelopt.torch.kernels.conv.bench_implicit_gemm --shapes all       # all presets
+```
+
 ## Status
 
-Current state: **Prototype**
+Current state: **Integrated** (registered in `QuantModuleRegistry`, auto-dispatched for NVFP4 Conv3D)
 
 Known limitations:
 
-- API is unstable and may change without notice.
-- Not registered in core quantization module registries.
-- Not covered by formal export/compress integration.
-- CUDA extension compile latency on first invocation.
-- Validation and performance coverage are limited to local experiments.
+- CUDA extension compile latency on first invocation (~seconds).
+- Grouped convolution (`groups > 1`) is not supported.
+- BF16 rounding error accumulates with the K dimension — expect max abs diff scaling roughly as `sqrt(K)` compared to cuDNN FP32.
+- Inference only (`@torch.no_grad`) — not suitable for QAT backward pass.
 
 ## Notes
 
-- The CUDA kernel is JIT-compiled on first call (can take several seconds).
+- The CUDA kernel is JIT-compiled on first call via `torch.utils.cpp_extension.load()`.
 - Output shape matches `torch.nn.functional.conv3d`.
-- FP4 path applies quantize-dequantize in-kernel for activation tiles.
+- FP4 path applies quantize-dequantize in-kernel for activation tiles (no extra global memory pass).
+- Tile config: BLOCK_M=64, BLOCK_N=64, BLOCK_K=256, 8 warps (256 threads), ~70 KB shared memory per block.
+
+## Files
+
+| File | Role |
+|------|------|
+| `implicit_gemm_cuda.py` | Python API and JIT compilation |
+| `implicit_gemm_kernel.cu` | CUDA kernel (BF16 WMMA + FP4 quantization) |
+| `implicit_gemm_binding.cpp` | PyTorch C++ extension binding |
 
 ## References
 
