@@ -113,9 +113,7 @@ def create_tiny_qwen3_moe_dir(
 ) -> Path:
     qwen3_moe_dir = Path(tmp_path) / "tiny_qwen3_moe"
     if with_tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(
-            "hf-internal-testing/tiny-random-LlamaForCausalLM"
-        )
+        tokenizer = tokenizer = get_tiny_tokenizer()
         tokenizer.save_pretrained(qwen3_moe_dir)
         config_kwargs["vocab_size"] = tokenizer.vocab_size
     get_tiny_qwen3_moe(**config_kwargs).save_pretrained(qwen3_moe_dir)
@@ -148,9 +146,7 @@ def create_tiny_gpt_oss_dir(
 ) -> Path:
     gpt_oss_dir = Path(tmp_path) / "tiny_gpt_oss"
     if with_tokenizer:
-        tokenizer = AutoTokenizer.from_pretrained(
-            "hf-internal-testing/tiny-random-LlamaForCausalLM"
-        )
+        tokenizer = tokenizer = get_tiny_tokenizer()
         tokenizer.save_pretrained(gpt_oss_dir)
         config_kwargs["vocab_size"] = tokenizer.vocab_size
     get_tiny_gpt_oss(**config_kwargs).save_pretrained(gpt_oss_dir)
