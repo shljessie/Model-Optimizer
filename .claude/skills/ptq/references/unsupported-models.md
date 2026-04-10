@@ -49,7 +49,7 @@ print(type(cfg).__name__)
      grep -r "class <ArchName>" /tmp/transformers-main/src/transformers/models/
      ```
 
-     - **Found** → install with deps: `pip install /tmp/transformers-main`, then re-run `AutoConfig.from_pretrained()`. **Important**: if ModelOpt is already installed, its `[hf]` extras may have pinned an older transformers. Install ModelOpt first, then upgrade transformers **after** (with deps, not `--no-deps`) so compatible `huggingface_hub` and other transitive deps are pulled in.
+     - **Found** → install: `pip install /tmp/transformers-main`, then re-run `AutoConfig.from_pretrained()`. For container dependency issues, see `references/slurm-setup-ptq.md` (PIP_CONSTRAINT, PYTHONPATH).
      - **Not found** → ask the user: *"The checkpoint uses `<ArchName>` which isn't in released or main-branch transformers. Do you have a private fork or custom modeling code?"*
 
 - **No `config.json`** → not a standard HF checkpoint. List the directory for README or `.py` files. If nothing useful, ask the user for the modeling code.
