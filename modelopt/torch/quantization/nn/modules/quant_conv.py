@@ -100,7 +100,7 @@ class _QuantConv3d(QuantLinearConvBase):
             and _is_nvfp4_quantizer(self.weight_quantizer)
         ):
             try:
-                from experimental.conv.implicit_gemm_cuda import (
+                from modelopt.torch.kernels.conv.implicit_gemm_cuda import (
                     conv3d_implicit_gemm_cuda,  # noqa: F401
                 )
 
@@ -112,7 +112,7 @@ class _QuantConv3d(QuantLinearConvBase):
 
     def _implicit_gemm_forward(self, input):
         """Run NVFP4 implicit GEMM kernel. Input may already be padded."""
-        from experimental.conv.implicit_gemm_cuda import conv3d_implicit_gemm_cuda
+        from modelopt.torch.kernels.conv.implicit_gemm_cuda import conv3d_implicit_gemm_cuda
 
         act_amax = self.input_quantizer._get_amax(input)
         weight = _nvfp4_quantize_weight_along_k(self.weight, self.weight_quantizer)

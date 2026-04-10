@@ -26,7 +26,7 @@ This code is kept under `experimental/` by design and is **not** part of the sta
 ```python
 import torch
 
-from experimental.conv.implicit_gemm_cuda import conv3d_implicit_gemm_cuda
+from modelopt.torch.kernels.conv.implicit_gemm_cuda import conv3d_implicit_gemm_cuda
 from modelopt.torch.quantization.tensor_quant import dynamic_block_quantize_op
 
 x = torch.randn(1, 128, 21, 60, 106, device="cuda")
