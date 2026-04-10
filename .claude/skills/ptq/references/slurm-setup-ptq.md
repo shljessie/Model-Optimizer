@@ -46,13 +46,13 @@ If `PYTHONPATH` doesn't work due to missing compiled extensions, fall back to `p
 
 ```bash
 unset PIP_CONSTRAINT
-pip install transformers   # now resolves with new deps included
+pip install -U transformers   # now upgrades and resolves with new deps included
 ```
 
 If that still conflicts, fall back to `--no-deps` (skips new deps — may need to add missing ones manually):
 
 ```bash
-pip install transformers --no-deps
+pip install -U transformers --no-deps
 ```
 
 ---
