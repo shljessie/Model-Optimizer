@@ -552,9 +552,7 @@ def _concatenate_experts_into_dense_ffn(
     child_block_config: BlockConfig,
     parent_block_config: BlockConfig,
 ) -> dict[str, torch.Tensor]:
-    assert child_block_config.ffn.gated and child_block_config.ffn.hidden_act == "silu", (
-        "Llama4 experts use SwiGLU."
-    )
+    # Llama4 experts use SwiGLU (gated + silu); FFNConfig does not track these fields directly.
 
     # verify sizes
     child_intermediate_size = child_block_config.ffn.intermediate_size
@@ -918,6 +916,7 @@ def _apply_hidden_size_pruning(
         return out_state_dict
 
     # Load channel ranking if needed
+    channel_ranking = None
     if hidden_size_init_mode == HiddenSizeInitMode.PruneByChannelRanking:
         if channel_importance_path is not None:
             with open(channel_importance_path, "r") as f:

@@ -395,13 +395,15 @@ def _assert_valid_config(args, puzzle_profile):
         "objective",
         "output_path",
     )
-    missing_args = [arg for arg in required_args if arg not in args or getattr(args, arg) is None]
+    missing_args = [
+        arg for arg in required_args if not hasattr(args, arg) or getattr(args, arg) is None
+    ]
     if missing_args:
         mprint(f"error: The following arguments are required: {', '.join(missing_args)}")
         sys.exit(1)
 
     # Make sure we have specified subblock_stats_args
-    if "subblock_stats_args" not in args and "subblock_stats_args" not in puzzle_profile:
+    if not hasattr(args, "subblock_stats_args") and "subblock_stats_args" not in puzzle_profile:
         mprint(
             "error: Must specify `subblock_stats_args` in either puzzle_profile or as a commandline arg."
         )
@@ -409,8 +411,8 @@ def _assert_valid_config(args, puzzle_profile):
 
     # Make sure we have specified constraints
     if (
-        "mip_constraints" not in args
-        and "human_constraints" not in args
+        not hasattr(args, "mip_constraints")
+        and not hasattr(args, "human_constraints")
         and "mip_constraints" not in puzzle_profile
         and "human_constraints" not in puzzle_profile
     ):

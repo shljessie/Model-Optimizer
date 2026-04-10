@@ -344,13 +344,17 @@ def _write_file_process_safe(
     and writes the content to the file. It can be _write_text (defined above), or torch.save,
     or a similar function (not safetensors.torch.save_file since it expects a path).
     """
-    with open(path, "wb") as f:
+    # Open with "ab+" so the file is not truncated before the lock is acquired.
+    # Once we hold the exclusive lock we seek to the start and truncate explicitly.
+    with open(path, "ab+") as f:
         # Try to acquire an exclusive, non-blocking lock
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return  # Exit immediately if the lock is not acquired
 
+        f.seek(0)
+        f.truncate()
         write_fn(content, f)  # Write the content if lock is acquired
         f.flush()  # Ensure data is written to disk
 

@@ -148,10 +148,12 @@ class MoEConfig(BaseDataclass):
         if self.num_local_experts <= 0:
             raise ValueError(f"num_local_experts must be positive, got {self.num_local_experts}")
         if self.num_experts_per_tok <= 0:
-            raise ValueError(f"top_k must be positive, got {self.top_k}")
+            raise ValueError(
+                f"num_experts_per_tok must be positive, got {self.num_experts_per_tok}"
+            )
         if self.num_experts_per_tok > self.num_local_experts:
             raise ValueError(
-                f"top_k ({self.top_k}) cannot be greater than num_local_experts ({self.num_local_experts})"
+                f"num_experts_per_tok ({self.num_experts_per_tok}) cannot be greater than num_local_experts ({self.num_local_experts})"
             )
         # if self.router_aux_loss_coef < 0:
         #     raise ValueError(f"router_aux_loss_coef must be non-negative, got {self.router_aux_loss_coef}")

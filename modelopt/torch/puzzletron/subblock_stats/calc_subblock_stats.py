@@ -413,7 +413,12 @@ def _load_subblock_configs_from_subblock_library(master_puzzle_dir: Path) -> lis
     )
     attention_configs = subblocks_df["attention_config"].dropna().drop_duplicates().tolist()
     ffn_configs = subblocks_df["ffn_config"].dropna().drop_duplicates().tolist()
-    subblock_configs = attention_configs + ffn_configs
+    # Wrap in the same dict format expected by calculate_subblock_stats() callers.
+    # Use parent_layer_indices=(-1,) to indicate no specific parent layer.
+    subblock_configs = [
+        immutabledict({"subblock_config": cfg, "parent_layer_indices": (-1,)})
+        for cfg in attention_configs + ffn_configs
+    ]
     return subblock_configs
 
 

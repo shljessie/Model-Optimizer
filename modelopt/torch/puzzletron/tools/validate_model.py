@@ -236,7 +236,8 @@ def prepare_dataloader(
         tokenizer_name = getattr(args, "tokenizer_name", None)
         assert (tokenizer_name is not None) or (args.model_name_or_path is not None)
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name or args.model_name_or_path, trust_remote_code=True
+            tokenizer_name or args.model_name_or_path,
+            trust_remote_code=getattr(args, "trust_remote_code", False),
         )
 
     val_dataloader = create_validation_dataloader(
