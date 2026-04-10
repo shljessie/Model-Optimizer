@@ -241,8 +241,8 @@ def wrapped_calib_func(
         if sequential:
             if forward_loop is None:
                 raise ValueError("forward_loop is required for calibration but got None.")
-            assert method in ["max", "gptq", "watersic_kv"], (
-                f"Sequential calibration currently only supports max, gptq, and watersic_kv calibration, got {method}"
+            assert method in ["max", "gptq"], (
+                f"Sequential calibration currently only supports max and gptq calibration, got {method}"
             )
             # Wrap with sequential processing
             sequential_calibrate(

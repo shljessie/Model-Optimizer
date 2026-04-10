@@ -1715,15 +1715,18 @@ def watersic_kv(
         n_rescaler_iters: Diagonal rescaler optimization iterations.
         sample_frac: Row subsampling for binary search (None = auto).
     """
-    from modelopt.torch.quantization.algorithms.watersic_kv.kv_quantizer import WaterSICKVHelper
+    from modelopt.torch.quantization.algorithms.watersic_kv.helper import WaterSICKVHelper
     from modelopt.torch.quantization.plugins.huggingface import _QuantAttention
 
     total_start = time.time()
 
     attn_modules = [(n, m) for n, m in model.named_modules() if isinstance(m, _QuantAttention)]
     if not attn_modules:
-        print_rank_0("No _QuantAttention modules found, skipping WaterSIC KV")
-        return
+        raise ValueError(
+            "WaterSIC KV-cache quantization was requested, but no _QuantAttention modules "
+            "were found. Ensure the model has been quantized with KV-cache quantizers enabled "
+            "before running WaterSIC KV calibration."
+        )
 
     print_rank_0(f"WaterSIC KV: Found {len(attn_modules)} attention layers")
 
@@ -1736,10 +1739,11 @@ def watersic_kv(
         helper.setup()
 
     print_rank_0("Collecting Q, K activations...")
-    forward_loop(model)
-
-    for helper in helpers.values():
-        helper.cleanup()
+    try:
+        forward_loop(model)
+    finally:
+        for helper in helpers.values():
+            helper.cleanup()
 
     # Phase 2: Run WaterSIC per layer
     print_rank_0("Running WaterSIC quantization...")

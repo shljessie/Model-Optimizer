@@ -16,8 +16,7 @@
 """Core ZSIC (Zero-Shot Integer Compression) algorithm for WaterSIC KV-cache quantization.
 
 This is a pure math module with no Model-Optimizer dependencies.  It implements
-the sequential integer coding algorithm described in the WaterSIC paper, ported
-from psx-vfp commit 39073b1.
+the sequential integer coding algorithm described in the WaterSIC paper.
 """
 
 from __future__ import annotations
@@ -26,10 +25,6 @@ import math
 
 import torch
 from torch import Tensor
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def damp_for_rate(target_rate: float, base: float = 1e-4, knee: float = 5.0) -> float:
@@ -51,15 +46,22 @@ def compute_entropy(Z: Tensor) -> float:
 
 
 def compute_output_nmse(W: Tensor, W_q: Tensor, A: Tensor) -> float:
-    """Normalised MSE measured in the output space: ``||err @ A||^2 / ||W @ A||^2``."""
-    err = (W - W_q) @ A
-    ref = W @ A
-    return (err.norm() ** 2 / ref.norm() ** 2).item()
+    """Normalised MSE measured in the output space: ``||err @ A||^2 / ||W @ A||^2``.
 
-
-# ---------------------------------------------------------------------------
-# Hessian / Cholesky
-# ---------------------------------------------------------------------------
+    Uses the trace identity ``||M @ N||_F^2 = tr(M^T M  N N^T)`` to avoid
+    materialising the ``(a, a)`` output matrix, which can be prohibitively large
+    when the number of tokens *a* is high (e.g. real-model calibration).
+    Only ``(n, n)`` intermediates are needed, where *n* = ``A.shape[0]``.
+    """
+    Sigma_X = A @ A.T  # (n, n)
+    delta = W - W_q  # (a, n)
+    err_gram = delta.T @ delta  # (n, n)
+    ref_gram = W.T @ W  # (n, n)
+    err_sq = (err_gram * Sigma_X).sum()
+    ref_sq = (ref_gram * Sigma_X).sum()
+    if ref_sq < 1e-30:
+        return float("inf")
+    return (err_sq / ref_sq).item()
 
 
 def _compute_hessian_cholesky(
@@ -104,16 +106,19 @@ def _compute_hessian_cholesky(
     try:
         L = torch.linalg.cholesky(H)
     except torch.linalg.LinAlgError:
-        # Retry with 10x more damping if the first attempt was singular.
-        H += 10 * damp * torch.eye(H.shape[0], device=A.device, dtype=A.dtype)
-        L = torch.linalg.cholesky(H)
+        retry_damp = max(10 * damp, 1e-6)
+        H += retry_damp * torch.eye(H.shape[0], device=A.device, dtype=A.dtype)
+        try:
+            L = torch.linalg.cholesky(H)
+        except torch.linalg.LinAlgError as e:
+            raise RuntimeError(
+                f"Cholesky factorization failed even with increased damping "
+                f"({retry_damp:.2e}). The activation matrix (shape {tuple(A.shape)}) "
+                f"may be degenerate. Check that calibration data produces non-trivial "
+                f"activations."
+            ) from e
 
     return Sigma_X, L, perm
-
-
-# ---------------------------------------------------------------------------
-# Rescaler optimisation
-# ---------------------------------------------------------------------------
 
 
 def _optimize_rescalers(
@@ -155,11 +160,6 @@ def _optimize_rescalers(
         gamma = num_g / den_g.clamp(min=1e-20)
 
     return t.unsqueeze(1) * W_hat_0 * gamma.unsqueeze(0)
-
-
-# ---------------------------------------------------------------------------
-# Core sequential coding
-# ---------------------------------------------------------------------------
 
 
 def zsic_quantize(
@@ -234,11 +234,6 @@ def zsic_quantize(
     return W_hat, rate, nmse, Z, gamma
 
 
-# ---------------------------------------------------------------------------
-# WaterSIC interface
-# ---------------------------------------------------------------------------
-
-
 def watersic_quantize(
     W: Tensor,
     A: Tensor,
@@ -300,11 +295,6 @@ def watersic_quantize(
         gamma = gamma[inv_perm]
 
     return W_hat, rate, nmse, Z, gamma
-
-
-# ---------------------------------------------------------------------------
-# Binary search for c
-# ---------------------------------------------------------------------------
 
 
 def binary_search_c(

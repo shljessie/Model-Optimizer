@@ -105,11 +105,11 @@ class WaterSICKVCalibConfig(QuantizeAlgorithmConfig):
     )
 
     use_sequential: bool = ModeloptField(
-        default=True,
+        default=False,
         title="Enable sequential layer-by-layer calibration.",
         description=(
-            "When True, the WaterSIC calibration is applied layer-by-layer in "
-            "decoder-block order so that each layer's quantized KV representation "
-            "is propagated to subsequent layers before they are calibrated."
+            "Must be False for WaterSIC. Unlike weight quantization, KV-cache "
+            "quantization does not have progressive error accumulation between "
+            "layers, so sequential calibration is not needed."
         ),
     )

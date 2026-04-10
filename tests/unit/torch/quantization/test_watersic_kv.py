@@ -274,10 +274,9 @@ class TestBinarySearchC:
 # KV Quantizer Helper tests
 # ---------------------------------------------------------------------------
 
-from modelopt.torch.quantization.algorithms.watersic_kv.kv_quantizer import (
+from modelopt.torch.quantization.algorithms.watersic_kv.helper import (
     WaterSICKVState,
     _compute_importance_weights,
-    kl_divergence_logits,
 )
 
 # ---------------------------------------------------------------------------
@@ -323,32 +322,6 @@ class TestComputeImportanceWeights:
 
 
 # ---------------------------------------------------------------------------
-# TestKlDivergenceLogits
-# ---------------------------------------------------------------------------
-
-
-class TestKlDivergenceLogits:
-    """Tests for :func:`kl_divergence_logits`."""
-
-    def test_identical_keys_zero_kl(self):
-        """KL divergence should be zero when K_q == K."""
-        torch.manual_seed(42)
-        Q = torch.randn(2, 8, 4)
-        K = torch.randn(2, 12, 4)
-        kl = kl_divergence_logits(Q, K, K)
-        assert kl == pytest.approx(0.0, abs=1e-7)
-
-    def test_different_keys_positive_kl(self):
-        """KL divergence should be positive when K_q != K."""
-        torch.manual_seed(42)
-        Q = torch.randn(2, 8, 4)
-        K = torch.randn(2, 12, 4)
-        K_q = K + 0.5 * torch.randn_like(K)
-        kl = kl_divergence_logits(Q, K, K_q)
-        assert kl > 0.0
-
-
-# ---------------------------------------------------------------------------
 # TestWaterSICKVState
 # ---------------------------------------------------------------------------
 
@@ -384,7 +357,7 @@ class TestWaterSICKVCalibConfig:
         assert cfg.target_rate == 2.0
         assert cfg.kl_aware is False
         assert cfg.use_lmmse is True
-        assert cfg.use_sequential is True
+        assert cfg.use_sequential is False
 
     def test_custom_values(self):
         from modelopt.torch.quantization.algorithms.watersic_kv.config import WaterSICKVCalibConfig

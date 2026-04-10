@@ -32,10 +32,6 @@ from modelopt.torch.utils import print_rank_0
 
 from .zsic import _compute_hessian_cholesky, binary_search_c, damp_for_rate, watersic_quantize
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class WaterSICKVState:
@@ -51,11 +47,6 @@ class WaterSICKVState:
     """Column permutation (or *None*)."""
     rate: float
     """Achieved coding rate (bits per element)."""
-
-
-# ---------------------------------------------------------------------------
-# Importance weighting
-# ---------------------------------------------------------------------------
 
 
 def _compute_importance_weights(P: Tensor, importance_clip: float = 50.0) -> Tensor:
@@ -90,63 +81,6 @@ def _compute_importance_weights(P: Tensor, importance_clip: float = 50.0) -> Ten
     return w.sqrt().unsqueeze(1)  # (N, 1)
 
 
-# ---------------------------------------------------------------------------
-# KL divergence in logit space
-# ---------------------------------------------------------------------------
-
-
-def kl_divergence_logits(
-    Q: Tensor,
-    K: Tensor,
-    K_q: Tensor,
-    temperature: float = 1.0,
-) -> float:
-    """Compute the KL divergence between attention distributions induced by *K* and *K_q*.
-
-    Uses the logit identity to avoid materialising the full attention matrix:
-
-        KL(P || P_q) = E_x[ P^T (s - s_q) + logsumexp(s_q) - logsumexp(s) ]
-
-    where ``s = Q K^T / temperature`` and ``s_q = Q K_q^T / temperature``.
-
-    Parameters
-    ----------
-    Q : Tensor (..., S, D)
-    K : Tensor (..., N, D)
-    K_q : Tensor (..., N, D)
-    temperature : float
-
-    Returns:
-    -------
-    kl : float
-        Mean KL divergence in **bits** (i.e. divided by ln 2).
-    """
-    Q64 = Q.double()
-    K64 = K.double()
-    Kq64 = K_q.double()
-
-    s = Q64 @ K64.transpose(-2, -1) / temperature  # (..., S, N)
-    s_q = Q64 @ Kq64.transpose(-2, -1) / temperature  # (..., S, N)
-
-    log_Z = torch.logsumexp(s, dim=-1)  # (..., S)
-    log_Z_q = torch.logsumexp(s_q, dim=-1)  # (..., S)
-
-    P = torch.softmax(s, dim=-1)  # (..., S, N)
-
-    # KL per query position: sum_n P_n (s_n - s_q_n) + log_Z_q - log_Z
-    kl_per_query = (P * (s - s_q)).sum(dim=-1) + log_Z_q - log_Z  # (..., S)
-
-    # Convert nats to bits and return mean.
-    import math
-
-    return (kl_per_query.mean() / math.log(2)).item()
-
-
-# ---------------------------------------------------------------------------
-# WaterSICKVHelper
-# ---------------------------------------------------------------------------
-
-
 class WaterSICKVHelper:
     """Hook-based helper that captures Q/K activations and runs WaterSIC quantisation.
 
@@ -177,8 +111,6 @@ class WaterSICKVHelper:
         self.collected_K: list[Tensor] = []
 
         self._original_fn = None
-
-    # ----- patching --------------------------------------------------
 
     def setup(self):
         """Patch ``_quantized_attention`` on the module instance to capture Q/K."""
@@ -220,8 +152,6 @@ class WaterSICKVHelper:
         if "_quantized_attention" in vars(self.module):
             delattr(self.module, "_quantized_attention")
 
-    # ----- quantisation -----------------------------------------------
-
     def quantize(
         self,
         target_rate: float = 4.0,
@@ -246,6 +176,13 @@ class WaterSICKVHelper:
         -------
         WaterSICKVState
         """
+        if not self.collected_Q or not self.collected_K:
+            raise RuntimeError(
+                f"[{self.name}] No Q/K activations were collected during the calibration "
+                f"forward pass. Ensure setup() was called before the forward loop and that "
+                f"the forward loop passes data through this attention layer."
+            )
+
         # Concatenate collected activations across calibration batches.
         # Each tensor is (batch, n_heads, seq, d_head).
         Q_all = torch.cat(self.collected_Q, dim=0)  # (B_total, H, S_q, D)
@@ -262,14 +199,17 @@ class WaterSICKVHelper:
 
         damp_pct = damp_for_rate(target_rate)
 
+        # Run quantization on GPU if available (much faster for real models).
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         for h in range(H):
             # K_h shape: (B, S_k, D) → treat as weight matrix (a, n) where
             # a = B * S_k (token-batch dimension) and n = D (head dimension).
-            K_h = K_all[:, h, :, :].reshape(-1, D).double()  # (B*S_k, D)
+            K_h = K_all[:, h, :, :].reshape(-1, D).to(device=device, dtype=torch.float64)
 
             # Activation matrix: use Q_h^T so the Hessian reflects query-key
             # interaction.  A shape: (D, B*S_q).
-            Q_h = Q_all[:, h, :, :].reshape(-1, D).double()  # (B*S_q, D)
+            Q_h = Q_all[:, h, :, :].reshape(-1, D).to(device=device, dtype=torch.float64)
             A = Q_h.T  # (D, B*S_q)
 
             # Optional importance weighting — scale K rows (not A) so that
@@ -320,19 +260,26 @@ class WaterSICKVHelper:
             # Recover per-head state.
             # alpha = c / L.diag() (same as inside watersic_quantize).
             alpha_h = (c / L.diag()).float()
+            if perm is not None:
+                inv_perm = torch.argsort(perm)
+                alpha_h = alpha_h[inv_perm]
 
-            Z_heads.append(Z_h)
-            alpha_heads.append(alpha_h)
-            gamma_heads.append(gamma_h.float())
-            perm_heads.append(perm)
+            # Move results to CPU to free GPU memory for next head.
+            Z_heads.append(Z_h.cpu())
+            alpha_heads.append(alpha_h.cpu())
+            gamma_heads.append(gamma_h.float().cpu())
+            perm_heads.append(perm.cpu() if perm is not None else None)
             rates.append(rate)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         mean_rate = sum(rates) / len(rates) if rates else 0.0
 
         state = WaterSICKVState(
-            Z=torch.stack(Z_heads),  # (H, B*S_k, D)
-            alpha=torch.stack(alpha_heads),  # (H, D)
-            gamma=torch.stack(gamma_heads),  # (H, D)
+            Z=torch.stack(Z_heads),
+            alpha=torch.stack(alpha_heads),
+            gamma=torch.stack(gamma_heads),
             perm=torch.stack(perm_heads) if perm_heads and perm_heads[0] is not None else None,
             rate=mean_rate,
         )
@@ -341,8 +288,6 @@ class WaterSICKVHelper:
         self.module._watersic_kv_state = state
 
         return state
-
-    # ----- cleanup -----------------------------------------------------
 
     def free(self):
         """Release collected calibration data."""
