@@ -28,6 +28,8 @@ from mip import BINARY, Model, maximize, minimize, xsum
 
 from .utils import consecutive_ngrams, get_nested_key, sort_replacements
 
+__all__ = ["run_mip"]
+
 ReplacementID: TypeAlias = Hashable
 Replacement: TypeAlias = dict[str, Any]
 ChosenReplacements: TypeAlias = list[Replacement]

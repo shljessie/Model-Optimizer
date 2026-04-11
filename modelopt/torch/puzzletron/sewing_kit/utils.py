@@ -43,6 +43,24 @@ from typing_extensions import override
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+__all__ = [
+    "ActivityContext",
+    "ActivityContextDuplicateException",
+    "dynamo_skip",
+    "dynamo_disable",
+    "is_submodule_of",
+    "is_submodule_or_same",
+    "fake_mode",
+    "fake_tensor",
+    "fake_tensor_like",
+    "fake_tensors",
+    "real_tensors",
+    "has_fake_tensor",
+    "distributed_isend_obj",
+    "distributed_send_obj",
+    "distributed_recv_obj",
+]
+
 Fn = TypeVar("Fn", bound=Callable)
 
 

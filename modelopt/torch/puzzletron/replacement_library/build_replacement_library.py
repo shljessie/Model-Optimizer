@@ -54,6 +54,14 @@ from ..utils.misc import block_config_to_str, subblock_config_to_str
 from ..utils.parsing import format_global_config
 from .replacement_utils import is_replacement_identical_to_teacher, replacement_is_teacher
 
+__all__ = [
+    "UNIQUE_SUBBLOCK_IDENTIFIER",
+    "CHECKPOINTS_DIR_NAME",
+    "build_replacement_library",
+    "launch_build_replacement_library",
+    "infer_teacher_dir",
+]
+
 UNIQUE_SUBBLOCK_IDENTIFIER = ["block_config", "attention_config", "ffn_config", "block_idx"]
 CHECKPOINTS_DIR_NAME = "ckpts"
 

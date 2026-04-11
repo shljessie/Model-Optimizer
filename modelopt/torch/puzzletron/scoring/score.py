@@ -33,8 +33,6 @@ from ..tools.validate_puzzle_with_multi_replacements import validate_puzzle_solu
 
 __all__ = [
     "extract_solution_id",
-    "find_missing_solutions",
-    "get_solutions_to_validate",
     "launch_scoring",
 ]
 

@@ -33,6 +33,22 @@ from ..utils import (
     real_tensors,
 )
 
+__all__ = [
+    "InputArgs",
+    "OutputValue",
+    "PassageInputAdapter",
+    "PassageOutputAdapter",
+    "PassageInputOverrides",
+    "PassageOutputOverrides",
+    "NoActivePassageContextError",
+    "RequiredPassageOutputsCapturedSignal",
+    "PassageOutput",
+    "Predicate",
+    "always_false_predicate",
+    "Passage",
+    "patch_module",
+]
+
 
 @dataclass
 class InputArgs:
