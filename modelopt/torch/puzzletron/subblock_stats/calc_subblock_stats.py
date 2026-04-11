@@ -25,8 +25,6 @@ from itertools import product
 from pathlib import Path
 from typing import Iterable, Optional, Type, TypeVar
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import pandas as pd
 import torch
 from immutabledict import immutabledict
