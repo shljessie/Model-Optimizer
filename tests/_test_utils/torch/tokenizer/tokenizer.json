@@ -2,7 +2,26 @@
   "version": "1.0",
   "truncation": null,
   "padding": null,
-  "added_tokens": [],
+  "added_tokens": [
+    {
+      "id": 104,
+      "content": "<|start_header_id|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 105,
+      "content": "<|end_header_id|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
   "normalizer": null,
   "pre_tokenizer": {
     "type": "Sequence",
@@ -205,7 +224,33 @@
       "¥": 98,
       "¦": 99,
       "<|begin_of_text|>": 100,
-      "<|eot_id|>": 101
+      "<|eot_id|>": 101,
+      "Ġ": 102,
+      "Ċ": 103,
+      "<|start_header_id|>": 104,
+      "<|end_header_id|>": 105,
+      "Ā": 106,
+      "ā": 107,
+      "Ă": 108,
+      "ă": 109,
+      "Ą": 110,
+      "ą": 111,
+      "Ć": 112,
+      "ć": 113,
+      "Ĉ": 114,
+      "ĉ": 115,
+      "ċ": 116,
+      "Č": 117,
+      "č": 118,
+      "Ď": 119,
+      "ď": 120,
+      "Đ": 121,
+      "đ": 122,
+      "Ē": 123,
+      "ē": 124,
+      "Ĕ": 125,
+      "ĕ": 126,
+      "Ė": 127
     },
     "merges": []
   }
