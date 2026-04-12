@@ -113,6 +113,8 @@ ls -lh <output_path>/
 
 Report the path and size to the user.
 
+**Next steps**: If the user wants to deploy or evaluate the quantized checkpoint, use the **deployment** or **evaluation** skill. The checkpoint workspace carries over — see `skills/common/end-to-end-workflow.md` for the full PTQ → Deploy → Eval pipeline. If the model required patches during PTQ (e.g., transformers upgrade), the same fixes will likely be needed at deployment and evaluation time.
+
 ## Key API Rules
 
 - `mtq.register()` classes **must** define `_setup()` and call it from `__init__`
