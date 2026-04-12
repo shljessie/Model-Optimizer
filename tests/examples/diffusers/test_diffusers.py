@@ -21,6 +21,27 @@ from _test_utils.examples.models import FLUX_SCHNELL_PATH, SD3_PATH, SDXL_1_0_PA
 from _test_utils.examples.run_command import run_example_command
 from _test_utils.torch.misc import minimum_sm
 
+# Tiny video model args — override MODEL_DEFAULTS for fast CI
+_WAN22_TINY_EXTRA_PARAMS = [
+    "--extra-param",
+    "height=16",
+    "--extra-param",
+    "width=16",
+    "--extra-param",
+    "num_frames=5",
+]
+
+_WAN22_FAST_CALIB_ARGS = [
+    "--calib-size",
+    "2",
+    "--batch-size",
+    "1",
+    "--n-steps",
+    "2",
+    "--model-dtype",
+    "BFloat16",
+]
+
 
 class DiffuserModel(NamedTuple):
     dtype: str
@@ -149,6 +170,84 @@ def test_diffusers_quantization(
     model.quantize(tmp_path)
     model.restore(tmp_path)
     model.inference(tmp_path)
+
+
+def _run_wan22_quantize(
+    tiny_wan22_path: str, tmp_path: Path, format_type: str, quant_algo: str, collect_method: str
+) -> None:
+    """Run quantize.py for Wan 2.2 with the tiny model."""
+    ckpt_path = str(tmp_path / f"wan22_{format_type}.pt")
+    cmd_args = [
+        "python",
+        "quantize.py",
+        "--model",
+        "wan2.2-t2v-14b",
+        "--override-model-path",
+        tiny_wan22_path,
+        "--format",
+        format_type,
+        "--quant-algo",
+        quant_algo,
+        "--collect-method",
+        collect_method,
+        "--trt-high-precision-dtype",
+        "BFloat16",
+        "--quantized-torch-ckpt-save-path",
+        ckpt_path,
+        *_WAN22_FAST_CALIB_ARGS,
+        *_WAN22_TINY_EXTRA_PARAMS,
+    ]
+    run_example_command(cmd_args, "diffusers/quantization")
+
+
+def _run_wan22_restore(
+    tiny_wan22_path: str, tmp_path: Path, format_type: str, quant_algo: str, collect_method: str
+) -> None:
+    """Restore a Wan 2.2 quantized checkpoint."""
+    ckpt_path = str(tmp_path / f"wan22_{format_type}.pt")
+    cmd_args = [
+        "python",
+        "quantize.py",
+        "--model",
+        "wan2.2-t2v-14b",
+        "--override-model-path",
+        tiny_wan22_path,
+        "--format",
+        format_type,
+        "--quant-algo",
+        quant_algo,
+        "--collect-method",
+        collect_method,
+        "--trt-high-precision-dtype",
+        "BFloat16",
+        "--restore-from",
+        ckpt_path,
+        *_WAN22_FAST_CALIB_ARGS,
+        *_WAN22_TINY_EXTRA_PARAMS,
+    ]
+    run_example_command(cmd_args, "diffusers/quantization")
+
+
+def test_wan22_int8_smoothquant(tiny_wan22_path: str, tmp_path: Path) -> None:
+    """Wan 2.2 INT8 SmoothQuant: quantize + restore."""
+    _run_wan22_quantize(tiny_wan22_path, tmp_path, "int8", "smoothquant", "min-mean")
+    _run_wan22_restore(tiny_wan22_path, tmp_path, "int8", "smoothquant", "min-mean")
+
+
+@pytest.mark.parametrize(
+    ("format_type", "quant_algo"),
+    [
+        pytest.param("fp8", "max", marks=minimum_sm(89)),
+        pytest.param("fp4", "max", marks=minimum_sm(89)),
+    ],
+    ids=["wan22_fp8_max", "wan22_fp4_max"],
+)
+def test_wan22_fp8_fp4(
+    tiny_wan22_path: str, tmp_path: Path, format_type: str, quant_algo: str
+) -> None:
+    """Wan 2.2 FP8/FP4: quantize + restore (requires SM89+)."""
+    _run_wan22_quantize(tiny_wan22_path, tmp_path, format_type, quant_algo, "default")
+    _run_wan22_restore(tiny_wan22_path, tmp_path, format_type, quant_algo, "default")
 
 
 @pytest.mark.parametrize(
