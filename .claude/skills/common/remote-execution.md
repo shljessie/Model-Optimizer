@@ -28,6 +28,17 @@ clusters:
 default_cluster: my-cluster
 ```
 
+### Checkpoint and storage availability
+
+Cluster compute nodes may not share the same filesystem as login nodes or other clusters. Before running any workload that references a checkpoint path, verify the path is accessible from compute nodes:
+
+| Cluster type | Compute-node storage | NOT accessible from compute nodes |
+|-------------|---------------------|----------------------------------|
+| JET clusters (oci-hsg, cw, oci-nrt) | `/lustre/fsw/...` | Workstation NFS (`/home/scratch.*`), other cluster mounts |
+| dlcluster | `/home/omniml_data_*`, `/home/scratch.*` | `/lustre/` paths |
+
+If a checkpoint was produced on a different cluster or workstation, copy it to the target cluster's accessible storage before submitting jobs. NEL and SLURM do NOT sync checkpoints automatically.
+
 See `.claude/clusters.yaml.example` for a fully annotated example with multiple cluster types.
 
 ---

@@ -51,6 +51,20 @@ srun \
     "
 ```
 
+### Container registry credentials (pyxis)
+
+If `srun --container-image` uses an image from a private registry (e.g., `nvcr.io/nvidia/...`), pyxis/enroot needs credentials on the cluster. Check for existing credentials and add if missing:
+
+```bash
+cat ~/.config/enroot/.credentials 2>/dev/null || echo "No credentials"
+# To add NGC credentials:
+mkdir -p ~/.config/enroot
+echo 'machine nvcr.io login $oauthtoken password <NGC_API_KEY>' > ~/.config/enroot/.credentials
+chmod 600 ~/.config/enroot/.credentials
+```
+
+Without this, `srun` will fail with `401 Unauthorized` when pulling from `nvcr.io`.
+
 Submit and capture the job ID:
 
 ```bash
