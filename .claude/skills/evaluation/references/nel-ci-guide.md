@@ -255,6 +255,7 @@ evaluation:
 | `trusted_eval` type mismatch in MLflow export | NEL writes boolean `true` instead of string `"true"` | Fix with `sed -i "s/trusted_eval: true/trusted_eval: 'true'/"` in export config |
 | `LexerNoViableAltException` in Hydra | `NEL_DEPLOYMENT_COMMAND` contains quotes, `&&`, `$()` | Use wrapper script pattern (section 4): put script in checkpoint dir, set command to `bash /checkpoint/serve.sh` |
 | `Bad Request` from GitLab API trigger | Shell escaping mangled the JSON payload | Use Python to construct JSON (section 4) instead of bash heredocs/string interpolation |
+| `The model <path> does not exist` (404) | Eval client uses checkpoint path as model_id instead of served_model_name | Add `deployment.served_model_name=<name>` to `NEL_OTHER_OVERRIDES` to match `--served-model-name` in your serve command |
 
 ---
 
