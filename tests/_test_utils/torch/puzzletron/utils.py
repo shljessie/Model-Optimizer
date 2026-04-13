@@ -70,17 +70,17 @@ def create_and_save_small_hf_model(
     hf_model_name: str,
     hybrid_override_pattern: str | None = None,
 ):
-    """
-    Create and save a small HuggingFace model for testing the conversion pipeline.
+    """Create and save a small HuggingFace model for testing the conversion pipeline.
+
     Uses real HuggingFace config to preserve model-specific settings (like tie_word_embeddings),
     but shrinks size parameters for fast testing.
 
     Args:
-        output_path: Where to save the model
-        tokenizer: Tokenizer to save alongside the model
-        hf_model_name: HuggingFace model card name (e.g., "meta-llama/Llama-3.1-8B-Instruct")
-        hybrid_override_pattern: For NemotronH models, the layer type pattern (e.g., "*-" for Attention+MLP,
-                                 "M-" for Mamba+MLP). Must match num_hidden_layers. None for non-NemotronH models.
+        output_path: Where to save the model.
+        tokenizer: Tokenizer to save alongside the model.
+        hf_model_name: HuggingFace model card name (e.g., "meta-llama/Llama-3.1-8B-Instruct").
+        hybrid_override_pattern: For NemotronH models, the layer type pattern (e.g., "*-" for
+            Attention+MLP, "M-" for Mamba+MLP). Must match num_hidden_layers.
     """
     # Load real HuggingFace config (preserves tie_word_embeddings, rope_scaling, etc.)
     config = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
