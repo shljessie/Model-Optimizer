@@ -60,13 +60,26 @@ rsync -av /path/to/local/checkpoint \
     <cluster-login>:/lustre/fsw/portfolios/coreai/users/$USER/checkpoints/
 ```
 
+**Cross-cluster copy** (e.g., dlcluster → oci-hsg): If the two clusters can't SSH to each other directly, pipe through your workstation without staging to disk:
+
+```bash
+ssh user@source-cluster "tar czf - -C /path/to/checkpoint ." | \
+    ssh user@target-cluster "tar xzf - -C /lustre/.../checkpoints/model-name"
+```
+
+After copying, set permissions for svc-jet: `chmod -R 777 /lustre/.../checkpoints/model-name`
+
 For dlcluster, the checkpoint paths are directly accessible since the NFS mounts are shared between login and compute nodes.
 
 ---
 
 ## 4. NEL CI Trigger Pattern
 
-For JET clusters, trigger evaluations via the GitLab API. Use `NEL_DEPLOYMENT_COMMAND` (not `NEL_OTHER_OVERRIDES` with `deployment.extra_args`) because `NEL_OTHER_OVERRIDES` splits values on spaces, breaking multi-flag commands.
+For JET clusters, trigger evaluations via the GitLab API.
+
+### Simple deployment (standard models)
+
+For models that work with stock vLLM/SGLang, use `NEL_DEPLOYMENT_COMMAND` directly:
 
 ```bash
 export GITLAB_TOKEN=<your_gitlab_token>
@@ -82,7 +95,6 @@ curl -k --request POST \
       {"key": "NEL_CLUSTER", "value": "oci-hsg"},
       {"key": "NEL_CHECKPOINT_OR_ARTIFACT", "value": "/lustre/.../checkpoint"},
       {"key": "NEL_DEPLOYMENT_IMAGE", "value": "vllm/vllm-openai:v0.19.0"},
-      {"key": "NEL_TASKS", "value": "simple_evals.gpqa_diamond_aa_v3"},
       {"key": "NEL_DEPLOYMENT_COMMAND", "value": "vllm serve /checkpoint --host 0.0.0.0 --port 8000 --tensor-parallel-size 4 --quantization modelopt_fp4 --trust-remote-code --served-model-name my-model"},
       {"key": "NEL_OTHER_OVERRIDES", "value": "deployment.tensor_parallel_size=4 execution.walltime=04:00:00"},
       {"key": "NEL_HF_HOME", "value": "/lustre/.../cache/huggingface"},
@@ -92,6 +104,74 @@ curl -k --request POST \
   }' \
   "https://gitlab-master.nvidia.com/api/v4/projects/221804/pipeline"
 ```
+
+### Complex deployment (unsupported models needing runtime patches)
+
+If the model needs runtime patches (e.g., transformers upgrade, framework source fixes), **do NOT put multi-step commands in `NEL_DEPLOYMENT_COMMAND`** — Hydra's override parser will break on nested quotes, `&&`, `$()`, etc.
+
+Instead, use the **wrapper script pattern**: place a `serve.sh` in the checkpoint directory on the cluster, then point `NEL_DEPLOYMENT_COMMAND` to it.
+
+**Step 1** — Write wrapper script to the checkpoint directory on the cluster:
+
+```bash
+ssh <cluster-login> 'cat > /lustre/.../checkpoint/serve.sh << '"'"'EOF'"'"'
+#!/bin/bash
+set -e
+pip install "transformers>=5.0.0.dev0" "huggingface_hub>=0.32.0" --pre -q
+# Patch vLLM for ministral3 support (example)
+MISTRAL3_PY=$(find /usr/local/lib -path "*/vllm/model_executor/models/mistral3.py" 2>/dev/null | head -1)
+sed -i "s/old_pattern/new_pattern/" "$MISTRAL3_PY"
+exec vllm serve /checkpoint --host 0.0.0.0 --port 8000 \
+    --tensor-parallel-size 4 --quantization modelopt_fp4 \
+    --trust-remote-code --served-model-name my-model --gpu-memory-utilization 0.9
+EOF
+chmod 777 /lustre/.../checkpoint/serve.sh'
+```
+
+**Step 2** — Set `NEL_DEPLOYMENT_COMMAND` to the wrapper:
+
+```
+{"key": "NEL_DEPLOYMENT_COMMAND", "value": "bash /checkpoint/serve.sh"}
+```
+
+This works because the checkpoint is mounted at `/checkpoint` inside the container. The script is Hydra-safe (no special characters in the override value).
+
+### Custom configs with `NEL_CONFIG_BASE64`
+
+When using a custom config (not from the repo), use `NEL_CONFIG_BASE64` instead of `NEL_CONFIG_PATH`. This requires setting `NEL_UNTRUSTED_EVAL=true`:
+
+```python
+import json, base64, subprocess, os
+
+with open("my_config.yaml") as f:
+    config_b64 = base64.b64encode(f.read().encode()).decode()
+
+payload = {
+    "ref": "main",
+    "variables": [
+        {"key": "NEL_CONFIG_BASE64", "value": config_b64},
+        {"key": "NEL_ACCOUNT", "value": "coreai_dlalgo_modelopt"},
+        {"key": "NEL_CLUSTER", "value": "oci-hsg"},
+        {"key": "NEL_CHECKPOINT_OR_ARTIFACT", "value": "/lustre/.../checkpoint"},
+        {"key": "NEL_DEPLOYMENT_IMAGE", "value": "vllm/vllm-openai:v0.19.0"},
+        {"key": "NEL_DEPLOYMENT_COMMAND", "value": "bash /checkpoint/serve.sh"},
+        {"key": "NEL_UNTRUSTED_EVAL", "value": "true"},
+        # ... other variables
+    ]
+}
+
+# Use Python to construct JSON (avoids shell escaping issues with curl)
+token = os.environ["GITLAB_TOKEN"]
+subprocess.run(
+    ["curl", "-k", "--request", "POST",
+     "--header", f"PRIVATE-TOKEN: {token}",
+     "--header", "Content-Type: application/json",
+     "--data", json.dumps(payload),
+     "https://gitlab-master.nvidia.com/api/v4/projects/221804/pipeline"],
+)
+```
+
+> **Tip**: Use Python (not bash) to construct the JSON payload for `curl`. Shell escaping of base64 strings and nested quotes is error-prone.
 
 ---
 
@@ -173,6 +253,8 @@ evaluation:
 | `NEL_OTHER_OVERRIDES` splits `extra_args` | Space-separated parsing breaks multi-flag values | Use `NEL_DEPLOYMENT_COMMAND` instead |
 | Checkpoint not found in container | Path not on cluster compute-node filesystem | Copy checkpoint to `/lustre/` (or cluster-accessible path) first |
 | `trusted_eval` type mismatch in MLflow export | NEL writes boolean `true` instead of string `"true"` | Fix with `sed -i "s/trusted_eval: true/trusted_eval: 'true'/"` in export config |
+| `LexerNoViableAltException` in Hydra | `NEL_DEPLOYMENT_COMMAND` contains quotes, `&&`, `$()` | Use wrapper script pattern (section 4): put script in checkpoint dir, set command to `bash /checkpoint/serve.sh` |
+| `Bad Request` from GitLab API trigger | Shell escaping mangled the JSON payload | Use Python to construct JSON (section 4) instead of bash heredocs/string interpolation |
 
 ---
 
