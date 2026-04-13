@@ -39,29 +39,28 @@ from typing import Any, Type
 import pandas as pd
 from omegaconf import DictConfig
 
-from modelopt.torch.puzzletron.anymodel.model_descriptor import (
-    ModelDescriptor,
-    ModelDescriptorFactory,
-)
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import (
-    AttentionConfig,
-    BlockConfig,
-    FFNConfig,
-)
-from modelopt.torch.puzzletron.replacement_library.replacement_utils import (
-    is_replacement_identical_to_teacher,
-    replacement_is_teacher,
-    sort_replacements,
-)
-from modelopt.torch.puzzletron.tools.checkpoint_utils import (
+from modelopt.torch.utils import json_dump
+
+from ..anymodel.model_descriptor import ModelDescriptor, ModelDescriptorFactory
+from ..block_config import AttentionConfig, BlockConfig, FFNConfig
+from ..mip.utils import sort_replacements
+from ..tools.checkpoint_utils import (
     SAFETENSORS_SUBBLOCKS_DIR_NAME,
     is_valid_decilm_checkpoint,
     load_model_config,
 )
-from modelopt.torch.puzzletron.tools.logger import mprint
-from modelopt.torch.puzzletron.tools.robust_json import json_dump
-from modelopt.torch.puzzletron.utils.parsing import format_global_config
-from modelopt.torch.puzzletron.utils.utils import block_config_to_str, subblock_config_to_str
+from ..tools.logger import mprint
+from ..utils.misc import block_config_to_str, subblock_config_to_str
+from ..utils.parsing import format_global_config
+from .replacement_utils import is_replacement_identical_to_teacher, replacement_is_teacher
+
+__all__ = [
+    "UNIQUE_SUBBLOCK_IDENTIFIER",
+    "CHECKPOINTS_DIR_NAME",
+    "build_replacement_library",
+    "launch_build_replacement_library",
+    "infer_teacher_dir",
+]
 
 UNIQUE_SUBBLOCK_IDENTIFIER = ["block_config", "attention_config", "ffn_config", "block_idx"]
 CHECKPOINTS_DIR_NAME = "ckpts"

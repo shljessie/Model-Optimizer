@@ -26,11 +26,9 @@ from typing import Any, TypeAlias
 
 from mip import BINARY, Model, maximize, minimize, xsum
 
-from modelopt.torch.puzzletron.mip.utils import (
-    consecutive_ngrams,
-    get_nested_key,
-    sort_replacements,
-)
+from .utils import consecutive_ngrams, get_nested_key, sort_replacements
+
+__all__ = ["run_mip"]
 
 ReplacementID: TypeAlias = Hashable
 Replacement: TypeAlias = dict[str, Any]
