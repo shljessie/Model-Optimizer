@@ -130,7 +130,7 @@ chmod 777 /lustre/.../checkpoint/serve.sh'
 
 **Step 2** — Set `NEL_DEPLOYMENT_COMMAND` to the wrapper:
 
-```
+```json
 {"key": "NEL_DEPLOYMENT_COMMAND", "value": "bash /checkpoint/serve.sh"}
 ```
 
