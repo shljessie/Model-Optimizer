@@ -19,31 +19,25 @@ In this example, we compress the [Llama-3.1-8B-Instruct](https://huggingface.co/
 
 The recommended way to run puzzletron is inside an NVIDIA NeMo container (e.g. `nvcr.io/nvidia/nemo:26.02`). NeMo containers ship a pre-installed `nvidia-modelopt` that does not include the puzzletron extras so you need to replace it with an editable install from this repo.
 
+> [!WARNING]
+> Use `python -m pip` instead of `pip` to avoid conflicts with the system-wide installed packages in the NeMo containers.
+
+> [!NOTE]
+> NeMo containers ship `nvidia-lm-eval` which may conflict with `lm-eval` that is used for evaluation, hence we uninstall and replace it with `lm-eval` from the repo.
+
 Once inside the container with the repo available, install dependencies from the repo root:
 
 ```bash
 python -m pip uninstall nvidia-lm-eval -y 2>/dev/null
-python -m pip install -e ".[hf,puzzletron]"
+python -m pip install -e ".[hf,puzzletron,dev-test]"
 python -m pip install -r examples/puzzletron/requirements.txt
 ```
 
 To verify the install, you can run the GPU tests as a smoke check:
 
 ```bash
-python -m pytest -s -v tests/gpu/torch/puzzletron/test_puzzletron.py -o addopts="" -k "mistral"
+python -m pytest tests/gpu/torch/puzzletron/test_puzzletron.py -k "Qwen3-8B"
 ```
-
-### Bare-metal / other containers
-
-If you are not using a NeMo container, install Model-Optimizer in editable mode with the corresponding dependencies (run from the repo root):
-
-```bash
-pip install -e .[hf,puzzletron]
-pip install -r examples/puzzletron/requirements.txt
-```
-
-> **Note:** NeMo containers may ship `nvidia-lm-eval` which may conflict with `lm-eval` that is used for evaluation.
-> If so, run `pip uninstall nvidia-lm-eval -y` before installing requirements.
 
 ### Hardware
 
@@ -52,7 +46,7 @@ pip install -r examples/puzzletron/requirements.txt
 - To make use of [Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) and [Nemotron-Post-Training-Dataset-v2](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2), you need to accept the terms and conditions for the corresponding model and the dataset in the Huggingface Hub. Log in to the Huggingface Hub and enter your HF token.
 
 ```bash
-hf auth login
+hf auth login --token <your token>
 ```
 
 ## Compress the Model
@@ -62,7 +56,9 @@ hf auth login
    dataset split: "code", "math", "stem", "chat", excluding reasoning samples (2.62GB)
 
    ```bash
-   python -m modelopt.torch.puzzletron.dataset.prepare_dataset --dataset_name nvidia/Nemotron-Post-Training-Dataset-v2 --output_dir path/to/Nemotron-Post-Training-Dataset-v2
+   python -m modelopt.torch.puzzletron.dataset.prepare_dataset \
+      --dataset_name nvidia/Nemotron-Post-Training-Dataset-v2 \
+      --output_dir path/to/Nemotron-Post-Training-Dataset-v2
    ```
 
 2. Specify the `puzzle_dir`, `input_hf_model_path`, `dataset_path`, `intermediate_size_list`, and `target_memory` arguments in the [llama-3_1-8B_pruneffn_memory.yaml](./configs/llama-3_1-8B_pruneffn_memory/llama-3_1-8B_pruneffn_memory.yaml) configuration file.
@@ -160,7 +156,9 @@ This assumes pruning, replacement library building, NAS scoring, and subblock st
 For example, let's set `target_memory: 96_000` in `llama-3_1-8B_pruneffn_memory.yaml`.
 
 ```bash
-torchrun --nproc_per_node 2 examples/puzzletron/main.py --config examples/puzzletron/configs/llama-3_1-8B_pruneffn_memory/llama-3_1-8B_pruneffn_memory.yaml --mip-only 2>&1 | tee ./log.txt | grep "Puzzletron Progress"
+torchrun --nproc_per_node 2 examples/puzzletron/main.py \
+   --config examples/puzzletron/configs/llama-3_1-8B_pruneffn_memory/llama-3_1-8B_pruneffn_memory.yaml \
+   --mip-only 2>&1 | tee ./log.txt | grep "Puzzletron Progress"
 ```
 
 This will generate the following network architecture (see `log.txt`):
@@ -241,7 +239,9 @@ The **MIP sweep mode** lets you explore multiple memory compression rates in a s
 2. Run the sweep:
 
    ```bash
-   torchrun --nproc_per_node 2 examples/puzzletron/main.py --config examples/puzzletron/configs/llama-3_1-8B_pruneffn_memory/llama-3_1-8B_pruneffn_memory.yaml --mip-only 2>&1 | tee ./log.txt | grep "Puzzletron Progress"
+   torchrun --nproc_per_node 2 examples/puzzletron/main.py \
+      --config examples/puzzletron/configs/llama-3_1-8B_pruneffn_memory/llama-3_1-8B_pruneffn_memory.yaml \
+      --mip-only 2>&1 | tee ./log.txt | grep "Puzzletron Progress"
    ```
 
 3. View results: The CSV file contains compression rates, memory usage, and accuracy metrics for each configuration.
@@ -258,11 +258,11 @@ Evaluate AnyModel checkpoints using [lm-eval](https://github.com/EleutherAI/lm-e
 
 ```bash
 python examples/llm_eval/lm_eval_hf.py \
-    --model hf \
-    --model_args pretrained=path/to/checkpoint,dtype=bfloat16,parallelize=True \
-    --tasks mmlu \
-    --num_fewshot 5 \
-    --batch_size 4
+   --model hf \
+   --model_args pretrained=path/to/checkpoint,dtype=bfloat16,parallelize=True \
+   --tasks mmlu \
+   --num_fewshot 5 \
+   --batch_size 4
 ```
 
 For a quick smoke test, add `--limit 10`.
@@ -286,13 +286,13 @@ sed -i 's+subblocks_safetensors/++g' model.safetensors.index.json
 - Benchmark latency
 
 ```bash
-vllm bench latency --model path/to/model --load-format safetensors --trust-remote-code
+vllm bench latency --model path/to/model --load-format safetensors
 ```
 
 - Benchmark throughput
 
 ```bash
-vllm bench throughput --model path/to/model --input-len 2000 --output-len 100 --load-format safetensors --trust-remote-code
+vllm bench throughput --model path/to/model --input-len 2000 --output-len 100 --load-format safetensors
 ```
 
 ## Knowledge Distillation

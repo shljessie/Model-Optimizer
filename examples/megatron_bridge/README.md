@@ -46,6 +46,9 @@ Note that the default dataset for pruning and quantization is [`nemotron-post-tr
 hf auth login --token <your token>
 ```
 
+> [!WARNING]
+> Use `python -m pip` instead of `pip` to avoid conflicts with the system-wide installed packages in the NeMo containers.
+
 ## Pruning
 
 This section shows how to prune a HuggingFace model using Minitron algorithm in Megatron-Bridge framework. Checkout other available pruning algorithms, supported frameworks and models, and general pruning getting-started in the [pruning README](../pruning/README.md).

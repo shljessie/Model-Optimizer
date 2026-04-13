@@ -53,7 +53,7 @@ from transformers import AutoConfig
 import modelopt.torch.utils.distributed as dist
 from modelopt.torch.utils import print_rank_0
 
-with contextlib.suppress(ImportError):
+with contextlib.suppress(ModuleNotFoundError):
     import modelopt.torch.puzzletron.plugins.mbridge  # noqa: F401
 
 SEED = 1234
