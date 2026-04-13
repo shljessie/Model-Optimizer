@@ -98,6 +98,7 @@ class _QuantConv3d(QuantLinearConvBase):
             and hasattr(self, "weight_quantizer")
             and _is_nvfp4_quantizer(self.input_quantizer)
             and _is_nvfp4_quantizer(self.weight_quantizer)
+            and self.groups == 1
         ):
             try:
                 from modelopt.torch.kernels.conv.implicit_gemm_cuda import (

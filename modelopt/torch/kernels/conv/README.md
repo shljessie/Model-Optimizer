@@ -115,7 +115,7 @@ Current state: **Integrated** (registered in `QuantModuleRegistry`, auto-dispatc
 Known limitations:
 
 - CUDA extension compile latency on first invocation (~seconds).
-- Grouped convolution (`groups > 1`) is not supported.
+- Grouped convolution (`groups > 1`) is not supported. In the ModelOpt E2E flow, `_QuantConv3d` automatically falls back to the default cuDNN path for grouped convolutions.
 - BF16 rounding error accumulates with the K dimension — expect max abs diff scaling roughly as `sqrt(K)` compared to cuDNN FP32.
 - Inference only (`@torch.no_grad`) — not suitable for QAT backward pass.
 
