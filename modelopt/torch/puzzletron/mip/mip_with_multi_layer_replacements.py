@@ -55,6 +55,9 @@ def run_mip(
         )
         print("\n\n\n")
 
+    if not replacements:
+        return [], 0.0, {}
+
     mip_model = Model()
 
     objective_vars = []

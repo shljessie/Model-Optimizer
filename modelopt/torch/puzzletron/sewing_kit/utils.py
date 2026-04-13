@@ -375,21 +375,21 @@ def has_fake_tensor(v: Any) -> bool:
 
 def _get_device_for_distributed(
     group: Optional[torch.distributed.ProcessGroup] = None,
-) -> str:
+) -> torch.device:
     """
     Determine the appropriate device for distributed communication based on the backend.
     NCCL backend requires CUDA tensors, while Gloo supports both CPU and CUDA.
     """
     if not torch.distributed.is_initialized():
-        return "cpu"
+        return torch.device("cpu")
 
     backend = torch.distributed.get_backend(group)
     if backend == "nccl":
         # NCCL requires CUDA tensors
-        return torch.cuda.current_device()
+        return torch.device("cuda", torch.cuda.current_device())
     else:
         # Gloo and other backends support CPU tensors
-        return "cpu"
+        return torch.device("cpu")
 
 
 def distributed_isend_obj(

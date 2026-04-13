@@ -342,7 +342,7 @@ def save_subblocks(
         # Check for any failures
         failed_saves = sum(1 for r in results if not r)
         if failed_saves > 0:
-            mprint(f"  Warning: {failed_saves} files failed to save")
+            raise RuntimeError(f"  {failed_saves} shard file(s) failed to save")
     else:
         mprint("  Using single-threaded saving...")
         for kwargs in safe_save_kwargs:

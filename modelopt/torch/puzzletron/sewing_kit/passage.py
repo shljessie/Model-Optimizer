@@ -297,6 +297,7 @@ class Passage(nn.Module):
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self.active_context_manager is not None
         self.active_context_manager.__exit__(exc_type, exc_val, exc_tb)
+        self.active_context_manager = None
 
     def freeze(self):
         self.eval()

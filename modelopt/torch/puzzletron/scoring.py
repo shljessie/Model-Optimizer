@@ -82,8 +82,10 @@ def main(cfg: DictConfig) -> None:
     cfg = hydra.utils.instantiate(cfg)
     mprint(cfg)
     dist.setup(timeout=cfg.nccl_timeout_minutes)
-    launch_scoring(cfg)
-    dist.cleanup()
+    try:
+        launch_scoring(cfg)
+    finally:
+        dist.cleanup()
 
 
 if __name__ == "__main__":
