@@ -59,6 +59,7 @@ SEED = 1234
 def test_puzzletron(
     project_root_path: Path,
     tmp_path: Path,
+    num_gpus,
     hf_model_name: str,
     converter: str,
     hybrid_override_pattern: str,
@@ -67,8 +68,11 @@ def test_puzzletron(
     if "Qwen3-VL" in hf_model_name and Version(transformers.__version__) < Version("4.57.0"):
         pytest.skip("Qwen3-VL is not supported with transformers < 4.57.0")
 
+    if "Nemotron" in hf_model_name:
+        pytest.importorskip("mamba_ssm", reason="mamba_ssm required for Nemotron tests")
+
     spawn_multiprocess_job(
-        size=torch.cuda.device_count(),
+        size=num_gpus,
         job=partial(
             _test_puzzletron_multiprocess_job,
             project_root_path,
@@ -291,7 +295,8 @@ EXPECTED_FFN_PRUNING_VALUES = {
     ],
     "Qwen/Qwen2.5-7B-Instruct": [
         {"score": 374, "channels": 205},
-        {"score": 100, "channels": 317},
+        # NOTE: below score differs as per GPU: set as per CI's RTX Pro 6000 BW. Getting 100 on RTX 6000 Ada
+        {"score": 102, "channels": 317},
     ],
     "Qwen/Qwen3-8B": [
         {"score": 405, "channels": 173},
