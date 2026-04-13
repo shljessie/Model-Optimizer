@@ -1,5 +1,18 @@
 # Skip-Softmax Sparse Attention for Diffusion Models
 
+> [!WARNING]
+> **Third-Party License Notice — LTX-2**
+>
+> LTX-2 packages (`ltx-core`, `ltx-pipelines`, `ltx-trainer`) are third-party dependencies
+> developed and provided by [Lightricks](https://github.com/Lightricks/LTX-2). They are
+> **NOT** covered by the Apache 2.0 license governing NVIDIA Model Optimizer.
+>
+> You **MUST** comply with the
+> [LTX Community License Agreement](https://github.com/Lightricks/LTX-2/blob/main/LICENSE)
+> when installing and using LTX-2 with NVIDIA Model Optimizer. Any derivative models or
+> fine-tuned weights produced from LTX-2 (including quantized, distilled, or sparsified
+> checkpoints) remain subject to the LTX Community License Agreement, not Apache 2.0.
+
 Skip-softmax sparse attention (BLASST, <https://arxiv.org/pdf/2512.12087>) skips KV
 tiles whose attention scores are negligible during the FlashAttention computation,
 reducing FLOPs without retraining.
