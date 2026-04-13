@@ -101,16 +101,11 @@ Standalone FP4 (E2M1) blockwise fake quantization with FP8 E4M3 scale quantizati
 | `global_amax` | Scalar tensor — global abs max for scale computation |
 | `block_size` | Number of elements per FP4 quantization block (default `16`) |
 
-## Testing and Benchmarking
+## Testing
 
 ```bash
 # Run tests (requires GPU)
 python -m pytest tests/gpu/torch/quantization/kernels/test_implicit_gemm.py -v
-
-# Run benchmarks
-python -m modelopt.torch.kernels.conv.bench_implicit_gemm                    # default shapes
-python -m modelopt.torch.kernels.conv.bench_implicit_gemm --shapes wan22     # Wan2.2 VAE shapes
-python -m modelopt.torch.kernels.conv.bench_implicit_gemm --shapes all       # all presets
 ```
 
 ## Status
