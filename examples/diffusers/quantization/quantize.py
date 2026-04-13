@@ -253,6 +253,7 @@ class ExportManager:
         ckpt_path.mkdir(parents=True, exist_ok=True)
         filename = f"{backbone_name}.pt" if backbone_name else "backbone.pt"
         target_path = ckpt_path / filename
+
         self.logger.info(f"Saving backbone to {target_path}")
         mto.save(backbone, str(target_path))
 
@@ -313,18 +314,15 @@ class ExportManager:
         if not restore_path.exists() or not restore_path.is_dir():
             raise FileNotFoundError(f"Checkpoint directory not found: {restore_path}")
 
-        backbones = list(self.pipeline_manager.iter_backbones())
-        for backbone_name, backbone in backbones:
+        for backbone_name, backbone in self.pipeline_manager.iter_backbones():
             source_path = restore_path / f"{backbone_name}.pt"
-            # Legacy fallback: only safe when there is exactly one backbone
-            if not source_path.exists() and len(backbones) == 1:
-                source_path = restore_path / "backbone.pt"
             if not source_path.exists():
                 raise FileNotFoundError(
                     f"Checkpoint not found for '{backbone_name}' in {restore_path}"
                 )
             self.logger.info(f"Restoring {backbone_name} from {source_path}")
             mto.restore(backbone, str(source_path))
+
         self.logger.info("Checkpoints restored successfully")
 
     # TODO: should not do the any data type

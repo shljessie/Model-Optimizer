@@ -170,9 +170,14 @@ class PipelineManager:
                 if name == "video_decoder":
                     self._ensure_ltx2_video_decoder_cached()
                     yield name, self._video_decoder
-                else:
+                elif name == "transformer":
                     self._ensure_ltx2_transformer_cached()
                     yield name, self._transformer
+                else:
+                    raise ValueError(
+                        f"Unsupported LTX-2 backbone name '{name}'. "
+                        "Expected 'transformer' or 'video_decoder'."
+                    )
             return
 
         for name in names:
