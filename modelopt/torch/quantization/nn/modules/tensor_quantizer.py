@@ -1421,14 +1421,16 @@ class StaticBlockScaleQuantizer(TensorQuantizer):
 
     def _short_amax(self, fmt=".4f"):
         """Short description of amax, accounting for LAQ mode."""
-        if self._laq and not self._tied_amax:
-            return (
-                f"pre={self._short_tensor(self._amax_pre.data, fmt)}, "
-                f"post={self._short_tensor(self._amax_post.data, fmt)}"
-            )
-        if self._laq:
-            return self._short_tensor(self._amax_post.data, fmt)
-        return super()._short_amax(fmt)
+        if not self._laq:
+            return super()._short_amax(fmt)
+        learn = self._learnable_amax
+        learn_str = "frozen" if not learn else f"learn=[{','.join(learn)}]"
+        if self._tied_amax:
+            return f"LAQ(tied={self._short_tensor(self._amax_post.data, fmt)}, {learn_str})"
+        return (
+            f"LAQ(pre={self._short_tensor(self._amax_pre.data, fmt)}, "
+            f"post={self._short_tensor(self._amax_post.data, fmt)}, {learn_str})"
+        )
 
     def enable_laq(
         self,
