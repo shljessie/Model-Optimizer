@@ -52,6 +52,9 @@ bash tools/debugger/client.sh run "bash llm_ptq/scripts/huggingface_example.sh"
 # Run with a long timeout (default is 600s)
 bash tools/debugger/client.sh --timeout 1800 run "python my_long_test.py"
 
+# Cancel a running command
+bash tools/debugger/client.sh cancel
+
 # Check status
 bash tools/debugger/client.sh status
 ```
@@ -65,6 +68,8 @@ The relay uses a directory at `tools/debugger/.relay/` with this structure:
 ├── server.ready      # Written by server on startup
 ├── client.ready      # Written by client during handshake
 ├── handshake.done    # Written by server to confirm handshake
+├── running           # Written by server while a command is executing (cmd_id:pid)
+├── cancel            # Written by client to request cancellation of the running command
 ├── cmd/              # Client writes command .sh files here
 │   └── <id>.sh       # Command to execute
 └── result/           # Server writes results here
@@ -82,9 +87,16 @@ The relay uses a directory at `tools/debugger/.relay/` with this structure:
 ### Command Execution
 
 1. Client writes a command to `.relay/cmd/<timestamp>.sh`
-2. Server detects the file, runs `bash <file>` in the workdir, captures output
+2. Server detects the file, runs `bash <file>` in the workdir in background, writes `.relay/running`
 3. Server writes `.relay/result/<timestamp>.log` and `.relay/result/<timestamp>.exit`
-4. Server removes the `.sh` file; client reads results and cleans up
+4. Server removes the `.sh` file and `.relay/running`; client reads results and cleans up
+
+### Cancellation
+
+1. Client writes `.relay/cancel`
+2. Server detects the cancel signal, kills the running command process tree
+3. Server writes exit code 130 and removes `.relay/running` and `.relay/cancel`
+4. Client-side timeout also triggers cancellation automatically
 
 ## Options
 
@@ -107,3 +119,5 @@ The relay uses a directory at `tools/debugger/.relay/` with this structure:
 - The `.relay/` directory is in `.gitignore` — it is not checked in.
 - Only one server should run at a time (startup clears the relay directory).
 - Commands run sequentially in the order the server discovers them.
+- A running command can be cancelled via `client.sh cancel`. Cancelled commands exit with code 130.
+- Client-side timeouts automatically cancel the running command on the server.

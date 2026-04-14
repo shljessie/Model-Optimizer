@@ -24,6 +24,9 @@ bash tools/debugger/client.sh run "<command>"
 # Long-running command (default timeout is 600s)
 bash tools/debugger/client.sh --timeout 1800 run "<command>"
 
+# Cancel the currently running command
+bash tools/debugger/client.sh cancel
+
 # Reconnect after server restart
 bash tools/debugger/client.sh flush
 bash tools/debugger/client.sh handshake

@@ -63,10 +63,19 @@ RESULT_DIR="$RELAY_DIR/result"
 
 cleanup() {
     echo "[server] Shutting down..."
+    # Kill any running command (guard all reads with || true to prevent set -e
+    # from aborting the trap and leaving stale marker files)
+    running_pid=$(cut -d: -f2 "$RELAY_DIR/running" 2>/dev/null) || true
+    if [[ -n "$running_pid" ]]; then
+        pkill -P "$running_pid" 2>/dev/null || true
+        kill "$running_pid" 2>/dev/null || true
+    fi
     # Kill any child processes in our process group
     pkill -P $$ 2>/dev/null || true
     rm -f "$RELAY_DIR/server.ready"
     rm -f "$RELAY_DIR/handshake.done"
+    rm -f "$RELAY_DIR/running"
+    rm -f "$RELAY_DIR/cancel"
     exit 0
 }
 trap cleanup SIGINT SIGTERM
@@ -140,20 +149,90 @@ while true; do
     fi
 
     for cmd_file in "$CMD_DIR"/*.sh; do
+        # Guard against command files deleted by the client between glob expansion
+        # and processing (e.g., client timeout on a queued command)
+        [[ -f "$cmd_file" ]] || continue
+
         cmd_id="$(basename "$cmd_file" .sh)"
-        cmd_content=$(cat "$cmd_file")
+        # Tolerate file disappearing between guard and read (TOCTOU with client timeout)
+        cmd_content=$(cat "$cmd_file" 2>/dev/null) || continue
+        # Remove command file immediately after reading to prevent re-execution
+        # and to avoid TOCTOU with client timeout deleting it during execution
+        rm -f "$cmd_file"
         echo "[server] Executing command $cmd_id: $cmd_content"
 
-        # Execute the command, tee stdout+stderr to console and result file
-        (cd "$WORKDIR" && bash "$cmd_file" 2>&1) | tee "$RESULT_DIR/$cmd_id.log" || true
-        exit_code=${PIPESTATUS[0]}
+        # Clear any stale cancel file from a previous timed-out client
+        rm -f "$RELAY_DIR/cancel"
 
-        # Atomic write of exit code (signal to client that result is ready)
+        # Create log file and stream output to server console via tail
+        : > "$RESULT_DIR/$cmd_id.log"
+        tail -f "$RESULT_DIR/$cmd_id.log" &
+        tail_pid=$!
+
+        # Run from cmd_content (not the file) since we already removed it
+        (cd "$WORKDIR" && bash -c "$cmd_content") >> "$RESULT_DIR/$cmd_id.log" 2>&1 &
+        cmd_pid=$!
+
+        # Track the running command (ID and PID) — atomic write to prevent partial reads
+        echo "$cmd_id:$cmd_pid" > "$RELAY_DIR/running.tmp"
+        mv "$RELAY_DIR/running.tmp" "$RELAY_DIR/running"
+
+        # Wait for completion or cancellation
+        cancelled=""
+        while kill -0 "$cmd_pid" 2>/dev/null; do
+            if [[ -f "$RELAY_DIR/cancel" ]]; then
+                # Verify cancel targets this command (reject empty or mismatched signals)
+                cancel_target=$(cat "$RELAY_DIR/cancel" 2>/dev/null) || true
+                if [[ "$cancel_target" != "$cmd_id" ]]; then
+                    rm -f "$RELAY_DIR/cancel"
+                    sleep "$POLL_INTERVAL"
+                    continue
+                fi
+                echo "[server] Cancelling command $cmd_id (PID $cmd_pid)..."
+                # Send SIGTERM to children first, then parent
+                pkill -P "$cmd_pid" 2>/dev/null || true
+                kill "$cmd_pid" 2>/dev/null || true
+                # Wait up to 5s for graceful exit, then escalate to SIGKILL
+                for _ in $(seq 1 5); do
+                    kill -0 "$cmd_pid" 2>/dev/null || break
+                    sleep 1
+                done
+                if kill -0 "$cmd_pid" 2>/dev/null; then
+                    echo "[server] Process $cmd_pid did not exit, sending SIGKILL..."
+                    pkill -9 -P "$cmd_pid" 2>/dev/null || true
+                    kill -9 "$cmd_pid" 2>/dev/null || true
+                fi
+                wait "$cmd_pid" 2>/dev/null || true
+                cancelled="true"
+                rm -f "$RELAY_DIR/cancel"
+                echo "[cancelled]" >> "$RESULT_DIR/$cmd_id.log"
+                echo "[server] Command $cmd_id cancelled."
+                break
+            fi
+            sleep "$POLL_INTERVAL"
+        done
+
+        # Determine exit code (|| exit_code=$? prevents set -e from killing the
+        # server when the command exits non-zero)
+        if [[ -n "$cancelled" ]]; then
+            exit_code=130
+        else
+            exit_code=0
+            wait "$cmd_pid" 2>/dev/null || exit_code=$?
+        fi
+
+        # Stop console streaming
+        kill "$tail_pid" 2>/dev/null || true
+        wait "$tail_pid" 2>/dev/null || true
+
+        # Write exit code BEFORE removing the running marker, so any observer
+        # that sees running disappear can immediately find the result
         echo "$exit_code" > "$RESULT_DIR/$cmd_id.exit.tmp"
         mv "$RESULT_DIR/$cmd_id.exit.tmp" "$RESULT_DIR/$cmd_id.exit"
 
-        # Remove the command file to mark it as processed
-        rm -f "$cmd_file"
+        # Now safe to remove markers
+        rm -f "$RELAY_DIR/running"
+        rm -f "$RELAY_DIR/cancel"
 
         echo "[server] Command $cmd_id finished (exit=$exit_code)"
     done
