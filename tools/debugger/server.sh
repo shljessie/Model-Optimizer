@@ -87,17 +87,28 @@ fi
 rm -rf "$RELAY_DIR"
 mkdir -p "$CMD_DIR" "$RESULT_DIR"
 
-# Install modelopt in editable mode (skip if already editable-installed from WORKDIR)
-if python -c "
-import modelopt, os
-assert os.path.realpath(modelopt.__path__[0]).startswith(os.path.realpath('$WORKDIR'))
-" 2>/dev/null; then
+# Ensure modelopt is editable-installed from WORKDIR
+check_modelopt_local() {
+    python -c "
+import modelopt, os, sys
+actual = os.path.realpath(modelopt.__path__[0])
+expected = os.path.realpath('$WORKDIR')
+if not actual.startswith(expected):
+    print(f'modelopt loaded from {actual}, expected under {expected}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1
+}
+
+if check_modelopt_local >/dev/null 2>&1; then
     echo "[server] modelopt already editable-installed from $WORKDIR, skipping pip install."
 else
     echo "[server] Installing modelopt (pip install -e .[dev]) ..."
-    (cd "$WORKDIR" && pip install -e ".[dev]") || {
-        echo "[server] WARNING: pip install failed (exit=$?), continuing anyway."
-    }
+    (cd "$WORKDIR" && pip install -e ".[dev]")
+    if ! check_modelopt_local; then
+        echo "[server] ERROR: modelopt is not running from the local folder ($WORKDIR)."
+        echo "[server] Try: pip install -e '.[dev]' inside the container, then restart the server."
+        exit 1
+    fi
     echo "[server] Install done."
 fi
 
@@ -130,7 +141,8 @@ while true; do
 
     for cmd_file in "$CMD_DIR"/*.sh; do
         cmd_id="$(basename "$cmd_file" .sh)"
-        echo "[server] Executing command $cmd_id..."
+        cmd_content=$(cat "$cmd_file")
+        echo "[server] Executing command $cmd_id: $cmd_content"
 
         # Execute the command, tee stdout+stderr to console and result file
         (cd "$WORKDIR" && bash "$cmd_file" 2>&1) | tee "$RESULT_DIR/$cmd_id.log" || true

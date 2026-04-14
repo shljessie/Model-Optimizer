@@ -91,6 +91,8 @@ case "$SUBCOMMAND" in
         # Generate a unique command ID (timestamp + PID to avoid collisions)
         cmd_id="$(date +%s%N)_$$"
 
+        echo "[client] Running: $*"
+
         # Write the command file atomically (tmp + mv)
         echo "$*" > "$CMD_DIR/$cmd_id.sh.tmp"
         mv "$CMD_DIR/$cmd_id.sh.tmp" "$CMD_DIR/$cmd_id.sh"
