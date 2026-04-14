@@ -208,8 +208,8 @@ class TrtExecBenchmark(Benchmark):
 
         if has_remote_config:
             try:
-                _check_for_tensorrt(min_version="10.16")
-                self.logger.debug("TensorRT Python API version >= 10.16 detected")
+                _check_for_tensorrt(min_version="10.15")
+                self.logger.debug("TensorRT Python API version >= 10.15 detected")
                 if "--safe" not in trtexec_args:
                     self.logger.warning(
                         "Remote autotuning requires '--safe' to be set. Adding it to trtexec arguments."
@@ -218,7 +218,7 @@ class TrtExecBenchmark(Benchmark):
                 return
             except ImportError:
                 self.logger.warning(
-                    "Remote autotuning is not supported with TensorRT version < 10.16. "
+                    "Remote autotuning is not supported with TensorRT version < 10.15. "
                     "Removing --remoteAutoTuningConfig from trtexec arguments"
                 )
                 trtexec_args = [
