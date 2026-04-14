@@ -179,6 +179,24 @@ class ModelDescriptor(ABC):
         """
         return config
 
+    @staticmethod
+    def truncate_pattern_for_subblock(lm_config, parent_layer_index=None):
+        """Adjust per-layer config fields so a single-layer model represents the correct layer type.
+
+        The default implementation handles ``hybrid_override_pattern`` for
+        hybrid architectures.  It is a no-op when the field is absent.
+        Override if a model uses a different pattern alphabet.
+        """
+        pattern = getattr(lm_config, "hybrid_override_pattern", None)
+        if not pattern:
+            return
+        # Strip cosmetic pipe separators (e.g. "M|-|*" -> "M-*") before indexing.
+        pattern = pattern.replace("|", "")
+        if parent_layer_index is not None and 0 <= parent_layer_index < len(pattern):
+            lm_config.hybrid_override_pattern = pattern[parent_layer_index]
+            return
+        lm_config.hybrid_override_pattern = pattern[0]
+
     @classmethod
     def create_dummy_block(cls, original_layer: nn.Module, block_index: int) -> nn.Module:
         """Create a dummy block to replace a layer for sharded model initialization."""

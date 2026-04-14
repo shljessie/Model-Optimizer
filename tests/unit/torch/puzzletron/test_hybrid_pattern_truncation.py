@@ -13,71 +13,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for hybrid_override_pattern handling in calculate_subblock_params.
+"""Tests for hybrid_override_pattern handling via ModelDescriptor.truncate_pattern_for_subblock.
 
-Covers _infer_hybrid_pattern_char, the fallback used when parent_layer_index
-is not available.  End-to-end validation with the real model is in
+Covers the base descriptor method that selects the correct pattern
+character when calculate_subblock_params builds a 1-layer model.
+End-to-end validation with the real model is in
 tests/gpu/puzzletron/test_nemotron_h_gpu_validation.py.
 """
+
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("transformers")
 
-from modelopt.torch.puzzletron.block_config import (
-    AttentionConfig,
-    BlockConfig,
-    FFNConfig,
-    MambaConfig,
-)
-from modelopt.torch.puzzletron.subblock_stats.calc_subblock_params_and_memory import (
-    _infer_hybrid_pattern_char,
-)
+from modelopt.torch.puzzletron.anymodel.model_descriptor import ModelDescriptor
 
 NEMOTRON_H_PATTERN = "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"
 
+descriptor = ModelDescriptor
 
-class TestInferHybridPatternChar:
-    """Test _infer_hybrid_pattern_char picks the right character for the subblock type."""
 
-    def test_ffn_picks_dash(self):
-        bc = BlockConfig(
-            attention=AttentionConfig(no_op=True), ffn=FFNConfig(intermediate_size=4096)
-        )
-        assert _infer_hybrid_pattern_char(NEMOTRON_H_PATTERN, bc) == "-"
+def _make_config(pattern=NEMOTRON_H_PATTERN):
+    return SimpleNamespace(hybrid_override_pattern=pattern)
 
-    def test_ffn_picks_e_when_no_dash(self):
-        bc = BlockConfig(
-            attention=AttentionConfig(no_op=True), ffn=FFNConfig(intermediate_size=4096)
-        )
-        assert _infer_hybrid_pattern_char("MMM*EE", bc) == "E"
 
-    def test_mamba_picks_m(self):
-        bc = BlockConfig(
-            attention=AttentionConfig(
-                mamba=MambaConfig(state_dim=128, num_heads=64, head_dim=64, num_groups=8)
-            ),
-            ffn=FFNConfig(no_op=True),
-        )
-        assert _infer_hybrid_pattern_char(NEMOTRON_H_PATTERN, bc) == "M"
+class TestTruncatePatternForSubblock:
+    """Test truncate_pattern_for_subblock with parent_layer_index lookups."""
 
-    def test_attention_picks_star(self):
-        bc = BlockConfig(
-            attention=AttentionConfig(num_key_value_heads=8),
-            ffn=FFNConfig(no_op=True),
-        )
-        assert _infer_hybrid_pattern_char(NEMOTRON_H_PATTERN, bc) == "*"
+    def test_index_selects_mamba(self):
+        cfg = _make_config()
+        descriptor.truncate_pattern_for_subblock(cfg, parent_layer_index=0)
+        assert cfg.hybrid_override_pattern == "M"
 
-    def test_fallback_to_first_char(self):
-        bc = BlockConfig(
-            attention=AttentionConfig(num_key_value_heads=8),
-            ffn=FFNConfig(no_op=True),
-        )
-        assert _infer_hybrid_pattern_char("MMM", bc) == "M"
+    def test_index_selects_ffn(self):
+        cfg = _make_config()
+        descriptor.truncate_pattern_for_subblock(cfg, parent_layer_index=1)
+        assert cfg.hybrid_override_pattern == "-"
+
+    def test_index_selects_attention(self):
+        cfg = _make_config()
+        descriptor.truncate_pattern_for_subblock(cfg, parent_layer_index=7)
+        assert cfg.hybrid_override_pattern == "*"
 
     def test_pipe_separator_stripped(self):
-        """Patterns with pipe separators should still match after stripping."""
-        bc = BlockConfig(
-            attention=AttentionConfig(no_op=True), ffn=FFNConfig(intermediate_size=4096)
-        )
-        assert _infer_hybrid_pattern_char("M|-|*", bc) == "-"
+        """Pipe-delimited patterns are normalised before index lookup."""
+        cfg = _make_config("M|-|*")
+        descriptor.truncate_pattern_for_subblock(cfg, parent_layer_index=1)
+        assert cfg.hybrid_override_pattern == "-"
+
+    def test_pipe_index_after_stripping(self):
+        """Index maps to the stripped pattern, not the raw string."""
+        cfg = _make_config("M|-|*")
+        descriptor.truncate_pattern_for_subblock(cfg, parent_layer_index=2)
+        assert cfg.hybrid_override_pattern == "*"
+
+    def test_no_index_falls_back_to_first_char(self):
+        """Without parent_layer_index the method falls back to pattern[0]."""
+        cfg = _make_config()
+        descriptor.truncate_pattern_for_subblock(cfg)
+        assert cfg.hybrid_override_pattern == "M"
+
+    def test_out_of_range_falls_back_to_first_char(self):
+        cfg = _make_config("M-*")
+        descriptor.truncate_pattern_for_subblock(cfg, parent_layer_index=999)
+        assert cfg.hybrid_override_pattern == "M"
+
+    def test_no_pattern_is_noop(self):
+        """Config without hybrid_override_pattern should be left unchanged."""
+        cfg = SimpleNamespace()
+        descriptor.truncate_pattern_for_subblock(cfg)
+        assert not hasattr(cfg, "hybrid_override_pattern")
+
+    def test_empty_pattern_is_noop(self):
+        """Empty pattern string should be left unchanged."""
+        cfg = _make_config("")
+        descriptor.truncate_pattern_for_subblock(cfg)
+        assert cfg.hybrid_override_pattern == ""
