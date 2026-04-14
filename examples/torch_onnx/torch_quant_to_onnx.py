@@ -35,13 +35,17 @@ from evaluation import evaluate
 import modelopt.torch.quantization as mtq
 
 """
-This script is used to quantize a timm model using dynamic quantization like MXFP8 or NVFP4,
-or using auto quantization for optimal per-layer quantization.
+Quantize a timm vision model and export to ONNX for TensorRT deployment.
+
+Supports FP8, INT8, MXFP8, NVFP4, INT4_AWQ, and AUTO (mixed-precision) quantization modes.
 
 The script will:
-1. Given the model name, create a timm torch model.
-2. Quantize the torch model in MXFP8, NVFP4, INT4_AWQ, or AUTO mode.
-3. Export the quantized torch model to ONNX format.
+1. Load a pretrained timm model (e.g., ViT, Swin, ResNet).
+2. Quantize the model using the specified mode. For models with Conv2d layers,
+   Conv2d quantization is automatically overridden for TensorRT compatibility
+   (FP8 for MXFP8/NVFP4, INT8 for INT4_AWQ).
+3. Export the quantized model to ONNX with FP16 weights.
+4. Optionally evaluate accuracy on ImageNet-1k before and after quantization.
 """
 
 
