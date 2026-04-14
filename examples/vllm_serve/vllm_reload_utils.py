@@ -453,6 +453,11 @@ def load_state_dict_from_path(
                 )
                 if wq_i is not None:
                     missing_wq_module_paths.add(".".join(parts[: wq_i + 1]))
+                else:
+                    raise ValueError(
+                        f"Missing checkpoint key {key!r} looks like a weight quantizer, but no path "
+                        "component ends with 'weight_quantizer'; cannot map to a module to disable."
+                    )
             else:
                 raise ValueError(
                     f"Key {key} not found in checkpoint state dict, but exists in model"
