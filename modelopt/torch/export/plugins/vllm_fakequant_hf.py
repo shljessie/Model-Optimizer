@@ -15,7 +15,6 @@
 """Export HuggingFace model to vLLM fakequant checkpoint."""
 
 import copy
-import re
 from pathlib import Path
 from typing import Any
 
@@ -28,20 +27,13 @@ from modelopt.torch.quantization.conversion import quantizer_state
 from modelopt.torch.quantization.model_calib import enable_stats_collection, finish_stats_collection
 from modelopt.torch.quantization.nn import QuantModule, TensorQuantizer
 from modelopt.torch.quantization.utils import get_quantizer_state_dict
-from modelopt.torch.utils import get_unwrapped_name
+from modelopt.torch.utils import get_unwrapped_name, safe_save
 
+from ..hf_vllm_quantizer_merge import is_weight_quantizer_state_key
 from ..layer_utils import get_experts_list, is_moe
 from ..quant_utils import get_quantization_format
 
-__all__ = ["export_hf_vllm_fq_checkpoint"]
-
-# Matches ``…weight_quantizer``, ``…weight_quantizer.0``, ``…w13_weight_quantizer.0``, etc.
-_WEIGHT_QUANTIZER_STATE_KEY = re.compile(r"(?:^|\.)(?:\w+_)?weight_quantizer(?:\.\d+)*$")
-
-
-def _is_weight_quantizer_state_key(key: str) -> bool:
-    """True for weight quantizer state keys, including ModuleList entries (``…weight_quantizer.0``)."""
-    return bool(_WEIGHT_QUANTIZER_STATE_KEY.search(key))
+__all__ = ["export_hf_vllm_fq_checkpoint", "is_weight_quantizer_state_key"]
 
 
 def disable_rotate(quantizer: TensorQuantizer):
@@ -64,7 +56,7 @@ def _collect_expert_pre_quant_scales(
     pqs_list: list[torch.Tensor] = []
     for ex in experts:
         iq = getattr(ex, "input_quantizer", None)
-        if iq is None or getattr(iq, "_disabled", False) or iq.pre_quant_scale is None:
+        if iq is None or not iq.is_enabled or iq.pre_quant_scale is None:
             return None
         pqs_list.append(iq.pre_quant_scale)
     return pqs_list
@@ -119,6 +111,9 @@ def _resmooth_experts_for_export(
                 continue
 
             avg_pqs = torch.stack(pqs_list).mean(0)
+            # Guard against degenerate calibration where a channel's scale is zero:
+            # zero avg_pqs would produce inf ratio and corrupt the exported weight.
+            avg_pqs = avg_pqs.clamp(min=torch.finfo(torch.float32).tiny)
 
             for ex in experts:
                 nm = id_to_name.get(id(ex))
@@ -259,7 +254,7 @@ def export_hf_vllm_fq_checkpoint(
 
     quantizer_state_dict = get_quantizer_state_dict(model)
     for key in list(quantizer_state_dict):
-        if _is_weight_quantizer_state_key(key):
+        if is_weight_quantizer_state_key(key):
             # Fakequant amax is folded into HF weights; do not reload weight quantizer tensors.
             quantizer_state_dict.pop(key)
         elif key in input_quantizers_folded_pqs:
@@ -287,7 +282,7 @@ def export_hf_vllm_fq_checkpoint(
     # ``quantizer_state`` and drop disabled weight quantizer entries (weights already folded).
     qstate = quantizer_state(model)
     for key in list(qstate):
-        if _is_weight_quantizer_state_key(key) and qstate[key].get("_disabled"):
+        if is_weight_quantizer_state_key(key) and qstate[key].get("_disabled"):
             qstate.pop(key)
 
     for mode_str, m_state in modelopt_state.get("modelopt_state_dict", []):
@@ -297,7 +292,7 @@ def export_hf_vllm_fq_checkpoint(
 
     # Per-quantizer tensor dict loaded alongside metadata on reload.
     modelopt_state["modelopt_state_weights"] = quantizer_state_dict
-    torch.save(modelopt_state, export_dir / "vllm_fq_modelopt_state.pth")
+    safe_save(modelopt_state, export_dir / "vllm_fq_modelopt_state.pth")
 
     # Step 3: Save HF weights using the pre-built folded state dict.
     model.save_pretrained(export_dir, state_dict=clean_sd, save_modelopt_state=False)
