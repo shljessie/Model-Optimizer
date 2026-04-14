@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import re
-import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
@@ -445,11 +444,15 @@ def load_state_dict_from_path(
     for key in model_quant_keys:
         if key not in checkpoint_quant_keys:
             if "weight_quantizer" in key:
+                # State dict keys continue past the submodule (e.g. ...weight_quantizer._amax).
+                # named_modules() names stop at the weight_quantizer module; strip the suffix.
                 parts = key.split(".")
-                for i, part in enumerate(parts):
-                    if part.endswith("weight_quantizer"):
-                        missing_wq_module_paths.add(".".join(parts[: i + 1]))
-                        break
+                wq_i = next(
+                    (i for i, p in enumerate(parts) if p.endswith("weight_quantizer")),
+                    None,
+                )
+                if wq_i is not None:
+                    missing_wq_module_paths.add(".".join(parts[: wq_i + 1]))
             else:
                 raise ValueError(
                     f"Key {key} not found in checkpoint state dict, but exists in model"
@@ -458,18 +461,6 @@ def load_state_dict_from_path(
     for name, module in model.named_modules():
         if name in missing_wq_module_paths and hasattr(module, "disable"):
             module.disable()
-
-    checkpoint_quant_count = len(checkpoint_quant_keys)
-
-    # Ensure counts match (excluding weight quantizer keys, which may be absent when weights
-    # were pre-folded at export)
-    model_non_wq_quant_count = sum(1 for k in model_quant_keys if "weight_quantizer" not in k)
-    if checkpoint_quant_count != model_non_wq_quant_count:
-        warnings.warn(
-            f"Mismatch in quantizer state key counts: checkpoint has {checkpoint_quant_count} "
-            f"quant keys but model has {model_non_wq_quant_count} non-weight quantizer state keys. "
-            f"This can happen if the model is using PP."
-        )
 
     # Update quant values
     saved_quant_dict = process_state_dict_for_tp(saved_quant_dict, current_state_dict)
