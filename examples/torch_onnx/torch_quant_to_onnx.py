@@ -17,6 +17,7 @@ import argparse
 import copy
 import json
 import re
+import subprocess
 import sys
 import warnings
 from pathlib import Path
@@ -396,6 +397,11 @@ def main():
         help="Number of scoring steps for auto quantization. Default is 128.",
     )
     parser.add_argument(
+        "--trt_build",
+        action="store_true",
+        help="Build a TensorRT engine from the exported ONNX model using trtexec.",
+    )
+    parser.add_argument(
         "--no_pretrained",
         action="store_true",
         help="Don't load pretrained weights (useful for testing with random weights).",
@@ -495,6 +501,26 @@ def main():
     )
 
     print(f"Quantized ONNX model is saved to {args.onnx_save_path}")
+
+    if args.trt_build:
+        build_trt_engine(args.onnx_save_path)
+
+
+def build_trt_engine(onnx_path):
+    """Build a TensorRT engine from the exported ONNX model using trtexec."""
+    cmd = [
+        "trtexec",
+        f"--onnx={onnx_path}",
+        "--stronglyTyped",
+        "--builderOptimizationLevel=4",
+    ]
+    print(f"\nBuilding TensorRT engine: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"TensorRT engine build failed for {onnx_path}:\n{result.stdout}\n{result.stderr}"
+        )
+    print("TensorRT engine build succeeded.")
 
 
 if __name__ == "__main__":
