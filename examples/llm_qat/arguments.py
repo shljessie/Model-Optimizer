@@ -28,7 +28,7 @@ class ModelArguments(ModelOptHFArguments):
         default=4096,
         metadata={
             "help": (
-                "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
+                "Maximum sequence length. Sequences will be right-padded (and possibly truncated)."
             )
         },
     )
@@ -82,16 +82,6 @@ class TrainingArguments(ModelOptHFArguments, transformers.TrainingArguments):
             )
         },
     )
-    # Sensible defaults (previously set by launch.sh)
-    eval_strategy: str = field(default="steps")
-    load_best_model_at_end: bool = field(default=True)
-    save_total_limit: int = field(default=2)
-    warmup_ratio: float = field(default=0.1)
-    logging_steps: int = field(default=1)
-    report_to: str = field(default="tensorboard")
-    do_eval: bool = field(default=True)
-    eval_accumulation_steps: int = field(default=1)
-    learning_rate: float = field(default=1e-4)
 
 
 class QuantizeArguments(ModelOptHFArguments):

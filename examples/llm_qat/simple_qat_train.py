@@ -125,7 +125,7 @@ def main() -> None:
     assert isinstance(recipe, ModelOptPTQRecipe), (
         f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
     )
-    model = mtq.quantize(model, recipe.ptq_cfg, calibrate)
+    model = mtq.quantize(model, recipe.quantize, calibrate)
 
     # Initialize optimizer
     optimizer = AdamW(model.parameters(), lr=args.lr)

@@ -28,7 +28,7 @@ _Auto-generated — do not edit by hand._
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--model_name_or_path` | `str` | `"meta-llama/Llama-2-7b-hf"` |  |
-| `--model_max_length` | `int` | `4096` | Maximum sequence length. Sequences will be right padded (and possibly truncated). |
+| `--model_max_length` | `int` | `4096` | Maximum sequence length. Sequences will be right-padded (and possibly truncated). |
 
 ## QuantizeArguments
 
@@ -42,7 +42,7 @@ _Auto-generated — do not edit by hand._
 
 ## TrainingArguments
 
-Extends [HuggingFace TrainingArguments](https://huggingface.co/docs/transformers/main_classes/trainer#transformers.TrainingArguments). Only additional/overridden arguments are shown below.
+Extends [HuggingFace TrainingArguments](https://huggingface.co/docs/transformers/main_classes/trainer#transformers.TrainingArguments). Only additional arguments are shown below.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|

@@ -98,7 +98,7 @@ from modelopt.recipe import load_recipe
 recipe = load_recipe("general/ptq/nvfp4_default-fp8_kv")
 
 # 2. Quantize the model in-place
-model = mtq.quantize(model, recipe.ptq_cfg, forward_loop)
+model = mtq.quantize(model, recipe.quantize, forward_loop)
 
 # 3. Fine-tune the quantized model
 trainer.train()

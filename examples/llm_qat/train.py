@@ -59,7 +59,7 @@ import modelopt.torch.opt as mto
 from modelopt.torch.distill.plugins.huggingface import DistillArguments
 from modelopt.torch.opt.plugins.transformers import ModelOptArgParser
 from modelopt.torch.quantization.plugins.transformers_trainer import QADTrainer, QATTrainer
-from modelopt.torch.utils import print_rank_0
+from modelopt.torch.utils import print_rank_0, warn_rank_0
 
 # Enable automatic save/load of modelopt state huggingface checkpointing
 mto.enable_huggingface_checkpointing()
@@ -69,7 +69,14 @@ def train():
     parser = ModelOptArgParser(
         (ModelArguments, TrainingArguments, DataArguments, DistillArguments, QuantizeArguments)
     )
-    model_args, training_args, data_args, distill_args, _ = parser.parse_args_into_dataclasses()
+    model_args, training_args, data_args, distill_args, quant_args = (
+        parser.parse_args_into_dataclasses()
+    )
+
+    if quant_args.recipe:
+        warn_rank_0(
+            "--recipe is ignored by train.py; use quantize.py for the quantization step before QAT/QAD training"
+        )
 
     if distill_args.distill and getattr(training_args, "fsdp_config", None):
         fsdp_cfg = training_args.fsdp_config

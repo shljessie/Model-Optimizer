@@ -193,6 +193,8 @@ class ModelOptArgParser(HfArgumentParser):
         # --config <yaml_file>: load YAML as defaults, CLI args override
         if "--config" in args:
             idx = args.index("--config")
+            if idx + 1 >= len(args):
+                raise ValueError("--config requires a path argument")
             config_path = args[idx + 1]
             args = args[:idx] + args[idx + 2 :]  # strip --config <path> from argv
             import yaml
@@ -261,7 +263,7 @@ class ModelOptArgParser(HfArgumentParser):
                 lines.append(
                     "Extends [HuggingFace TrainingArguments]"
                     "(https://huggingface.co/docs/transformers/main_classes/trainer#transformers.TrainingArguments)."
-                    " Only additional/overridden arguments are shown below."
+                    " Only additional arguments are shown below."
                 )
                 lines.append("")
             else:

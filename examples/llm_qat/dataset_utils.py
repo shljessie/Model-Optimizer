@@ -246,8 +246,6 @@ def _chatml_assistant_mask(input_ids: list[int], tokenizer: PreTrainedTokenizerB
             skip_newline = False
             continue
         if tid == im_end_id:
-            if in_assistant:
-                masks[i] = 1
             in_assistant = False
             continue
         if in_assistant:
@@ -319,7 +317,7 @@ def make_chat_tokenize_fn(
                 truncation=True,
                 max_length=max_length,
             )
-        except Exception as e:
+        except (ValueError, TypeError, KeyError) as e:
             print_rank_0(f"WARNING: Failed to tokenize sample: {e}. Skipping.")
             pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
             return {
@@ -459,7 +457,7 @@ def _stream_samples(
     print_rank_0(f"\tFetching {per_rank} samples (rank {rank})...")
     try:
         result = list(ds.skip(offset).take(per_rank))
-    except (TypeError, ValueError, Exception) as e:
+    except (StopIteration, ValueError) as e:
         print_rank_0(
             f"\tWARNING: Failed to stream {hf_path} [{split_name}]: {e}. Skipping this split."
         )

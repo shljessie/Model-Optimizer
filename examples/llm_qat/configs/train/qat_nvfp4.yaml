@@ -26,6 +26,10 @@ seed: 42
 do_train: true
 do_eval: true
 
+# Checkpointing
+load_best_model_at_end: true
+save_total_limit: 2
+
 # Evaluation
 eval_on_start: true
 eval_strategy: steps
