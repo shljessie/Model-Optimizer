@@ -28,9 +28,7 @@ import pytest
 
 pytest.importorskip("diffusers")
 
-import torch
 import torch.nn as nn
-
 
 # ---------------------------------------------------------------------------
 # Configs (no quantize_p — that's now a quantization feature)
