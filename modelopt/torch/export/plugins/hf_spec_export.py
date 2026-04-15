@@ -193,6 +193,13 @@ class EagleExporter(SpeculativeDecodingExporter):
                     new_value = str(new_value).replace("torch.", "")
                 template_config[key] = new_value
 
+        # Some models (e.g. Qwen3) store rope_theta only inside rope_scaling, not at the
+        # top level.  TRT-LLM and other engines require the top-level field, so copy it up.
+        rope_scaling = template_config.get("rope_scaling") or {}
+        if isinstance(rope_scaling, dict) and template_config.get("rope_theta") is None:
+            if rope_scaling.get("rope_theta") is not None:
+                template_config["rope_theta"] = rope_scaling["rope_theta"]
+
         return template_config
 
     def _export_lora(self, export_dir: Path, full_sd: dict):
