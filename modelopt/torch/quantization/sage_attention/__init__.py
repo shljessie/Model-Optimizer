@@ -67,7 +67,7 @@ Requirements
 
 import torch
 
-__all__ = ["apply_sage_attention"]
+__all__ = ["apply_sage_attention", "apply_sage_attention_v3"]
 
 
 def apply_sage_attention(
@@ -125,4 +125,55 @@ def apply_sage_attention(
     transformer._modelopt_sage_attention = True  # mark for inspection
 
     q_str = "NVFP4 E2M1" if quantize_p else "disabled"
-    print(f"[ModelOpt] SageAttention applied: quantize_p={quantize_p} ({q_str} P-tile quantization)")
+    print(
+        f"[ModelOpt] SageAttention applied: quantize_p={quantize_p} ({q_str} P-tile quantization)"
+    )
+
+
+def apply_sage_attention_v3(transformer: torch.nn.Module) -> None:
+    """Patch a diffusers transformer with SageAttention v3 microscaling NVFP4.
+
+    Wraps ``transformer.forward`` to quantize **Q, K, V, and P** to NVFP4 E2M1
+    using per-group microscaling (groups of 16 elements along the head dimension),
+    following the SageAttention v3 paper (arxiv 2505.11594).
+
+    Compared to :func:`apply_sage_attention` (which only quantizes P with per-tile
+    scaling), this also quantizes Q, K, and V with finer per-group scales, targeting
+    Blackwell / Ada GPUs where FP4 tensor cores provide maximum throughput.
+
+    Args:
+        transformer: A diffusers transformer module (e.g. ``pipe.transformer``).
+
+    Raises:
+        ImportError: If ``modelopt.torch.sparsity.attention_sparsity`` is not
+            installed (required for the Triton kernel and diffusers backend).
+    """
+    try:
+        from modelopt.torch.sparsity.attention_sparsity.kernels.diffusers_triton_attention import (
+            clear_sage_attention_config,
+            get_triton_attention_backend,
+            register_diffusers_triton_attention,
+            set_sage_attention_config,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "apply_sage_attention_v3 requires modelopt.torch.sparsity.attention_sparsity "
+            "(Triton kernel + diffusers backend). Install modelopt with the [all] extra "
+            "or ensure triton is available."
+        ) from exc
+
+    register_diffusers_triton_attention()
+
+    original_forward = transformer.forward
+
+    def _sage_v3_forward(*args, **kwargs):
+        set_sage_attention_config(quantize_p=False, quantize_qkv=True)
+        with get_triton_attention_backend():
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                clear_sage_attention_config()
+
+    transformer.forward = _sage_v3_forward
+    transformer._modelopt_sage_attention_v3 = True  # mark for inspection
+    print("[ModelOpt] SageAttention v3 applied: per-group MX NVFP4 on Q, K, V, and P")

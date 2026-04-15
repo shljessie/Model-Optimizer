@@ -98,23 +98,31 @@ def clear_triton_skip_softmax_config() -> None:
     _thread_local.calibration_counters = None
 
 
-def set_sage_attention_config(quantize_p: bool = True) -> None:
-    """Set NVFP4 P-matrix quantization flag for SageAttention.
+def set_sage_attention_config(
+    quantize_p: bool = True,
+    quantize_qkv: bool = False,
+) -> None:
+    """Set NVFP4 quantization flags for SageAttention.
 
-    Manages ``quantize_p`` independently of sparse-attention params so that
-    SageAttention can be applied standalone or combined with skip-softmax /
-    N:M sparsity without either feature clobbering the other.
+    Manages ``quantize_p`` and ``quantize_qkv`` independently of sparse-attention
+    params so either can be combined with skip-softmax / N:M sparsity without
+    clobbering the other's state.
 
     Args:
         quantize_p: If True, quantize the post-softmax P tile to NVFP4 E2M1
-            inside the Triton kernel (per-tile max scaling).
+            (per-tile max scaling, SageAttn v1/v2 style). Default True.
+        quantize_qkv: If True, apply SageAttn-v3-style per-group microscaling NVFP4
+            to Q, K, V (groups of 16 along head_dim) and finer per-group NVFP4 to P.
+            Supersedes ``quantize_p`` when set. Default False.
     """
     _thread_local.quantize_p = quantize_p
+    _thread_local.quantize_qkv = quantize_qkv
 
 
 def clear_sage_attention_config() -> None:
-    """Clear NVFP4 P-matrix quantization flag."""
+    """Clear NVFP4 quantization flags."""
     _thread_local.quantize_p = False
+    _thread_local.quantize_qkv = False
 
 
 def get_calibration_counters() -> "torch.Tensor | None":
@@ -185,7 +193,7 @@ def _diffusers_triton_attention(
 
             return o.view(batch, seq_q, num_heads_q, head_dim)
 
-    # --- Inference mode: optional skip-softmax, N:M sparsity, and/or NVFP4 quantize_p ---
+    # --- Inference mode: optional skip-softmax, N:M sparsity, and/or NVFP4 quantization ---
     threshold = getattr(_thread_local, "skip_threshold", None)
     if threshold is not None and threshold > 0.0:
         kw["skip_softmax_threshold"] = threshold
@@ -201,8 +209,10 @@ def _diffusers_triton_attention(
         if dense_window_size > 0:
             kw["dense_window_size"] = dense_window_size
 
-    quantize_p = getattr(_thread_local, "quantize_p", False)
-    if quantize_p:
+    quantize_qkv = getattr(_thread_local, "quantize_qkv", False)
+    if quantize_qkv:
+        kw["quantize_qkv"] = True
+    elif getattr(_thread_local, "quantize_p", False):
         kw["quantize_p"] = True
 
     assert attention is not None, "Triton attention kernel not available (requires CUDA + triton)"

@@ -83,6 +83,9 @@ Usage::
     # SageAttention standalone — NVFP4 P-matrix quantization only (no sparsity)
     python wan2_sage_attention.py --prompt "..." --kernel nvfp4
 
+    # SageAttention v3 — per-group MX NVFP4 on Q, K, V, and P (arxiv 2505.11594)
+    python wan2_sage_attention.py --prompt "..." --kernel nvfp4-v3
+
     # ModelOpt Triton sparse + NVFP4 P-matrix quantization
     python wan2_sage_attention.py --prompt "..." --kernel triton-sparse --quantize-p
 
@@ -119,6 +122,7 @@ KERNEL_SAGE2_FP8 = "sage2-fp8"
 KERNEL_TRITON_SPARSE = "triton-sparse"
 KERNEL_TRITON_SKIP = "triton-skip"
 KERNEL_NVFP4 = "nvfp4"
+KERNEL_NVFP4_V3 = "nvfp4-v3"
 KERNEL_CHOICES = [
     KERNEL_FP8,
     KERNEL_SAGE1,
@@ -127,6 +131,7 @@ KERNEL_CHOICES = [
     KERNEL_TRITON_SPARSE,
     KERNEL_TRITON_SKIP,
     KERNEL_NVFP4,
+    KERNEL_NVFP4_V3,
 ]
 
 # Kernels that modify pipe.transformer in-place via ModelOpt APIs (not SDPA patching).
@@ -727,7 +732,8 @@ def parse_args() -> argparse.Namespace:
             "sage2-fp8: SA2++ INT8+FP8; "
             "triton-sparse: ModelOpt Triton 2:4 N:M sparse softmax (requires triton + modelopt); "
             "triton-skip: ModelOpt Triton skip-softmax tile pruning (requires triton + modelopt); "
-            "nvfp4: ModelOpt SageAttention NVFP4 P-matrix quantization standalone (requires triton + modelopt)"
+            "nvfp4: ModelOpt SageAttention NVFP4 P-matrix quantization standalone (requires triton + modelopt); "
+            "nvfp4-v3: SageAttention v3 per-group MX NVFP4 on Q/K/V/P (requires triton + modelopt)"
         ),
     )
     parser.add_argument(
@@ -885,6 +891,12 @@ def main() -> None:
         from modelopt.torch.quantization import apply_sage_attention
 
         apply_sage_attention(pipe.transformer)
+        run_inference(pipe, args, label=args.kernel)
+
+    elif args.kernel == KERNEL_NVFP4_V3:
+        from modelopt.torch.quantization import apply_sage_attention_v3
+
+        apply_sage_attention_v3(pipe.transformer)
         run_inference(pipe, args, label=args.kernel)
 
     elif args.kernel in _TRITON_MODELOPT_KERNELS:

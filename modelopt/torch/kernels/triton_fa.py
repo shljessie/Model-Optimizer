@@ -329,6 +329,51 @@ def _quantize_p_nvfp4(p, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     return q * scale  # dequantize back to original scale
 
 
+# NVFP4 E2M1 per-group microscaling helper (SageAttention v3 style)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quantize_vec_mx_nvfp4(x, ROWS: tl.constexpr, COLS: tl.constexpr, MX_BLOCK: tl.constexpr):
+    """Per-group NVFP4 E2M1 microscaling quantization (SageAttention v3).
+
+    Quantizes ``x [ROWS, COLS]`` in groups of ``MX_BLOCK`` consecutive elements
+    along the last axis (i.e. along the head-dimension for Q/K/V, or along the
+    KV axis for P).  Each group of ``MX_BLOCK`` elements shares one scale:
+    ``scale = max(|x|) / 6.0`` — a float32 approximation of the paper's FP8-E8M0
+    per-block scale.  Supports both positive and negative values (Q, K, V are
+    not bounded to [0, 1] like P).
+
+    The quantized levels are the 15 symmetric NVFP4 E2M1 values:
+    ``{±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6, 0}``.
+
+    Usage:
+      * Q ``[BLOCK_M, BLOCK_D]``: call directly.
+      * K^T ``[BLOCK_D, BLOCK_N]``: call as
+        ``tl.trans(_quantize_vec_mx_nvfp4(tl.trans(k), BLOCK_N, BLOCK_D, 16))``
+        so that the 16-element groups run along BLOCK_D within each key vector.
+      * V ``[BLOCK_N, BLOCK_D]``: call directly.
+      * P ``[BLOCK_M, BLOCK_N]``: call directly (groups of 16 along KV axis).
+    """
+    NUM_GROUPS: tl.constexpr = ROWS * COLS // MX_BLOCK
+    x_grouped = tl.reshape(x, (NUM_GROUPS, MX_BLOCK))
+    # Per-group scale: max(|x|) / 6.0
+    x_max = tl.max(tl.abs(x_grouped), axis=1)  # [NUM_GROUPS]
+    scale = tl.maximum(x_max, 1e-12) / 6.0  # [NUM_GROUPS]
+    x_norm = x_grouped / scale[:, None]  # [NUM_GROUPS, MX_BLOCK]
+    # Symmetric NVFP4 E2M1 boundary-compare
+    # Boundaries: ±0.25, ±0.75, ±1.25, ±1.75, ±2.5, ±3.5, ±5.0
+    x_abs = tl.abs(x_norm)
+    sign = tl.where(x_norm >= 0.0, 1.0, -1.0)
+    q = tl.full((NUM_GROUPS, MX_BLOCK), 0.0, dtype=tl.float32)
+    q = tl.where(x_abs >= 0.25, 0.5 * sign, q)
+    q = tl.where(x_abs >= 0.75, 1.0 * sign, q)
+    q = tl.where(x_abs >= 1.25, 1.5 * sign, q)
+    q = tl.where(x_abs >= 1.75, 2.0 * sign, q)
+    q = tl.where(x_abs >= 2.50, 3.0 * sign, q)
+    q = tl.where(x_abs >= 3.50, 4.0 * sign, q)
+    q = tl.where(x_abs >= 5.00, 6.0 * sign, q)
+    return tl.reshape(q * scale[:, None], (ROWS, COLS))
+
+
 # ---------------------------------------------------------------------------
 # Forward kernel
 # ---------------------------------------------------------------------------
@@ -370,6 +415,7 @@ def _attn_fwd(
     APPLY_SKIP_SOFTMAX: tl.constexpr = False,  # Skip KV tiles with negligible scores
     SKIP_THRESHOLD_LOG2: tl.constexpr = 0.0,  # log2(lambda) * sm_scale, pre-scaled for comparison on scaled scores
     QUANTIZE_P: tl.constexpr = False,  # Quantize post-softmax p tile to NVFP4 E2M1 (per-tile, STE)
+    QUANTIZE_QKV: tl.constexpr = False,  # SageAttn-v3: per-group MX NVFP4 for Q/K/V + finer P
     IS_PAGED: tl.constexpr = False,  # Whether K/V are in paged cache
     K_cache=None,  # [num_blocks, page_size, num_kv_heads, head_dim] paged K
     V_cache=None,  # [num_blocks, page_size, num_kv_heads, head_dim] paged V
@@ -410,6 +456,9 @@ def _attn_fwd(
     # --- Load Q tile [BLOCK_M, BLOCK_D]: stays in SRAM for the entire KV loop ---
     q_ptrs = (q_offset + q_pos[:, None]) * stride_qbs + head_idx * stride_qh + dim_pos[None, :]
     q = tl.load(Q + q_ptrs, mask=(q_pos[:, None] < seq_len_q) & d_mask[None, :], other=0.0)
+    if QUANTIZE_QKV:
+        # SageAttn-v3: per-group MX NVFP4 quantization of Q (groups of 16 along head_dim)
+        q = _quantize_vec_mx_nvfp4(q, BLOCK_M, BLOCK_D, 16)
 
     # Base pointers for K and V at this KV head (per-tile offset added in loop)
     k_base = K + kv_head_idx * stride_kh
@@ -454,6 +503,11 @@ def _attn_fwd(
                 mask=((kv_start + kv_pos[None, :]) < seq_len_kv) & d_mask[:, None],
                 other=0.0,
             )
+
+        if QUANTIZE_QKV:
+            # SageAttn-v3: per-group MX NVFP4 for K (groups of 16 along head_dim).
+            # K^T is [BLOCK_D, BLOCK_N]; transpose so groups run along BLOCK_D per key vector.
+            k = tl.trans(_quantize_vec_mx_nvfp4(tl.trans(k), BLOCK_N, BLOCK_D, 16))
 
         # scores = Q @ K^T * scale  [BLOCK_M, BLOCK_N]
         scores = tl.dot(q, k) * qk_scale
@@ -533,7 +587,10 @@ def _attn_fwd(
                         mask=((kv_start + kv_pos[:, None]) < seq_len_kv) & d_mask[None, :],
                         other=0.0,
                     )
-                if QUANTIZE_P:
+                if QUANTIZE_QKV:
+                    v = _quantize_vec_mx_nvfp4(v, BLOCK_N, BLOCK_D, 16)
+                    p = _quantize_vec_mx_nvfp4(p, BLOCK_M, BLOCK_N, 16)
+                elif QUANTIZE_P:
                     p = _quantize_p_nvfp4(p, BLOCK_M, BLOCK_N)
                 acc = tl.dot(p.to(v.dtype), v, acc)
                 row_max = m_new
@@ -575,7 +632,10 @@ def _attn_fwd(
                     mask=((kv_start + kv_pos[:, None]) < seq_len_kv) & d_mask[None, :],
                     other=0.0,
                 )
-            if QUANTIZE_P:
+            if QUANTIZE_QKV:
+                v = _quantize_vec_mx_nvfp4(v, BLOCK_N, BLOCK_D, 16)
+                p = _quantize_vec_mx_nvfp4(p, BLOCK_M, BLOCK_N, 16)
+            elif QUANTIZE_P:
                 p = _quantize_p_nvfp4(p, BLOCK_M, BLOCK_N)
             acc = tl.dot(p.to(v.dtype), v, acc)
             row_max = m_new
@@ -969,6 +1029,7 @@ class _Attention(torch.autograd.Function):
         block_table,
         page_size,
         quantize_p,
+        quantize_qkv,
     ):
         HEAD_DIM = q.shape[2]
         num_q_heads = q.shape[1]
@@ -1006,9 +1067,10 @@ class _Attention(torch.autograd.Function):
         # The threshold is scaled by sm_scale to control sparsity relative to
         # head dimension: larger head_dim → smaller sm_scale → more aggressive
         # skipping for the same lambda value.
-        if quantize_p and (q.requires_grad or k.requires_grad or v.requires_grad):
+        if (quantize_p or quantize_qkv) and (q.requires_grad or k.requires_grad or v.requires_grad):
             raise NotImplementedError(
-                "quantize_p supports inference only; backward does not model the quantized P path"
+                "quantize_p / quantize_qkv support inference only; "
+                "backward does not model the quantized path"
             )
 
         apply_skip = skip_softmax_threshold is not None and skip_softmax_threshold > 0.0
@@ -1058,6 +1120,7 @@ class _Attention(torch.autograd.Function):
             APPLY_SKIP_SOFTMAX=apply_skip,
             SKIP_THRESHOLD_LOG2=skip_threshold_log2,
             QUANTIZE_P=quantize_p,
+            QUANTIZE_QKV=quantize_qkv,
             IS_PAGED=is_paged,
             K_cache=k_cache,
             V_cache=v_cache,
@@ -1091,6 +1154,7 @@ class _Attention(torch.autograd.Function):
         ctx.apply_skip = apply_skip
         ctx.skip_threshold_log2 = skip_threshold_log2
         ctx.quantize_p = quantize_p
+        ctx.quantize_qkv = quantize_qkv
         return o
 
     @staticmethod
@@ -1222,6 +1286,7 @@ class _Attention(torch.autograd.Function):
             None,  # block_table
             None,  # page_size
             None,  # quantize_p
+            None,  # quantize_qkv
         )
 
 
@@ -1244,6 +1309,7 @@ def attention(
     dense_window_size: int = 64,
     skip_softmax_threshold: float | None = None,
     quantize_p: bool = False,
+    quantize_qkv: bool = False,
     k_cache: torch.Tensor | None = None,
     v_cache: torch.Tensor | None = None,
     block_table: torch.Tensor | None = None,
@@ -1279,9 +1345,13 @@ def attention(
             softmax contribution is negligible. Tiles are skipped entirely
             (no softmax, V load, or BMM2). The threshold is applied on
             unscaled scores. Set to ``None`` or ``0`` to disable.
-        quantize_p: If ``True``, quantize the post-softmax p tile to NVFP4
-            E2M1 before the p @ V matmul (per-tile max scaling, STE in
-            backward). Default ``False``.
+        quantize_p: If ``True``, quantize the post-softmax P tile to NVFP4
+            E2M1 before the P @ V matmul (per-tile max scaling, STE).
+            Default ``False``.
+        quantize_qkv: If ``True``, apply SageAttention-v3-style per-group
+            microscaling NVFP4 to Q, K, V (groups of 16 along head_dim) and
+            per-group NVFP4 to P (groups of 16 along the KV axis). Supersedes
+            ``quantize_p`` when both are set. Default ``False``.
         k_cache: Paged K cache [num_blocks, page_size, num_kv_heads, head_dim].
             When provided, K/V are read from paged cache via block_table
             instead of from contiguous k/v tensors.
@@ -1316,6 +1386,7 @@ def attention(
         block_table,
         page_size,
         quantize_p,
+        quantize_qkv,
     )
 
 
