@@ -113,6 +113,38 @@ ls -lh <output_path>/
 
 Report the path and size to the user.
 
+### Post-quantization validation (MoE models)
+
+For MoE models, verify that expert layers were actually quantized. The quantization config patterns (`*mlp*`, `*block_sparse_moe*`) may not match all model architectures — e.g., Gemma4 uses `layers.N.experts.*` which is missed by these patterns, leaving experts unquantized without any warning.
+
+**Check 1**: Compare exported weight names against `hf_quant_config.json` exclude list. If large parameter groups (especially expert/MoE weights) have no corresponding scale params (`weight_scale`, `input_scale`) AND are not in `exclude_modules`, they were silently skipped:
+
+```bash
+python3 -c "
+import json
+idx = json.load(open('<output>/model.safetensors.index.json'))
+cfg = json.load(open('<output>/hf_quant_config.json'))
+excludes = cfg['quantization']['exclude_modules']
+
+# Find weights without scales (potential unquantized layers)
+all_keys = set(idx['weight_map'].keys())
+base_weights = {k for k in all_keys if not any(s in k for s in ['scale', 'norm', 'layernorm', 'embed'])}
+has_scale = {k for k in all_keys if 'scale' in k}
+
+for w in sorted(base_weights):
+    w_base = w.rsplit('.', 1)[0]  # strip .weight suffix
+    if not any(s in all_keys for s in [f'{w_base}.weight_scale', f'{w_base}.input_scale', f'{w}.weight_scale']):
+        if not any(p.replace('*', '') in w for p in excludes):
+            print(f'WARNING: {w} has no scale params and is not in exclude list')
+"
+```
+
+If warnings appear for expert/MoE layers, the quantization patterns missed them. Fix by either:
+- Re-running PTQ with a custom config adding the missing pattern (e.g., `"*.experts.*"`)
+- If the model already has a fix PR (check `modelopt/torch/quantization/plugins/huggingface.py`), update ModelOpt and re-run
+
+**Check 2**: For models with fused 3D expert tensors, verify the export added them to `exclude_modules` if they weren't quantized. Missing exclude entries cause deployment failures (vLLM/SGLang try to load them as quantized). See `deployment/references/unsupported-models.md` for the "quantized/unquantized layer confusion" pattern.
+
 ## Key API Rules
 
 - `mtq.register()` classes **must** define `_setup()` and call it from `__init__`
