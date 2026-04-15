@@ -5,7 +5,6 @@ on:
       - '**/SKILL.md'
 permissions:
   contents: read
-  pull-requests: write
 safe-outputs:
   add-comment:
     max: 1
