@@ -60,10 +60,10 @@ from .conversion import (
 from .model_calib import (
     awq,
     gptq,
+    layerwise_calibrate,
     local_hessian_calibrate,
     max_calibrate,
     mse_calibrate,
-    sequential_calibrate,
     smoothquant,
     svdquant,
 )
@@ -222,7 +222,8 @@ def wrapped_calib_func(
     """
     kwargs = config.model_dump()
     method = kwargs.pop("method")
-    sequential = kwargs.pop("use_sequential", False)
+    layerwise = kwargs.pop("use_layerwise", False)
+    checkpoint_dir = kwargs.pop("checkpoint_dir", None)
     if method is not None and "awq" in method:
         # For backward compatibility
         kwargs["algorithm"] = method
@@ -237,17 +238,15 @@ def wrapped_calib_func(
                 module._moe_calib_experts_ratio = moe_calib_experts_ratio
 
     if func is not None:
-        if sequential:
+        if layerwise:
             if forward_loop is None:
                 raise ValueError("forward_loop is required for calibration but got None.")
-            assert method in ["max", "gptq"], (
-                f"Sequential calibration currently only supports max and gptq calibration, got {method}"
-            )
-            # Wrap with sequential processing
-            sequential_calibrate(
+            # Wrap with layerwise processing
+            layerwise_calibrate(
                 model,
                 forward_loop=forward_loop,
                 calib_func=func,
+                checkpoint_dir=checkpoint_dir,
                 **kwargs,
             )
         else:

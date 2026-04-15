@@ -1217,13 +1217,23 @@ class QuantizeAlgorithmConfig(ModeloptBaseConfig):
         ),
     )
 
-    use_sequential: bool = ModeloptField(
+    use_layerwise: bool = ModeloptField(
         default=False,
-        title="Enable sequential layer-by-layer calibration.",
+        title="Enable layerwise (layer-by-layer) calibration.",
         description=(
-            "If True, the calibration algorithm is applied sequentially to each decoder block. "
+            "If True, the calibration algorithm is applied to each decoder layer independently. "
             "Each layer's inputs are captured via a single forward pass that reflects the "
             "quantization of all preceding layers, incurring O(N) forward passes for N layers."
+        ),
+    )
+
+    checkpoint_dir: str | None = ModeloptField(
+        default=None,
+        title="Checkpoint directory for layerwise calibration.",
+        description=(
+            "If set together with use_layerwise=True, per-layer checkpoints are saved to this "
+            "directory during calibration. On restart, calibration resumes from the last "
+            "completed layer."
         ),
     )
 
