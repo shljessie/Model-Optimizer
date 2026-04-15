@@ -19,6 +19,9 @@ import glob
 import io
 import os
 import platform
+import re
+import shutil
+import subprocess  # nosec B404
 import sys
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,7 +29,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import onnxruntime as ort
 from onnxruntime.quantization.operators.qdq_base_operator import QDQOperatorBase
 from onnxruntime.quantization.registry import QDQRegistry, QLinearOpsRegistry
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from modelopt.onnx.logging_config import logger
 from modelopt.onnx.quantization.operators import QDQConvTranspose, QDQCustomOp, QDQNormalization
@@ -53,11 +56,6 @@ def _check_for_trtexec(min_version: str = "10.0") -> str:
     Raises:
         ImportError: If `trtexec` is not found or the version is too low.
     """
-    import re
-    import shutil
-    import subprocess  # nosec B404
-
-    from packaging.version import InvalidVersion, Version
 
     def _parse_version_from_string(version_str: str) -> str | None:
         # Try canonical TensorRT x.x.x.x strings first
