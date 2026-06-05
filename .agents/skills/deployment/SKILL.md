@@ -192,7 +192,7 @@ If a cluster config exists (`~/.config/modelopt/clusters.yaml` or `.claude/clust
 1. **Source remote utilities:**
 
    ```bash
-   source .claude/skills/common/remote_exec.sh
+   source .agents/skills/common/remote_exec.sh
    remote_load_cluster
    remote_check_ssh
    remote_detect_env

@@ -191,7 +191,7 @@ Do not reimplement workflows that existing skills own:
 | Compute baseline-vs-candidate deltas | `compare-results` |
 
 Before launching PTQ in a ModelOpt repo, read the current PTQ skill from
-`.claude/skills/ptq/SKILL.md`; recipe paths and validation gates can change.
+`.agents/skills/ptq/SKILL.md`; recipe paths and validation gates can change.
 
 ## ModelOpt Starting Points
 

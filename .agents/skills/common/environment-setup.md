@@ -34,7 +34,7 @@ If the cluster config contains multiple clusters and the user did not name the t
 For remote, connect:
 
 ```bash
-source .claude/skills/common/remote_exec.sh
+source .agents/skills/common/remote_exec.sh
 remote_load_cluster <cluster_name>
 remote_check_ssh
 remote_detect_env    # sets REMOTE_ENV_TYPE = slurm / docker / bare

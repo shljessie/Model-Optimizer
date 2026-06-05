@@ -30,7 +30,7 @@ change is being measured, typically a further quantized version of the baseline.
    judge/code-execution status, sample accounting, and reasoning parsing before
    computing deltas.
 5. For each task, use the canonical score field from the matching
-   `.claude/skills/evaluation/recipes/tasks/<task>.md` Score Extraction
+   `.agents/skills/evaluation/recipes/tasks/<task>.md` Score Extraction
    section.
 6. Compute exact deltas outside the chat context when there are multiple tasks
    or repeated runs.
