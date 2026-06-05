@@ -20,6 +20,20 @@ than maintaining N copies that drift out of sync, **`.agents/` is the single
 source of truth** — each agent's guidance or install mechanism points here
 directly.
 
+## How each agent finds these
+
+Each agent points at `.agents/` through whatever mechanism it supports — never
+a copy:
+
+- **Claude Code** only auto-discovers skills under `.claude/skills/`, so
+  `.claude/` holds relative in-repo symlinks back into `.agents/`:
+  `.claude/skills → ../.agents/skills`, `.claude/scripts → ../.agents/scripts`,
+  and `.claude/clusters.yaml.example → ../.agents/clusters.yaml.example`. These
+  follow the same committed-symlink pattern already used elsewhere in this repo
+  (e.g. `CLAUDE.md`, `tools/launcher/modules/Model-Optimizer`).
+- **Future agents** (Codex, Cursor, …) add their own symlink or config pointing
+  at `.agents/`.
+
 ## Editing rules
 
 - **Always edit files under `.agents/`**.
